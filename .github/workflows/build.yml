@@ -4,44 +4,40 @@ on:
   push:
     branches: [main]
 
-defaults:
-  run:
-    working-directory: SplitDeck-project/SplitDeck
-
 jobs:
   build:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
 
+      - name: Locate project directory
+        id: proj
+        run: |
+          if [ -f "project.yml" ]; then
+            echo "dir=." >> $GITHUB_OUTPUT
+          elif [ -f "SplitDeck/project.yml" ]; then
+            echo "dir=SplitDeck" >> $GITHUB_OUTPUT
+          elif [ -f "SplitDeck-project/SplitDeck/project.yml" ]; then
+            echo "dir=SplitDeck-project/SplitDeck" >> $GITHUB_OUTPUT
+          else
+            echo "project.yml not found!" >&2
+            exit 1
+          fi
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
       - name: Generate Xcode project
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: xcodegen generate
 
       - name: Build (unsigned)
+        working-directory: ${{ steps.proj.outputs.dir }}
         run: |
+          set -o pipefail
           xcodebuild clean build \
             -project SplitDeck.xcodeproj \
             -scheme SplitDeck \
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
-            -derivedDataPath build \
-            CODE_SIGN_STYLE=Manual \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY=""
-
-      - name: Package IPA
-        run: |
-          mkdir -p Payload
-          cp -R build/Build/Products/Release-iphoneos/SplitDeck.app Payload/
-          zip -r SplitDeck.ipa Payload
-
-      - name: Upload IPA Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: SplitDeck-ipa
-          path: SplitDeck-project/SplitDeck/SplitDeck.ipa
