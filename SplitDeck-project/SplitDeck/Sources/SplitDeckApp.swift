@@ -649,7 +649,10 @@ struct VaultView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var importing = false
     @State private var msg = ""
-    @State private var cn = "", cnum = "", cexp = "", ccvc = ""
+    @State private var cn = ""
+    @State private var cnum = ""
+    @State private var cexp = ""
+    @State private var ccvc = ""
 
     var body: some View {
         NavigationStack {
