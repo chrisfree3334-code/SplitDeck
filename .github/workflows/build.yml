@@ -41,3 +41,28 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" 2>&1 | tee build.log
+
+      - name: Show compile errors
+        if: failure()
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          echo "=== ERRORS ==="
+          grep -E "error:" build.log | sort -u | head -40 || true
+
+      - name: Package IPA
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          mkdir -p Payload
+          cp -R build/Build/Products/Release-iphoneos/SplitDeck.app Payload/
+          zip -r SplitDeck.ipa Payload
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SplitDeck-ipa
+          path: ${{ steps.proj.outputs.dir }}/SplitDeck.ipa
