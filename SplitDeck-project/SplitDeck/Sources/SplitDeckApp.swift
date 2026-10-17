@@ -1,8 +1,11 @@
 import SwiftUI
+import UIKit
 import WebKit
 import LocalAuthentication
 import Security
 import UniformTypeIdentifiers
+import NetworkExtension
+import QuartzCore
 
 @main
 struct SplitDeckApp: App {
@@ -13,18 +16,23 @@ func q(_ s: String) -> String {
     (try? String(data: JSONEncoder().encode(s), encoding: .utf8)) ?? "\"\""
 }
 
-// MARK: Vault (Keychain, device-only, Face ID gated)
+// MARK: - Vault (Keychain, device-only, Face ID gated)
 
 struct Login: Codable, Identifiable { var id = UUID(); var site: String; var user: String; var pass: String }
 struct Card: Codable, Identifiable { var id = UUID(); var name: String; var number: String; var exp: String; var cvc: String }
 
 enum Store {
     static func read<T: Decodable>(_ key: String, _ t: T.Type) -> T? {
-        let query: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: key, kSecReturnData as String: true]
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: key,
+            kSecReturnData as String: true
+        ]
         var out: AnyObject?
         guard SecItemCopyMatching(query as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
         return try? JSONDecoder().decode(T.self, from: d)
     }
+
     static func write<T: Encodable>(_ key: String, _ v: T) {
         guard let d = try? JSONEncoder().encode(v) else { return }
         let base: [String: Any] = [kSecClass as String: kSecClassGenericPassword, kSecAttrAccount as String: key]
@@ -46,6 +54,7 @@ final class Vault: ObservableObject {
         let ok = try? await LAContext().evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Unlock your saved logins and cards")
         unlocked = ok == true
     }
+
     func lock() { unlocked = false }
     func save() { Store.write("logins", logins); Store.write("cards", cards) }
 
@@ -83,22 +92,28 @@ final class Vault: ObservableObject {
     }
 }
 
-// MARK: Ad, tracker and cookie-banner rules
+// MARK: - Ad, tracker and cookie-banner rules
 
 enum Rules {
-    static let hosts = ["doubleclick.net", "googlesyndication.com", "googleadservices.com", "google-analytics.com",
+    static let hosts = [
+        "doubleclick.net", "googlesyndication.com", "googleadservices.com", "google-analytics.com",
         "adservice.google.com", "connect.facebook.net", "scorecardresearch.com", "taboola.com", "outbrain.com",
         "criteo.com", "adnxs.com", "amazon-adsystem.com", "hotjar.com", "quantserve.com", "pubmatic.com",
-        "rubiconproject.com", "openx.net", "moatads.com", "ads-twitter.com", "analytics.tiktok.com"]
+        "rubiconproject.com", "openx.net", "moatads.com", "ads-twitter.com", "analytics.tiktok.com"
+    ]
 
     static func compile() async -> WKContentRuleList? {
         var rules: [[String: Any]] = hosts.map { h -> [String: Any] in
             ["trigger": ["url-filter": "^https?://([^/]*\\.)?" + h.replacingOccurrences(of: ".", with: "\\."), "load-type": ["third-party"]],
              "action": ["type": "block"]]
         }
-        rules.append(["trigger": ["url-filter": ".*"],
-                      "action": ["type": "css-display-none",
-                                 "selector": "#onetrust-consent-sdk,#CybotCookiebotDialog,.qc-cmp2-container,#didomi-host,#cookie-banner,.cookie-banner,.cc-window,#truste-consent-track"]])
+        rules.append([
+            "trigger": ["url-filter": ".*"],
+            "action": [
+                "type": "css-display-none",
+                "selector": "#onetrust-consent-sdk,#CybotCookiebotDialog,.qc-cmp2-container,#didomi-host,#cookie-banner,.cookie-banner,.cc-window,#truste-consent-track"
+            ]
+        ])
         guard let d = try? JSONSerialization.data(withJSONObject: rules),
               let s = String(data: d, encoding: .utf8),
               let store = WKContentRuleListStore.default() else { return nil }
@@ -110,7 +125,421 @@ enum Rules {
     static let capture = "document.addEventListener('submit',function(e){var f=e.target;var p=f.querySelector('input[type=password]');if(!p||!p.value)return;var u=f.querySelector('input[type=email],input[type=text],input[autocomplete=username]');window.webkit.messageHandlers.cred.postMessage({site:location.origin,user:u?u.value:'',pass:p.value})},true);"
 }
 
-// MARK: One browser pane
+// MARK: - VPN Service (IKEv2 via NEVPNManager)
+
+struct VPNServer: Identifiable, Codable, Hashable {
+    var id: String { address }
+    var provider: String
+    var name: String
+    var address: String
+    var remoteID: String
+
+    func hash(into hasher: inout Hasher) { hasher.combine(address) }
+    static func == (lhs: VPNServer, rhs: VPNServer) -> Bool { lhs.address == rhs.address }
+}
+
+@MainActor
+final class VPNService: ObservableObject {
+    static let presets: [VPNServer] = [
+        // hide.me (Audited, verified no-log, native free IKEv2 servers)
+        VPNServer(provider: "hide.me", name: "hide.me – Netherlands (Free)", address: "free-nl.hide.me", remoteID: "hide.me"),
+        VPNServer(provider: "hide.me", name: "hide.me – United States (Free)", address: "free-us.hide.me", remoteID: "hide.me"),
+        VPNServer(provider: "hide.me", name: "hide.me – Germany (Free)", address: "free-de.hide.me", remoteID: "hide.me"),
+        VPNServer(provider: "hide.me", name: "hide.me – Canada (Free)", address: "free-ca.hide.me", remoteID: "hide.me"),
+
+        // Proton VPN (Swiss privacy, free endpoints)
+        VPNServer(provider: "Proton VPN", name: "Proton – Netherlands (Free)", address: "nl-free-01.protonvpn.net", remoteID: "nl-free-01.protonvpn.net"),
+        VPNServer(provider: "Proton VPN", name: "Proton – United States (Free)", address: "us-free-01.protonvpn.net", remoteID: "us-free-01.protonvpn.net"),
+        VPNServer(provider: "Proton VPN", name: "Proton – Japan (Free)", address: "jp-free-01.protonvpn.net", remoteID: "jp-free-01.protonvpn.net"),
+    ]
+
+    @Published var status: NEVPNStatus = .disconnected
+    @Published var errorMessage: String?
+    @Published var selectedServer: VPNServer = presets[0]
+    @Published var isConfigured: Bool = false
+
+    private let manager = NEVPNManager.shared()
+
+    init() {
+        if let savedAddr = UserDefaults.standard.string(forKey: "vpn_server_address"),
+           let match = Self.presets.first(where: { $0.address == savedAddr }) {
+            selectedServer = match
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .NEVPNStatusDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.status = self.manager.connection.status
+            }
+        }
+
+        Task { await reloadConfiguration() }
+    }
+
+    func reloadConfiguration() async {
+        do {
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+                manager.loadFromPreferences { err in
+                    if let err { c.resume(throwing: err) } else { c.resume() }
+                }
+            }
+            status = manager.connection.status
+            isConfigured = manager.protocolConfiguration != nil
+        } catch {
+            status = .invalid
+            isConfigured = false
+        }
+    }
+
+    var statusTitle: String {
+        switch status {
+        case .connected: return "Connected"
+        case .connecting: return "Connecting…"
+        case .disconnecting: return "Disconnecting…"
+        case .disconnected: return isConfigured ? "Disconnected" : "Not Configured"
+        case .reasserting: return "Reconnecting…"
+        case .invalid: return "Not Configured"
+        @unknown default: return "Unknown"
+        }
+    }
+
+    var statusColor: Color {
+        switch status {
+        case .connected: return .green
+        case .connecting, .reasserting, .disconnecting: return .orange
+        case .disconnected: return isConfigured ? .secondary : .gray
+        default: return .secondary
+        }
+    }
+
+    func configure(server: VPNServer, username: String, password: String) async {
+        do {
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+                manager.loadFromPreferences { err in
+                    if let err { c.resume(throwing: err) } else { c.resume() }
+                }
+            }
+
+            guard let passwordRef = keychainSave(password) else {
+                throw NSError(domain: "SplitDeckVPN", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to securely store VPN password in Keychain."])
+            }
+
+            let proto = NEVPNProtocolIKEv2()
+            proto.serverAddress = server.address
+            proto.remoteIdentifier = server.remoteID
+            proto.authenticationMethod = .usernamePassword
+            proto.useExtendedAuthentication = true
+            proto.username = username
+            proto.passwordReference = passwordRef
+
+            // Standard cryptographic suites for maximum compatibility with hide.me, Proton & strongSwan
+            proto.ikeSecurityAssociationParameters.encryptionAlgorithm = .algorithmAES256GCM
+            proto.ikeSecurityAssociationParameters.integrityAlgorithm = .SHA256
+            proto.ikeSecurityAssociationParameters.diffieHellmanGroup = .group14
+            proto.ikeSecurityAssociationParameters.lifetimeMinutes = 1440
+
+            proto.childSecurityAssociationParameters.encryptionAlgorithm = .algorithmAES256GCM
+            proto.childSecurityAssociationParameters.integrityAlgorithm = .SHA256
+            proto.childSecurityAssociationParameters.diffieHellmanGroup = .group14
+            proto.childSecurityAssociationParameters.lifetimeMinutes = 1440
+
+            proto.disconnectOnSleep = false
+            proto.deadPeerDetectionRate = .medium
+
+            manager.protocolConfiguration = proto
+            manager.localizedDescription = "SplitDeck VPN (\(server.provider))"
+            manager.isEnabled = true
+            selectedServer = server
+
+            UserDefaults.standard.set(server.address, forKey: "vpn_server_address")
+            UserDefaults.standard.set(username, forKey: "vpn_saved_username")
+
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+                manager.saveToPreferences { err in
+                    if let err { c.resume(throwing: err) } else { c.resume() }
+                }
+            }
+
+            isConfigured = true
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func connect() async {
+        do {
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+                manager.loadFromPreferences { err in
+                    if let err { c.resume(throwing: err) } else { c.resume() }
+                }
+            }
+            try manager.connection.startVPNTunnel()
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func disconnect() {
+        manager.connection.stopVPNTunnel()
+    }
+
+    private func keychainSave(_ password: String) -> Data? {
+        guard let data = password.data(using: .utf8) else { return nil }
+        let acct = "SplitDeck_VPN_Key"
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: acct
+        ]
+        SecItemDelete(base as CFDictionary)
+
+        var add = base
+        add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        add[kSecReturnPersistentRef as String] = true
+
+        var ref: AnyObject?
+        let status = SecItemAdd(add as CFDictionary, &ref)
+        if status == errSecSuccess, let persistentRef = ref as? Data {
+            return persistentRef
+        }
+        return nil
+    }
+}
+
+// MARK: - VPN View
+
+struct VPNView: View {
+    @ObservedObject var vpn: VPNService
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var username = UserDefaults.standard.string(forKey: "vpn_saved_username") ?? ""
+    @State private var password = ""
+    @State private var useCustom = false
+    @State private var customServer = ""
+    @State private var customRemoteID = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Connection Status") {
+                    HStack {
+                        Circle().fill(vpn.statusColor).frame(width: 12, height: 12)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(vpn.statusTitle).font(.headline)
+                            if vpn.status == .connected {
+                                Text("Routing traffic via \(vpn.selectedServer.name)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer()
+                        if vpn.status == .connected {
+                            Button("Disconnect") { vpn.disconnect() }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.red)
+                        } else if vpn.status == .connecting || vpn.status == .reasserting || vpn.status == .disconnecting {
+                            ProgressView()
+                        } else if vpn.isConfigured {
+                            Button("Connect") { Task { await vpn.connect() } }
+                                .buttonStyle(.borderedProminent)
+                        }
+                    }
+                }
+
+                Section("Free Trusted Provider") {
+                    Picker("Server", selection: $vpn.selectedServer) {
+                        Section("hide.me (Audited No-Logs, Free IKEv2)") {
+                            ForEach(VPNService.presets.filter { $0.provider == "hide.me" }) { s in
+                                Text(s.name).tag(s)
+                            }
+                        }
+                        Section("Proton VPN (Free Tier)") {
+                            ForEach(VPNService.presets.filter { $0.provider == "Proton VPN" }) { s in
+                                Text(s.name).tag(s)
+                            }
+                        }
+                    }
+                    .pickerStyle(.navigationLink)
+
+                    Toggle("Use custom IKEv2 server", isOn: $useCustom.animation())
+                    if useCustom {
+                        TextField("Server Hostname or IP", text: $customServer)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .keyboardType(.URL)
+                        TextField("Remote ID", text: $customRemoteID)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
+                }
+
+                Section {
+                    TextField("VPN Username", text: $username)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .textContentType(.username)
+                    SecureField("VPN Password", text: $password)
+                        .textContentType(.password)
+                } header: {
+                    Text("Credentials")
+                } footer: {
+                    VStack(alignment: .leading, spacing: 6) {
+                        if vpn.selectedServer.provider == "hide.me" {
+                            Text("• **hide.me Free**: Sign up free at hide.me (no credit card required). Enter your hide.me account username and password above.")
+                        } else if vpn.selectedServer.provider == "Proton VPN" {
+                            Text("• **Proton VPN**: Sign up free at protonvpn.com. Go to Account → Settings → OpenVPN / IKEv2 credentials and copy your generated credentials.")
+                        } else {
+                            Text("• Enter standard credentials for your self-hosted strongSwan or private IKEv2 server.")
+                        }
+                    }
+                    .font(.caption)
+                }
+
+                Section {
+                    Button {
+                        let targetServer = useCustom
+                            ? VPNServer(provider: "Custom", name: "Custom (\(customServer))", address: customServer, remoteID: customRemoteID.isEmpty ? customServer : customRemoteID)
+                            : vpn.selectedServer
+
+                        Task {
+                            await vpn.configure(server: targetServer, username: username, password: password)
+                            if vpn.errorMessage == nil {
+                                await vpn.connect()
+                            }
+                        }
+                    } label: {
+                        HStack {
+                            Spacer()
+                            Label(vpn.status == .connected ? "Update Configuration" : "Save & Connect", systemImage: "lock.shield")
+                                .fontWeight(.semibold)
+                            Spacer()
+                        }
+                    }
+                    .disabled(username.isEmpty || password.isEmpty || (useCustom && customServer.isEmpty))
+                }
+
+                if let err = vpn.errorMessage {
+                    Section {
+                        Label(err, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.red)
+                            .font(.subheadline)
+                    }
+                }
+            }
+            .navigationTitle("VPN Shield")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Display Settings (120Hz ProMotion & 30/60Hz Battery Saver)
+
+enum FrameRateMode: String, CaseIterable, Identifiable {
+    case max120 = "120"
+    case balanced60 = "60"
+    case saver30 = "30"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .max120: return "120 Hz (ProMotion Ultra Smooth)"
+        case .balanced60: return "60 Hz (Standard / Battery Saver)"
+        case .saver30: return "30 Hz (Maximum Battery Saver)"
+        }
+    }
+
+    var shortLabel: String {
+        switch self {
+        case .max120: return "120 Hz"
+        case .balanced60: return "60 Hz"
+        case .saver30: return "30 Hz"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .max120: return "bolt.fill"
+        case .balanced60: return "leaf.fill"
+        case .saver30: return "battery.50percent"
+        }
+    }
+
+    var fpsRange: CAFrameRateRange {
+        switch self {
+        case .max120:
+            return CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
+        case .balanced60:
+            return CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+        case .saver30:
+            return CAFrameRateRange(minimum: 15, maximum: 30, preferred: 30)
+        }
+    }
+}
+
+private final class DisplayLinkProxy: NSObject {
+    @objc func tick(_ link: CADisplayLink) {}
+}
+
+@MainActor
+final class DisplaySettings: ObservableObject {
+    @Published var currentMode: FrameRateMode {
+        didSet {
+            UserDefaults.standard.set(currentMode.rawValue, forKey: "splitdeck_framerate_mode")
+            applyFrameRate()
+        }
+    }
+
+    var isProMotionSupported: Bool {
+        UIScreen.main.maximumFramesPerSecond >= 120
+    }
+
+    var hardwareMaxFPS: Int {
+        UIScreen.main.maximumFramesPerSecond
+    }
+
+    private var displayLink: CADisplayLink?
+    private let proxy = DisplayLinkProxy()
+
+    init() {
+        let saved = UserDefaults.standard.string(forKey: "splitdeck_framerate_mode") ?? ""
+        self.currentMode = FrameRateMode(rawValue: saved) ?? .max120
+        applyFrameRate()
+    }
+
+    /// Applies preferred frame rate range to guide iOS display pacing.
+    /// When CADisableMinimumFrameDurationOnPhone is enabled, ProMotion devices run at up to 120Hz.
+    /// In battery saver modes (60Hz or 30Hz), CADisplayLink locks the preferred range down.
+    func applyFrameRate() {
+        displayLink?.invalidate()
+        displayLink = nil
+
+        // If low power mode is active globally, iOS caps to 60Hz automatically
+        let targetRange = currentMode.fpsRange
+
+        let link = CADisplayLink(target: proxy, selector: #selector(DisplayLinkProxy.tick))
+        link.preferredFrameRateRange = targetRange
+        link.add(to: .main, forMode: .common)
+        self.displayLink = link
+    }
+
+    deinit {
+        displayLink?.invalidate()
+    }
+}
+
+// MARK: - Browser Pane
 
 final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate, WKScriptMessageHandler {
     let id = UUID()
@@ -211,7 +640,7 @@ struct PaneView: View {
     }
 }
 
-// MARK: Vault screen
+// MARK: - Vault Screen
 
 struct VaultView: View {
     @ObservedObject var vault: Vault
@@ -273,12 +702,15 @@ struct VaultView: View {
     }
 }
 
-// MARK: Main screen
+// MARK: - Main Screen
 
 struct ContentView: View {
     @StateObject private var first = Pane(start: "https://duckduckgo.com")
     @StateObject private var second = Pane(start: "https://en.wikipedia.org")
     @StateObject private var vault = Vault()
+    @StateObject private var vpn = VPNService()
+    @StateObject private var display = DisplaySettings()
+
     @Environment(\.scenePhase) private var phase
     @State private var split: CGFloat = 0.5
     @State private var splitOn = true
@@ -286,6 +718,7 @@ struct ContentView: View {
     @State private var blockOn = true
     @State private var rules: WKContentRuleList?
     @State private var showVault = false
+    @State private var showVPN = false
     @State private var pending: Login?
     private let handle: CGFloat = 16
 
@@ -313,14 +746,54 @@ struct ContentView: View {
             Menu {
                 Toggle("Split view", isOn: $splitOn)
                 if !splitOn { Button("Switch page") { showSecond.toggle() } }
-                Toggle("Block ads and trackers", isOn: $blockOn)
-                Button("Passwords and cards") { showVault = true }
+                Toggle("Block ads & trackers", isOn: $blockOn)
+                Button("Passwords & cards") { showVault = true }
+
+                Divider()
+
+                Button {
+                    showVPN = true
+                } label: {
+                    Label("VPN Shield (\(vpn.statusTitle))",
+                          systemImage: vpn.status == .connected ? "lock.shield.fill" : "shield")
+                }
+
+                Divider()
+
+                Menu {
+                    ForEach(FrameRateMode.allCases) { m in
+                        Button {
+                            display.currentMode = m
+                        } label: {
+                            HStack {
+                                Text(m.label)
+                                if display.currentMode == m {
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    Label("Display Rate: \(display.currentMode.shortLabel)", systemImage: display.currentMode.icon)
+                }
             } label: {
-                Image(systemName: "ellipsis.circle.fill").font(.title2).padding(10)
+                HStack(spacing: 6) {
+                    if vpn.status == .connected {
+                        Image(systemName: "lock.shield.fill")
+                            .font(.subheadline)
+                            .foregroundStyle(.green)
+                    }
+                    Image(systemName: "ellipsis.circle.fill")
+                        .font(.title2)
+                }
+                .padding(10)
+                .background(.ultraThinMaterial, in: Circle())
+                .padding(12)
             }
         }
         .statusBarHidden(true)
         .sheet(isPresented: $showVault) { VaultView(vault: vault, fill: fill) }
+        .sheet(isPresented: $showVPN) { VPNView(vpn: vpn) }
         .alert("Save password?", isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } })) {
             Button("Save") { if let p = pending { vault.logins.append(p); vault.save() }; pending = nil }
             Button("Not now", role: .cancel) { pending = nil }
@@ -330,9 +803,14 @@ struct ContentView: View {
             second.onCredential = { pending = $0 }
             rules = await Rules.compile()
             apply()
+            display.applyFrameRate()
         }
         .onChange(of: blockOn) { _, _ in apply() }
-        .onChange(of: phase) { _, p in if p != .active { vault.lock() } }
+        .onChange(of: phase) { _, p in
+            if p != .active {
+                vault.lock()
+            }
+        }
     }
 
     private func apply() {
@@ -354,7 +832,7 @@ struct ContentView: View {
 
     private func divider(horizontal: Bool, total: CGFloat) -> some View {
         ZStack {
-            Color(.systemGray5)
+            Color(uiColor: .systemGray5)
             Capsule().fill(Color.secondary)
                 .frame(width: horizontal ? 4 : 40, height: horizontal ? 40 : 4)
         }

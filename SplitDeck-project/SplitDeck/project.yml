@@ -7,7 +7,15 @@ targets:
   SplitDeck:
     type: application
     platform: iOS
-    sources: [Sources]
+    sources:
+      - Sources
+    entitlements:
+      path: Sources/SplitDeck.entitlements
+    dependencies:
+      - sdk: NetworkExtension.framework
+      - sdk: WebKit.framework
+      - sdk: LocalAuthentication.framework
+      - sdk: Security.framework
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.splitdeck
@@ -17,6 +25,11 @@ targets:
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
         INFOPLIST_KEY_NSFaceIDUsageDescription: "Unlock your saved logins and cards"
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_CADisableMinimumFrameDurationOnPhone: YES
         MARKETING_VERSION: "1.0"
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "5.0"
+        CODE_SIGN_STYLE: Manual
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
