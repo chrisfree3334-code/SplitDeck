@@ -2933,7 +2933,7 @@ struct PaneView: View {
 
     // Full screen: the page runs underneath the floating bar, scrolling clear of it.
     // Split view: each page sits between slim strips.
-    var body: some View {
+    private var stack: some View {
         VStack(spacing: 0) {
             if atTop && !floating { topRow }
             ZStack {
@@ -2971,13 +2971,18 @@ struct PaneView: View {
             }
             .clipped()
             .overlay(alignment: atTop ? .top : .bottom) {
-                if floating { floatingBar }
+                if floating { AnyView(floatingBar) }
             }
             .overlay(alignment: .bottom) {
                 if floating && atTop && showToolbar { floatingToolbar }
             }
             if !atTop && !floating { bottomRow }
         }
+    }
+
+    // Type-erased layers keep SwiftUI's view types shallow (see ContentView.body).
+    var body: some View {
+        AnyView(stack)
         .onPreferenceChange(BarCoverKey.self) { c in
             cover = c
             pane.setCover(c)
@@ -3103,7 +3108,7 @@ struct PaneView: View {
             shareButton.frame(maxWidth: .infinity)
             if !actions.islandShown && actions.splitEnabled { splitButton.frame(maxWidth: .infinity) }
             tabsButton.frame(maxWidth: .infinity)
-            menu.frame(maxWidth: .infinity)
+            AnyView(menu).frame(maxWidth: .infinity)
         }
         .frame(height: 46)
         .simultaneousGesture(TapGesture().onEnded { touched() })
@@ -3271,7 +3276,7 @@ struct PaneView: View {
                 }
                 if !actions.islandShown && actions.splitEnabled { splitButton }
                 if !compact || !actions.islandShown { tabsButton }
-                menu
+                AnyView(menu)
             }
         }
         .frame(height: barH - 6)
@@ -3302,7 +3307,7 @@ struct PaneView: View {
     // never cross-fades: it shrinks around the address while the buttons fold away into it (like Safari),
     // and grows back out when you tap it, even while the page is still moving.
     private var mainBar: some View {
-        HStack(spacing: 0) {
+        AnyView(HStack(spacing: 0) {
             if showEnds && toolbarLayout && pane.isPrivate {
                 Image(systemName: "eye.slash.fill")
                     .font(.system(size: 12, weight: .semibold))
@@ -3330,7 +3335,7 @@ struct PaneView: View {
             } else if showEnds {
                 trailingEnd.transition(.opacity.combined(with: .scale(scale: 0.5, anchor: .trailing)))
             }
-        }
+        })
         .padding(.horizontal, mini ? (compact ? 12 : 18) : 0)
         .frame(height: mini ? pillH : barH)
         .frame(maxWidth: mini ? nil : .infinity)
@@ -5907,6 +5912,9 @@ struct ContentView: View {
     @State private var appLocked = UserDefaults.standard.bool(forKey: "appLock")
     @State private var leftAt: Date?
     @State private var unlocking = false
+    // Status bar and home indicator sizes. Read from the window after layout, never while SwiftUI is
+    // building the screen: asking UIKit then re-enters SwiftUI's update and doubles the stack it uses.
+    @State private var insets = UIEdgeInsets(top: 62, left: 0, bottom: 34, right: 0)   // typical iPhone, replaced right after launch
 
     // Battery saver: dark only. Private tab on top: dark. Otherwise your Light / Dark / System choice.
     private var appScheme: ColorScheme? {
@@ -5925,9 +5933,84 @@ struct ContentView: View {
         }
     }
 
+    // The screen is built in type-erased layers. As one long chain, the view's type is nested so deeply
+    // that working it out overflows the iPhone's 1 MB main-thread stack at launch (the simulator's
+    // larger stack hides this), which is what crashed 1.2 on device.
     var body: some View {
+        AnyView(presented)
+        .onChange(of: shields.version) { _, _ in applyShields() }
+        .onChange(of: blockOn) { _, _ in shields.masterChanged() }
+        .onChange(of: saver) { _, _ in applySaver() }
+        .onChange(of: minimalBar) { _, _ in applySaver() }
+        .onChange(of: splitEnabled) { _, on in
+            if !on && tabs.split { withAnimation(anim(.snappy)) { tabs.closeSplit(keep: 0) } }
+        }
+        .onChange(of: activeTheme) { _, _ in tabs.allLive.forEach { $0.objectWillChange.send() } }
+        .onAppear { appIconName = UIApplication.shared.alternateIconName ?? "" }
+        .onChange(of: engine) { _, _ in tabs.visible.forEach { tabs.pane($0).goHome() } }
+        .onChange(of: phase) { _, p in phaseChanged(p) }
+        .onChange(of: appLock) { _, on in if !on { appLocked = false } }
+        .onOpenURL { openLink($0) }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
+            tabs.sleepHidden()
+        }
+    }
+
+    private func phaseChanged(_ p: ScenePhase) {
+        if p != .active { vault.lock() }
+        if p == .background && lockPrivate && tabs.privateCount > 0 { privateLocked = true }
+        if p == .background { leftAt = Date() }
+        if p == .active { refreshInsets() }
+        if p == .active && appLock, let left = leftAt {
+            leftAt = nil
+            if Date().timeIntervalSince(left) >= Double(appLockDelay) {
+                sheet = nil
+                shieldsPane = nil
+                tabsOpen = false
+                appLocked = true
+            }
+            if appLocked { unlockApp() }
+        }
+    }
+
+    private func refreshInsets() {
+        DispatchQueue.main.async {
+            let i = ContentView.windowInsets()
+            if i != insets { insets = i }
+        }
+    }
+
+    private var presented: some View {
+        AnyView(screen)
+        .sheet(item: $sheet) { s in
+            sheetView(s)
+                .preferredColorScheme(appScheme)
+                .tint(activeTheme.accent)
+                .transaction { t in if saver { t.animation = nil; t.disablesAnimations = true } }
+        }
+        // Its own sheet, carrying the page with it, so it never opens blank.
+        .sheet(item: $shieldsPane) { p in
+            ShieldsView(shields: shields, pane: p)
+                .presentationDetents([.medium, .large])
+                .preferredColorScheme(appScheme)
+                .tint(activeTheme.accent)
+        }
+        .task {
+            Pane.ruleProvider = { host in shields.rules(for: host) }
+            Pane.youtubeProvider = { host in shields.youtubeOn(for: host) }
+            Pane.onBlocked = { shields.countBlocked() }
+            if appLock && appLocked { unlockApp() }
+            tabs.configure = { p in configure(p) }
+            tabs.allLive.forEach { configure($0) }
+            applySaver()
+            refreshInsets()
+            await shields.prepare()
+        }
+    }
+
+    private var screen: some View {
         GeometryReader { root in
-            let safe = ContentView.windowInsets()
+            let safe = insets
             let portrait = root.size.height >= root.size.width
             let topOwnStrip = tabs.split && portrait   // the top pane draws its own strip under the status bar
             VStack(spacing: 0) {
@@ -5936,6 +6019,7 @@ struct ContentView: View {
                 }
                 deck(portrait: portrait, safe: safe)
             }
+            .onChange(of: root.size) { _, _ in refreshInsets() }
             .ignoresSafeArea(.container, edges: .vertical)
             .background(activeTheme.strip.ignoresSafeArea())
             .overlay {
@@ -5983,59 +6067,6 @@ struct ContentView: View {
         .preferredColorScheme(appScheme)
         .transaction { t in
             if saver { t.animation = nil; t.disablesAnimations = true }
-        }
-        .sheet(item: $sheet) { s in
-            sheetView(s)
-                .preferredColorScheme(appScheme)
-                .tint(activeTheme.accent)
-                .transaction { t in if saver { t.animation = nil; t.disablesAnimations = true } }
-        }
-        // Its own sheet, carrying the page with it, so it never opens blank.
-        .sheet(item: $shieldsPane) { p in
-            ShieldsView(shields: shields, pane: p)
-                .presentationDetents([.medium, .large])
-                .preferredColorScheme(appScheme)
-                .tint(activeTheme.accent)
-        }
-        .task {
-            Pane.ruleProvider = { host in shields.rules(for: host) }
-            Pane.youtubeProvider = { host in shields.youtubeOn(for: host) }
-            Pane.onBlocked = { shields.countBlocked() }
-            if appLock && appLocked { unlockApp() }
-            tabs.configure = { p in configure(p) }
-            tabs.allLive.forEach { configure($0) }
-            applySaver()
-            await shields.prepare()
-        }
-        .onChange(of: shields.version) { _, _ in applyShields() }
-        .onChange(of: blockOn) { _, _ in shields.masterChanged() }
-        .onChange(of: saver) { _, _ in applySaver() }
-        .onChange(of: minimalBar) { _, _ in applySaver() }
-        .onChange(of: splitEnabled) { _, on in
-            if !on && tabs.split { withAnimation(anim(.snappy)) { tabs.closeSplit(keep: 0) } }
-        }
-        .onChange(of: activeTheme) { _, _ in tabs.allLive.forEach { $0.objectWillChange.send() } }
-        .onAppear { appIconName = UIApplication.shared.alternateIconName ?? "" }
-        .onChange(of: engine) { _, _ in tabs.visible.forEach { tabs.pane($0).goHome() } }
-        .onChange(of: phase) { _, p in
-            if p != .active { vault.lock() }
-            if p == .background && lockPrivate && tabs.privateCount > 0 { privateLocked = true }
-            if p == .background { leftAt = Date() }
-            if p == .active && appLock, let left = leftAt {
-                leftAt = nil
-                if Date().timeIntervalSince(left) >= Double(appLockDelay) {
-                    sheet = nil
-                    shieldsPane = nil
-                    tabsOpen = false
-                    appLocked = true
-                }
-                if appLocked { unlockApp() }
-            }
-        }
-        .onChange(of: appLock) { _, on in if !on { appLocked = false } }
-        .onOpenURL { openLink($0) }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
-            tabs.sleepHidden()
         }
     }
 
