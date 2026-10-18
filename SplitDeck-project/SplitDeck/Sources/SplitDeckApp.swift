@@ -6,10 +6,42 @@ import UniformTypeIdentifiers
 import EventKit
 import EventKitUI
 import NetworkExtension
+import PhotosUI
 
 @main
 struct SplitDeckApp: App {
     var body: some Scene { WindowGroup { ContentView() } }
+}
+
+// Colour for bar icons and text when "Adapt to Page" is off.
+enum TextColors {
+    static let names = ["System", "White", "Black", "Blue", "Orange", "Mint", "Pink"]
+
+    static func color(_ n: String) -> Color? {
+        switch n {
+        case "White": return .white
+        case "Black": return .black
+        case "Blue": return Color(red: 0.04, green: 0.52, blue: 1.0)
+        case "Orange": return Color(red: 1.0, green: 0.58, blue: 0.0)
+        case "Mint": return Color(red: 0.39, green: 0.9, blue: 0.75)
+        case "Pink": return Color(red: 1.0, green: 0.5, blue: 0.72)
+        default: return nil
+        }
+    }
+
+    // Light text sits on a dark surface and vice versa; nil = follow the phone's light/dark mode.
+    static func isLight(_ n: String) -> Bool? {
+        switch n {
+        case "White", "Mint", "Pink": return true
+        case "Black": return false
+        default: return nil
+        }
+    }
+
+    static func ink(adaptive: Bool, name: String) -> AnyShapeStyle {
+        if !adaptive, let c = color(name) { return AnyShapeStyle(c) }
+        return AnyShapeStyle(.primary)
+    }
 }
 
 enum BarColors {
@@ -183,6 +215,12 @@ enum Rules {
             ["trigger": ["url-filter": "^https?://([^/]*\\.)?" + h.replacingOccurrences(of: ".", with: "\\."), "load-type": ["third-party"]],
              "action": ["type": "block"]]
         }
+        // YouTube serves ads from its own domain, so these are matched by path instead of by host.
+        for path in ["youtube\\.com/api/stats/ads", "youtube\\.com/pagead/", "youtube\\.com/ptracking",
+                     "youtube\\.com/get_midroll_", "youtube\\.com/api/stats/qoe\\?.*adformat",
+                     "youtube\\.com/youtubei/v1/log_event"] {
+            rules.append(["trigger": ["url-filter": path], "action": ["type": "block"]])
+        }
         rules.append(["trigger": ["url-filter": ".*"],
                       "action": ["type": "css-display-none",
                                  "selector": "#onetrust-consent-sdk,#CybotCookiebotDialog,.qc-cmp2-container,#didomi-host,#cookie-banner,.cookie-banner,.cc-window,#truste-consent-track"]])
@@ -195,6 +233,71 @@ enum Rules {
     static let decline = "(function(){var s=['#onetrust-reject-all-handler','#CybotCookiebotDialogBodyButtonDecline','#didomi-notice-disagree-button','.fc-cta-do-not-consent','button.cc-deny','[data-testid=reject-all]','[aria-label=\"Reject all\"]','.js-reject-cookies'];var n=0;var t=setInterval(function(){s.forEach(function(x){var b=document.querySelector(x);if(b)b.click()});if(++n>20)clearInterval(t)},500)})();"
 
     static let capture = "document.addEventListener('submit',function(e){var f=e.target;var p=f.querySelector('input[type=password]');if(!p||!p.value)return;var u=f.querySelector('input[type=email],input[type=text],input[autocomplete=username]');window.webkit.messageHandlers.cred.postMessage({site:location.origin,user:u?u.value:'',pass:p.value})},true);"
+
+    // Runs before YouTube's own code: strips ad data from the player's settings, hides ad slots,
+    // and as a last resort mutes and skips any ad that still starts.
+    static let youtube = #"""
+    (function () {
+      if (!/(^|\.)youtube(-nocookie)?\.com$/.test(location.hostname) || window.__sdYT) return;
+      window.__sdYT = true;
+      var KEYS = ['adPlacements', 'playerAds', 'adSlots', 'adBreakHeartbeatParams', 'adBreakParams'];
+      function prune(o, depth) {
+        if (!o || typeof o !== 'object' || depth > 4) return o;
+        if (Array.isArray(o)) { for (var i = 0; i < o.length; i++) prune(o[i], depth + 1); return o; }
+        for (var k = 0; k < KEYS.length; k++) { if (KEYS[k] in o) { try { delete o[KEYS[k]]; } catch (e) {} } }
+        if (o.playerResponse) prune(o.playerResponse, depth + 1);
+        if (o.response) prune(o.response, depth + 1);
+        if (o.data) prune(o.data, depth + 1);
+        return o;
+      }
+      var parse = JSON.parse;
+      JSON.parse = function () { var r = parse.apply(this, arguments); try { prune(r, 0); } catch (e) {} return r; };
+      var json = Response.prototype.json;
+      Response.prototype.json = function () {
+        return json.apply(this, arguments).then(function (d) { try { prune(d, 0); } catch (e) {} return d; });
+      };
+      var initial;
+      try {
+        Object.defineProperty(window, 'ytInitialPlayerResponse', {
+          configurable: true,
+          get: function () { return initial; },
+          set: function (v) { initial = prune(v, 0); }
+        });
+      } catch (e) {}
+      var css = 'ytd-ad-slot-renderer,ytd-in-feed-ad-layout-renderer,ytd-promoted-sparkles-web-renderer,' +
+        'ytd-promoted-video-renderer,ytd-display-ad-renderer,ytd-companion-slot-renderer,' +
+        'ytd-action-companion-ad-renderer,ytd-banner-promo-renderer,ytd-statement-banner-renderer,' +
+        'ytd-player-legacy-desktop-watch-ads-renderer,#masthead-ad,#player-ads,' +
+        'ytm-promoted-sparkles-web-renderer,ytm-promoted-sparkles-text-search-renderer,ytm-companion-ad-renderer,' +
+        'ytm-companion-slot,ad-slot-renderer,ytm-ad-slot-renderer,ytm-in-feed-ad-layout-renderer,' +
+        'ytm-promoted-video-renderer,ytm-paid-content-overlay-renderer,.ytp-ad-overlay-container,' +
+        '.ytp-ad-message-container,.ytp-featured-product,' +
+        'ytm-rich-item-renderer:has(ad-slot-renderer),ytm-item-section-renderer:has(ytm-ad-slot-renderer),' +
+        'ytd-rich-item-renderer:has(ytd-ad-slot-renderer){display:none!important}';
+      var style = document.createElement('style');
+      style.textContent = css;
+      (document.head || document.documentElement).appendChild(style);
+      setInterval(function () {
+        var v = document.querySelector('video');
+        var ad = document.querySelector('.ad-showing, .ad-interrupting');
+        if (v && ad) {
+          if (!v.__sdAd) { v.__sdAd = true; v.__sdMuted = v.muted; }
+          v.muted = true;
+          v.playbackRate = 16;
+          if (isFinite(v.duration) && v.duration > 0 && v.currentTime < v.duration - 0.2) {
+            try { v.currentTime = v.duration - 0.1; } catch (e) {}
+          }
+        } else if (v && v.__sdAd) {
+          v.__sdAd = false;
+          v.muted = v.__sdMuted;
+          v.playbackRate = 1;
+        }
+        var skip = document.querySelector('.ytp-ad-skip-button, .ytp-ad-skip-button-modern, .ytp-skip-ad-button, ' +
+          '.ytm-skip-ad-button, .ytp-ad-skip-button-container button, button[class*="skip-ad"]');
+        if (skip) skip.click();
+      }, 250);
+    })();
+    """#
 
     static let raf = "(function(){var raf=window.requestAnimationFrame.bind(window);var last=0;window.requestAnimationFrame=function(cb){return raf(function ts(t){var f=window.__sdFps||0;if(f&&t-last<1000/f-2){raf(ts);return}last=t;cb(t)})}})();"
 
@@ -559,6 +662,19 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     var onChange: (() -> Void)?
     static var fps = 0
     static var ruleProvider: ((String) -> [WKContentRuleList])?
+    static var youtubeProvider: ((String) -> Bool)?
+    @Published var loading = false
+    private var loadObs: NSKeyValueObservation?
+
+    static func installScripts(_ u: WKUserContentController, youtube: Bool) {
+        u.removeAllUserScripts()
+        u.addUserScript(WKUserScript(source: Rules.raf, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        if youtube {
+            u.addUserScript(WKUserScript(source: Rules.youtube, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        }
+        u.addUserScript(WKUserScript(source: Rules.decline, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        u.addUserScript(WKUserScript(source: Rules.capture, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
+    }
     static var onBlocked: (() -> Void)?
     private var obs: NSKeyValueObservation?
     private var lastY: CGFloat = 0
@@ -580,9 +696,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         config.upgradeKnownHostsToHTTPS = true
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
         config.applicationNameForUserAgent = "Version/18.0 Mobile/15E148 Safari/604.1"
-        config.userContentController.addUserScript(WKUserScript(source: Rules.raf, injectionTime: .atDocumentStart, forMainFrameOnly: true))
-        config.userContentController.addUserScript(WKUserScript(source: Rules.decline, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
-        config.userContentController.addUserScript(WKUserScript(source: Rules.capture, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
+        Pane.installScripts(config.userContentController, youtube: false)
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.allowsBackForwardNavigationGestures = true
         wv.scrollView.keyboardDismissMode = .interactive
@@ -607,6 +721,9 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             }
             if y <= 0 && self.collapsed { self.collapsed = false }
             self.scheduleTint()
+        }
+        loadObs = wv.observe(\.isLoading, options: [.new]) { [weak self] w, _ in
+            DispatchQueue.main.async { self?.loading = w.isLoading }
         }
         if let start, !start.isEmpty { load(start) }
     }
@@ -758,11 +875,16 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     @discardableResult
     func applyRules(host: String) -> Bool {
         let lists = Pane.ruleProvider?(host) ?? []
-        let ids = lists.map { $0.identifier ?? "" }
+        let youtube = Pane.youtubeProvider?(host) ?? false
+        let ids = lists.map { $0.identifier ?? "" } + (youtube ? ["youtube-script"] : [])
         guard ids != appliedRules else { return false }
         let u = webView.configuration.userContentController
         u.removeAllContentRuleLists()
         lists.forEach { u.add($0) }
+        let hadYouTube = appliedRules?.contains("youtube-script") ?? false
+        if appliedRules == nil || youtube != hadYouTube {
+            Pane.installScripts(u, youtube: youtube)
+        }
         appliedRules = ids
         return true
     }
@@ -1120,6 +1242,230 @@ final class Tabs: ObservableObject {
     }
 }
 
+// MARK: Themes
+
+struct Theme: Equatable {
+    let name: String
+    let top: Color       // home page gradient, top
+    let bottom: Color    // home page gradient, bottom
+    let strip: Color     // bars around the page and the status bar area
+    let accent: Color    // buttons, switches, highlights
+    let dark: Bool?      // nil = follow the phone's light/dark mode
+
+    var scheme: ColorScheme? { dark.map { $0 ? .dark : .light } }
+    var isSystem: Bool { dark == nil }
+
+    static func hex(_ h: String) -> Color {
+        let n = Int(h.dropFirst(), radix: 16) ?? 0
+        return Color(red: Double((n >> 16) & 255) / 255, green: Double((n >> 8) & 255) / 255, blue: Double(n & 255) / 255)
+    }
+
+    static let system = Theme(name: "Default", top: Color(.systemBackground), bottom: Color(.systemBackground),
+                              strip: Color(.systemBackground), accent: .blue, dark: nil)
+
+    static let presets: [Theme] = [
+        system,
+        Theme(name: "Matcha", top: hex("#EEF3E2"), bottom: hex("#CFE0B4"), strip: hex("#EEF3E2"), accent: hex("#4E7D32"), dark: false),
+        Theme(name: "Sunrise", top: hex("#FFE7C7"), bottom: hex("#FFB4A2"), strip: hex("#FFEBD3"), accent: hex("#E8572A"), dark: false),
+        Theme(name: "Ocean", top: hex("#DFF1FA"), bottom: hex("#9DCDEB"), strip: hex("#E4F3FB"), accent: hex("#1667B5"), dark: false),
+        Theme(name: "Lavender", top: hex("#F1ECFC"), bottom: hex("#CFC0F2"), strip: hex("#F2EDFC"), accent: hex("#6B4BC2"), dark: false),
+        Theme(name: "Sakura", top: hex("#FDECF1"), bottom: hex("#F6BCCD"), strip: hex("#FDEEF2"), accent: hex("#C23B6A"), dark: false),
+        Theme(name: "Midnight", top: hex("#1A2340"), bottom: hex("#090D19"), strip: hex("#0E1426"), accent: hex("#7FA2FF"), dark: true),
+        Theme(name: "Ember", top: hex("#3A1A14"), bottom: hex("#140807"), strip: hex("#1D0D0A"), accent: hex("#FF7A45"), dark: true),
+        Theme(name: "Forest", top: hex("#1F3326"), bottom: hex("#0B140E"), strip: hex("#111D15"), accent: hex("#7FD39A"), dark: true),
+    ]
+
+    // Builds a theme from a photo: the average colour for the bars, the most vivid colour as the accent.
+    static func fromImage(_ img: UIImage) -> Theme? {
+        guard let cg = img.cgImage else { return nil }
+        let w = 24, h = 24
+        var px = [UInt8](repeating: 0, count: w * h * 4)
+        let ok: Bool = px.withUnsafeMutableBytes { buf in
+            guard let ctx = CGContext(data: buf.baseAddress, width: w, height: h, bitsPerComponent: 8, bytesPerRow: w * 4,
+                                      space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return false }
+            ctx.draw(cg, in: CGRect(x: 0, y: 0, width: w, height: h))
+            return true
+        }
+        guard ok else { return nil }
+        var sum = (0.0, 0.0, 0.0)
+        var best = (score: -1.0, r: 0.0, g: 0.0, b: 0.0)
+        for i in stride(from: 0, to: px.count, by: 4) {
+            let r = Double(px[i]) / 255, g = Double(px[i + 1]) / 255, b = Double(px[i + 2]) / 255
+            sum.0 += r; sum.1 += g; sum.2 += b
+            let mx = max(r, g, b), mn = min(r, g, b)
+            let sat = mx == 0 ? 0 : (mx - mn) / mx
+            let score = sat * (1 - abs(mx - 0.75))
+            if score > best.score { best = (score, r, g, b) }
+        }
+        let n = Double(w * h)
+        let avg = (sum.0 / n, sum.1 / n, sum.2 / n)
+        let lum = 0.299 * avg.0 + 0.587 * avg.1 + 0.114 * avg.2
+        let dark = lum < 0.5
+        func mix(_ c: (Double, Double, Double), _ t: Double, _ amt: Double) -> Color {
+            Color(red: c.0 + (t - c.0) * amt, green: c.1 + (t - c.1) * amt, blue: c.2 + (t - c.2) * amt)
+        }
+        let accent = best.score > 0.12
+            ? Color(red: best.r, green: best.g, blue: best.b)
+            : (dark ? Color.white : Color.black)
+        return Theme(name: "Photo",
+                     top: mix(avg, dark ? 0 : 1, dark ? 0.2 : 0.4),
+                     bottom: mix(avg, dark ? 0 : 1, dark ? 0.45 : 0.15),
+                     strip: mix(avg, dark ? 0 : 1, dark ? 0.55 : 0.6),
+                     accent: accent,
+                     dark: dark)
+    }
+}
+
+private struct ThemeKey: EnvironmentKey {
+    static let defaultValue = Theme.system
+}
+
+private struct HomeImageKey: EnvironmentKey {
+    static let defaultValue: UIImage? = nil
+}
+
+extension EnvironmentValues {
+    var sdTheme: Theme {
+        get { self[ThemeKey.self] }
+        set { self[ThemeKey.self] = newValue }
+    }
+    var sdHomeImage: UIImage? {
+        get { self[HomeImageKey.self] }
+        set { self[HomeImageKey.self] = newValue }
+    }
+}
+
+final class ThemeStore: ObservableObject {
+    @Published var name: String = UserDefaults.standard.string(forKey: "theme") ?? "Default" {
+        didSet { UserDefaults.standard.set(name, forKey: "theme") }
+    }
+    @Published var matchPhoto: Bool = UserDefaults.standard.object(forKey: "matchPhoto") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(matchPhoto, forKey: "matchPhoto") }
+    }
+    @Published private(set) var homeImage: UIImage?
+    @Published private(set) var photoTheme: Theme?
+
+    static let imageURL: URL = {
+        let d = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d.appendingPathComponent("home-background.jpg")
+    }()
+
+    init() {
+        if let img = UIImage(contentsOfFile: ThemeStore.imageURL.path) {
+            homeImage = img
+            photoTheme = Theme.fromImage(img)
+        }
+    }
+
+    var current: Theme {
+        if matchPhoto, homeImage != nil, let p = photoTheme { return p }
+        return Theme.presets.first { $0.name == name } ?? .system
+    }
+
+    // Saves a downscaled copy (max 1600 px) so it loads fast and doesn't use much storage.
+    func setImage(_ data: Data) {
+        guard let src = UIImage(data: data) else { return }
+        let maxSide: CGFloat = 1600
+        let scale = min(1, maxSide / max(src.size.width, src.size.height))
+        let size = CGSize(width: (src.size.width * scale).rounded(), height: (src.size.height * scale).rounded())
+        let fmt = UIGraphicsImageRendererFormat()
+        fmt.scale = 1
+        let img = UIGraphicsImageRenderer(size: size, format: fmt).image { _ in src.draw(in: CGRect(origin: .zero, size: size)) }
+        try? img.jpegData(compressionQuality: 0.85)?.write(to: ThemeStore.imageURL)
+        homeImage = img
+        photoTheme = Theme.fromImage(img)
+    }
+
+    func removeImage() {
+        try? FileManager.default.removeItem(at: ThemeStore.imageURL)
+        homeImage = nil
+        photoTheme = nil
+    }
+}
+
+struct ThemeChip: View {
+    let theme: Theme
+    let selected: Bool
+    var body: some View {
+        VStack(spacing: 6) {
+            ZStack(alignment: .bottomTrailing) {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .fill(LinearGradient(colors: theme.isSystem ? [Color(.systemGray5), Color(.systemGray3)] : [theme.top, theme.bottom],
+                                         startPoint: .top, endPoint: .bottom))
+                Circle().fill(theme.accent).frame(width: 16, height: 16).padding(8)
+            }
+            .frame(width: 64, height: 84)
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(selected ? Color.accentColor : Color.primary.opacity(0.12), lineWidth: selected ? 3 : 0.5))
+            Text(theme.name).font(.caption2.weight(.medium)).foregroundStyle(.primary)
+        }
+    }
+}
+
+struct ThemeSettings: View {
+    @ObservedObject var themes: ThemeStore
+    @State private var pick: PhotosPickerItem?
+
+    var body: some View {
+        Form {
+            Section {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 14) {
+                        ForEach(Theme.presets, id: \.name) { t in
+                            Button { withAnimation(.snappy) { themes.name = t.name } } label: {
+                                ThemeChip(theme: t, selected: themes.current.name == t.name)
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("\(t.name) theme")
+                        }
+                    }
+                    .padding(.vertical, 8)
+                }
+            } header: {
+                Text("Theme")
+            } footer: {
+                if themes.matchPhoto && themes.homeImage != nil {
+                    Text("Your theme is currently matched to your home photo. Turn off Match Theme to Photo to use a preset.")
+                }
+            }
+            Section {
+                if let img = themes.homeImage {
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(height: 160)
+                        .frame(maxWidth: .infinity)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                }
+                PhotosPicker(selection: $pick, matching: .images) {
+                    Label(themes.homeImage == nil ? "Choose Photo" : "Change Photo", systemImage: "photo")
+                }
+                if themes.homeImage != nil {
+                    Toggle("Match Theme to Photo", isOn: $themes.matchPhoto)
+                    Button("Remove Photo", role: .destructive) { withAnimation { themes.removeImage() } }
+                }
+            } header: {
+                Text("Home Background")
+            } footer: {
+                Text("Your photo stays on this iPhone. Matching picks the bar, accent and light or dark look from its colours.")
+            }
+        }
+        .navigationTitle("Themes")
+        .onChange(of: pick) { _, item in
+            guard let item else { return }
+            Task {
+                if let data = try? await item.loadTransferable(type: Data.self) {
+                    await MainActor.run { withAnimation { themes.setImage(data) } }
+                }
+                await MainActor.run { pick = nil }
+            }
+        }
+    }
+}
+
 // MARK: Start page sites
 
 final class Sites: ObservableObject {
@@ -1181,7 +1527,7 @@ struct SiteIcon: View {
             }
         }
         .frame(width: size, height: size)
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: size * 0.28, style: .continuous))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: size * 0.28, style: .continuous))
     }
 }
 
@@ -1193,6 +1539,9 @@ struct StartPage: View {
     @AppStorage("homeMode") private var mode = 0
     @State private var adding = false
     @State private var newSite = ""
+    @Environment(\.sdTheme) private var theme
+    @Environment(\.sdHomeImage) private var homeImage
+    @Environment(\.colorScheme) private var sys
 
     private func name(_ h: String) -> String {
         let parts = h.split(separator: ".")
@@ -1253,7 +1602,7 @@ struct StartPage: View {
                                     .font(.title2.weight(.medium))
                                     .foregroundStyle(.secondary)
                                     .frame(width: 56, height: 56)
-                                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                                 Text("Add").font(.caption).foregroundStyle(.secondary)
                             }
                         }
@@ -1266,7 +1615,22 @@ struct StartPage: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .scrollDismissesKeyboard(.interactively)
-        .background(Color(.systemBackground))
+        .environment(\.colorScheme, homeImage != nil ? .dark : sys)
+        .background {
+            if let img = homeImage {
+                GeometryReader { g in
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: g.size.width, height: g.size.height)
+                        .clipped()
+                }
+                .overlay(LinearGradient(colors: [.black.opacity(0.5), .black.opacity(0.15), .black.opacity(0.35)],
+                                        startPoint: .top, endPoint: .bottom))
+            } else {
+                LinearGradient(colors: [theme.top, theme.bottom], startPoint: .top, endPoint: .bottom)
+            }
+        }
         .alert("Add a site", isPresented: $adding) {
             TextField("example.com", text: $newSite)
                 .textInputAutocapitalization(.never)
@@ -1292,6 +1656,7 @@ final class Shields: ObservableObject {
         BlockList(id: "ads", name: "Ads", detail: "EasyList", defaultOn: true),
         BlockList(id: "trackers", name: "Trackers", detail: "EasyPrivacy and Peter Lowe's list", defaultOn: true),
         BlockList(id: "cookies", name: "Cookie Notices", detail: "Hides consent pop-ups", defaultOn: true),
+        BlockList(id: "youtube", name: "YouTube Ads", detail: "Removes, hides or skips ads on YouTube", defaultOn: true),
         BlockList(id: "annoyances", name: "Annoyances", detail: "Newsletter pop-ups, social widgets, chat bubbles", defaultOn: false),
     ]
 
@@ -1349,6 +1714,11 @@ final class Shields: ObservableObject {
             if let c = compiled[l.id] { out.append(c) }
         }
         return out
+    }
+
+    func youtubeOn(for host: String) -> Bool {
+        let master = UserDefaults.standard.object(forKey: "block") as? Bool ?? true
+        return master && isUp(host) && isEnabled("youtube")
     }
 
     // Counts are batched so a page full of blocked ads doesn't redraw the UI dozens of times.
@@ -1541,15 +1911,22 @@ struct PaneView: View {
     var trailingRoom: CGFloat = 0  // space left for the tab pill beside a top bar
     @Environment(\.colorScheme) private var sys
     @AppStorage("saver") private var saver = false
+    @AppStorage("adaptiveText") private var adaptiveText = true
+    @AppStorage("textColor") private var textColor = "System"
+    @Environment(\.sdTheme) private var theme
     @State private var desktop = false
     @FocusState private var focused: Bool
 
+    private var ink: AnyShapeStyle { TextColors.ink(adaptive: adaptiveText, name: textColor) }
     private var mini: Bool { pane.collapsed && !focused && !pane.isHome }
     // The bottom strip takes the page's own colour so it blends in; the top strip matches the status bar.
     private var stripColor: Color {
-        pane.isHome || atTop ? Color(.systemBackground) : (pane.bottomColor ?? Color(.systemBackground))
+        pane.isHome || atTop ? theme.strip : (pane.bottomColor ?? theme.strip)
     }
+    // Whether the bar surface is dark. Adaptive: follows the page so text stays readable.
+    // Fixed colour: the surface contrasts with the colour you picked.
     private var dark: Bool {
+        if !adaptiveText { return TextColors.isLight(textColor) ?? (sys == .dark) }
         if pane.isHome || atTop { return sys == .dark }
         return pane.pageDark ?? (sys == .dark)
     }
@@ -1633,33 +2010,25 @@ struct PaneView: View {
         .animation(saver ? nil : .easeInOut(duration: 0.25), value: dark)
     }
 
-    private var shieldButton: some View {
-        Button { actions.shields() } label: {
-            Image(systemName: actions.shieldsUp ? "shield.lefthalf.filled" : "shield.slash")
-                .font(.system(size: compact ? 13 : 15, weight: .semibold))
-                .foregroundStyle(actions.shieldsUp ? Color.orange : Color.secondary)
-                .frame(width: iconW, height: barH)
-                .overlay(alignment: .topTrailing) {
-                    if actions.shieldsUp && pane.blockedCount > 0 && !compact {
-                        Text(pane.blockedCount > 99 ? "99+" : "\(pane.blockedCount)")
-                            .font(.system(size: 9, weight: .bold))
-                            .monospacedDigit()
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 3)
-                            .frame(minWidth: 14, minHeight: 14)
-                            .background(Color.orange, in: Capsule())
-                            .offset(x: -1, y: 7)
-                    }
-                }
+    // Small refresh (or stop, while loading) button inside the address capsule.
+    private var reloadButton: some View {
+        Button {
+            if pane.loading { pane.webView.stopLoading() } else { pane.webView.reload() }
+        } label: {
+            Image(systemName: pane.loading ? "xmark" : "arrow.clockwise")
+                .font(.system(size: compact ? 11 : 13, weight: .semibold))
+                .foregroundStyle(ink)
+                .frame(width: compact ? 26 : 30, height: barH)
                 .contentShape(Rectangle())
         }
+        .accessibilityLabel(pane.loading ? "Stop loading" : "Reload")
     }
 
     private func navButton(_ icon: String, _ enabled: Bool, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
                 .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(.primary)
+                .foregroundStyle(ink)
                 .frame(width: 44, height: 48)
                 .contentShape(Rectangle())
         }
@@ -1682,7 +2051,7 @@ struct PaneView: View {
         Button(action: action) {
             Image(systemName: name)
                 .font(.system(size: compact ? 14 : 16, weight: .semibold))
-                .foregroundStyle(.primary)
+                .foregroundStyle(ink)
                 .frame(width: iconW, height: barH)
                 .contentShape(Rectangle())
         }
@@ -1694,11 +2063,11 @@ struct PaneView: View {
         HStack(spacing: 0) {
             Image(systemName: "key.fill")
                 .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.primary)
+                .foregroundStyle(ink)
                 .padding(.leading, 14)
             Text("Use saved password")
                 .font(.footnote.weight(.semibold))
-                .foregroundStyle(.primary)
+                .foregroundStyle(ink)
                 .lineLimit(1)
                 .padding(.leading, 8)
             Spacer(minLength: 8)
@@ -1711,7 +2080,7 @@ struct PaneView: View {
                     .foregroundStyle(.white)
                     .padding(.horizontal, 14)
                     .frame(height: 26)
-                    .background(Color.accentColor, in: Capsule())
+                    .background(theme.accent, in: Capsule())
             }
             icon("xmark") { pane.offerFill = false }
         }
@@ -1726,7 +2095,7 @@ struct PaneView: View {
         TextField("Search or enter site", text: addressText)
             .textFieldStyle(.plain)
             .font(compact ? .subheadline : .body)
-            .foregroundStyle(.primary)
+            .foregroundStyle(ink)
             .multilineTextAlignment(focused ? .leading : .center)
             .textInputAutocapitalization(.never)
             .autocorrectionDisabled()
@@ -1741,7 +2110,7 @@ struct PaneView: View {
             HStack(spacing: 0) {
                 Text("Tap items to hide")
                     .font(compact ? .footnote.weight(.medium) : .subheadline.weight(.medium))
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(ink)
                     .padding(.leading, compact ? 14 : 18)
                 Spacer(minLength: 8)
                 if pane.canUndoHide { icon("arrow.uturn.backward") { pane.undoHide() } }
@@ -1751,7 +2120,7 @@ struct PaneView: View {
                         .foregroundStyle(.white)
                         .padding(.horizontal, compact ? 12 : 16)
                         .frame(height: barH - 12)
-                        .background(Color.accentColor, in: Capsule())
+                        .background(theme.accent, in: Capsule())
                 }
                 .padding(.trailing, 6)
             }
@@ -1763,7 +2132,7 @@ struct PaneView: View {
             Button { pane.collapsed = false } label: {
                 Text(pane.host.isEmpty ? "Search" : pane.host.replacingOccurrences(of: "www.", with: ""))
                     .font(compact ? .caption2.weight(.semibold) : .caption.weight(.semibold))
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(ink)
                     .lineLimit(1)
                     .padding(.horizontal, compact ? 12 : 16)
                     .padding(.vertical, compact ? 5 : 7)
@@ -1777,7 +2146,6 @@ struct PaneView: View {
                 if !focused {
                     icon("chevron.left", enabled: pane.backEnabled) { pane.back() }
                     icon("chevron.right", enabled: pane.forwardEnabled) { pane.forward() }
-                    if !pane.isHome { shieldButton }
                 }
                 field.padding(.leading, focused ? 14 : 2)
                 if focused {
@@ -1785,6 +2153,7 @@ struct PaneView: View {
                 } else {
                     if !pane.isHome && pane.hasLogin { icon("key.fill") { actions.autofill() } }
                     if !pane.isHome && pane.hasCard { icon("creditcard.fill") { actions.autofill() } }
+                    if !pane.isHome { reloadButton }
                     menu
                 }
             }
@@ -1797,13 +2166,13 @@ struct PaneView: View {
             HStack(spacing: 8) {
                 if !focused { navPair }
                 HStack(spacing: 0) {
-                    if !focused && !pane.isHome { shieldButton }
-                    field.padding(.leading, !focused && !pane.isHome ? 0 : 16)
+                    field.padding(.leading, 16)
                     if focused {
                         if !pane.address.isEmpty { icon("xmark.circle.fill") { pane.address = "" } }
                     } else {
                         if !pane.isHome && pane.hasLogin { icon("key.fill") { actions.autofill() } }
                         if !pane.isHome && pane.hasCard { icon("creditcard.fill") { actions.autofill() } }
+                        if !pane.isHome { reloadButton }
                         menu
                     }
                 }
@@ -1822,7 +2191,6 @@ struct PaneView: View {
             Button { pane.goHome() } label: { Label("Home", systemImage: "house") }
             Button { actions.newTab() } label: { Label("New Tab", systemImage: "plus.square.on.square") }
             if !pane.isHome {
-                Button { pane.webView.reload() } label: { Label("Reload", systemImage: "arrow.clockwise") }
                 Button { desktop.toggle(); pane.setDesktop(desktop) } label: {
                     Label(desktop ? "Mobile Site" : "Desktop Site", systemImage: desktop ? "iphone" : "desktopcomputer")
                 }
@@ -1833,12 +2201,18 @@ struct PaneView: View {
                 Button { actions.calendar() } label: { Label("Add to Calendar", systemImage: "calendar.badge.plus") }
             }
             Divider()
+            if !pane.isHome {
+                Button { actions.shields() } label: {
+                    Label(actions.shieldsUp ? "Shields · \(pane.blockedCount) blocked" : "Shields Down",
+                          systemImage: actions.shieldsUp ? "shield.lefthalf.filled" : "shield.slash")
+                }
+            }
             Button { actions.vpn() } label: { Label(actions.vpnOn ? "VPN (On)" : "VPN", systemImage: actions.vpnOn ? "lock.shield.fill" : "lock.shield") }
             Button { actions.settings() } label: { Label("Settings", systemImage: "gearshape") }
         } label: {
             Image(systemName: "ellipsis")
                 .font(.system(size: compact ? 14 : 16, weight: .semibold))
-                .foregroundStyle(.primary)
+                .foregroundStyle(ink)
                 .frame(width: iconW, height: barH)
                 .contentShape(Rectangle())
         }
@@ -1851,12 +2225,16 @@ struct TopBar: View {
     @ObservedObject var tabs: Tabs
     var saver: Bool
     var openTabs: () -> Void
+    @AppStorage("adaptiveText") private var adaptiveText = true
+    @AppStorage("textColor") private var textColor = "System"
+
+    private var ink: AnyShapeStyle { TextColors.ink(adaptive: adaptiveText, name: textColor) }
 
     private func button<L: View>(_ action: @escaping () -> Void, @ViewBuilder label: () -> L) -> some View {
         Button(action: action) {
             label()
                 .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.primary)
+                .foregroundStyle(ink)
                 .frame(minWidth: 40, minHeight: 36)
                 .contentShape(Rectangle())
         }
@@ -1870,20 +2248,20 @@ struct TopBar: View {
                     .monospacedDigit()
                     .frame(minWidth: 20, minHeight: 20)
                     .padding(.horizontal, 2)
-                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(.primary, lineWidth: 1.6))
+                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(ink, lineWidth: 1.6))
             }
             button({ withAnimation(saver ? nil : .snappy) { tabs.swap() } }) {
-                Image(systemName: "arrow.triangle.2.circlepath")
+                Image(systemName: "arrow.left.arrow.right")
             }
             .disabled(!tabs.canSwap)
             .opacity(tabs.canSwap ? 1 : 0.4)
             button({ withAnimation(saver ? nil : .snappy) { tabs.toggleSplit() } }) {
-                Image(systemName: tabs.split ? "rectangle.split.2x1.fill" : "rectangle.split.2x1")
+                Image(systemName: tabs.split ? "rectangle.split.1x2.fill" : "rectangle.split.1x2")
             }
         }
         .padding(.horizontal, 4)
         .frame(height: 36)
-        .sdGlass(Capsule())
+        .sdGlass(Capsule(), dark: adaptiveText ? nil : TextColors.isLight(textColor))
     }
 }
 
@@ -1894,6 +2272,7 @@ struct TopStrip: View {
     var saver: Bool
     var safeTop: CGFloat
     var openTabs: () -> Void
+    @Environment(\.sdTheme) private var theme
 
     var body: some View {
         let shown = !pane.collapsed || pane.isHome
@@ -1910,7 +2289,7 @@ struct TopStrip: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .background(Color(.systemBackground))
+        .background(theme.strip)
         .animation(saver ? nil : .smooth(duration: 0.4), value: shown)
     }
 }
@@ -1936,9 +2315,14 @@ struct TabsView: View {
                         .pickerStyle(.segmented)
                     }
                     LazyVGrid(columns: columns, spacing: 18) {
-                        ForEach(tabs.list) { t in card(t) }
+                        ForEach(tabs.list) { t in
+                            TabCard(t: t, tabs: tabs) {
+                                tabs.show(t.id, slot: tabs.split ? slot : 0)
+                                dismiss()
+                            }
+                        }
                     }
-                    Text("Tabs you haven't used recently sleep to save memory and battery, then reload when opened.")
+                    Text("Swipe a tab left or right to close it. Tabs you haven't used recently sleep to save memory and battery, then reload when opened.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -1961,12 +2345,30 @@ struct TabsView: View {
         }
     }
 
-    private func card(_ t: TabInfo) -> some View {
+}
+
+// One tab in the grid. Swipe it sideways to close it, or tap to open.
+struct TabCard: View {
+    let t: TabInfo
+    @ObservedObject var tabs: Tabs
+    var open: () -> Void
+    @State private var dx: CGFloat = 0
+    @State private var closing = false
+
+    private func close(toward dir: CGFloat) {
+        closing = true
+        withAnimation(.easeIn(duration: 0.18)) { dx = dir * 520 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.17) {
+            withAnimation(.snappy) { tabs.close(t.id) }
+        }
+    }
+
+    var body: some View {
         let host = (URL(string: t.url)?.host ?? "").replacingOccurrences(of: "www.", with: "")
         let isVisible = tabs.visible.contains(t.id)
-        return VStack(spacing: 7) {
+        VStack(spacing: 7) {
             ZStack(alignment: .topTrailing) {
-                preview(t, host: host)
+                preview(host: host)
                     .frame(height: 220)
                     .frame(maxWidth: .infinity)
                     .background(Color(.secondarySystemGroupedBackground))
@@ -1976,9 +2378,7 @@ struct TabsView: View {
                             .stroke(isVisible ? Color.accentColor : Color.primary.opacity(0.12), lineWidth: isVisible ? 3 : 0.5)
                     )
                     .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
-                Button {
-                    withAnimation(.snappy) { tabs.close(t.id) }
-                } label: {
+                Button { close(toward: 1) } label: {
                     Image(systemName: "xmark")
                         .font(.system(size: 11, weight: .bold))
                         .foregroundStyle(.white)
@@ -1986,6 +2386,7 @@ struct TabsView: View {
                         .background(Color.black.opacity(0.55), in: Circle())
                 }
                 .padding(8)
+                .accessibilityLabel("Close tab")
             }
             HStack(spacing: 6) {
                 if host.isEmpty {
@@ -2003,19 +2404,34 @@ struct TabsView: View {
             .padding(.horizontal, 4)
         }
         .contentShape(Rectangle())
-        .onTapGesture {
-            tabs.show(t.id, slot: tabs.split ? slot : 0)
-            dismiss()
-        }
+        .offset(x: dx)
+        .rotationEffect(.degrees(Double(dx / 40)))
+        .opacity(1 - min(abs(dx) / 300, 0.75))
+        .onTapGesture { if !closing { open() } }
+        .simultaneousGesture(
+            DragGesture(minimumDistance: 16)
+                .onChanged { v in
+                    guard !closing, abs(v.translation.width) > abs(v.translation.height) else { return }
+                    dx = v.translation.width
+                }
+                .onEnded { v in
+                    guard !closing else { return }
+                    if abs(dx) > 90 || abs(v.predictedEndTranslation.width) > 280 {
+                        close(toward: (dx == 0 ? v.predictedEndTranslation.width : dx) > 0 ? 1 : -1)
+                    } else {
+                        withAnimation(.spring(response: 0.3, dampingFraction: 0.75)) { dx = 0 }
+                    }
+                }
+        )
         .contextMenu {
-            Button(role: .destructive) { withAnimation(.snappy) { tabs.close(t.id) } } label: {
+            Button(role: .destructive) { close(toward: 1) } label: {
                 Label("Close Tab", systemImage: "xmark")
             }
         }
         .transition(.scale(scale: 0.8).combined(with: .opacity))
     }
 
-    @ViewBuilder private func preview(_ t: TabInfo, host: String) -> some View {
+    @ViewBuilder private func preview(host: String) -> some View {
         if host.isEmpty {
             VStack(spacing: 8) {
                 Image(systemName: "house").font(.title2)
@@ -2119,12 +2535,15 @@ struct MySitesEditor: View {
 struct SettingsView: View {
     @ObservedObject var sites: Sites
     @ObservedObject var shields: Shields
+    @ObservedObject var themes: ThemeStore
     @AppStorage("engine") private var engine = "DuckDuckGo"
     @AppStorage("saver") private var saver = false
     @AppStorage("homeMode") private var homeMode = 0
     @AppStorage("autoFillPrompt") private var autoPrompt = true
     @AppStorage("barStyle") private var barStyle = 0
     @AppStorage("barColor") private var barColor = "System"
+    @AppStorage("adaptiveText") private var adaptiveText = true
+    @AppStorage("textColor") private var textColor = "System"
     var openVault: () -> Void
     var openVPN: () -> Void
     @Environment(\.dismiss) private var dismiss
@@ -2138,6 +2557,11 @@ struct SettingsView: View {
                     }
                 }
                 Section {
+                    NavigationLink {
+                        ThemeSettings(themes: themes)
+                    } label: {
+                        LabeledContent("Themes", value: themes.homeImage != nil && themes.matchPhoto ? "Photo" : themes.current.name)
+                    }
                     Picker("Bar Style", selection: $barStyle) {
                         Text("Glass").tag(0)
                         Text("Solid").tag(1)
@@ -2161,8 +2585,28 @@ struct SettingsView: View {
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
+                    Toggle("Adapt Text to Page", isOn: $adaptiveText)
+                    if !adaptiveText {
+                        HStack(spacing: 10) {
+                            ForEach(TextColors.names, id: \.self) { n in
+                                Circle()
+                                    .fill(TextColors.color(n) ?? Color(.label))
+                                    .frame(width: 28, height: 28)
+                                    .overlay(Circle().stroke(Color.primary.opacity(0.2), lineWidth: 0.5))
+                                    .overlay(Circle().stroke(Color.accentColor, lineWidth: textColor == n ? 2.5 : 0).padding(-4))
+                                    .contentShape(Circle())
+                                    .onTapGesture { textColor = n }
+                                    .accessibilityLabel(n)
+                            }
+                        }
+                        .padding(.vertical, 6)
+                    }
                 } header: {
                     Text("Appearance")
+                } footer: {
+                    Text(adaptiveText
+                         ? "Icons and text switch between light and dark to stay readable on each page."
+                         : "Icons and text use \(textColor == "System" ? "your phone's light or dark mode" : textColor.lowercased()), with the bar shaded to keep it readable.")
                 }
                 Section("Home Page") {
                     Picker("Show", selection: $homeMode) {
@@ -2301,6 +2745,7 @@ struct ContentView: View {
     @StateObject private var vault = Vault()
     @StateObject private var vpnService = VPNService()
     @StateObject private var shields = Shields()
+    @StateObject private var themes = ThemeStore()
     @Environment(\.scenePhase) private var phase
     @AppStorage("block") private var blockOn = true
     @AppStorage("saver") private var saver = false
@@ -2336,8 +2781,12 @@ struct ContentView: View {
                 }
             }
             .ignoresSafeArea(.container, edges: .vertical)
-            .background(Color(.systemBackground).ignoresSafeArea())
+            .background(themes.current.strip.ignoresSafeArea())
         }
+        .environment(\.sdTheme, themes.current)
+        .environment(\.sdHomeImage, themes.homeImage)
+        .tint(themes.current.accent)
+        .preferredColorScheme(themes.current.scheme)
         .sheet(item: $sheet) { s in sheetView(s) }
         .alert("Save password?", isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } })) {
             Button("Save") { if let p = pending { vault.logins.append(p); vault.save() }; pending = nil }
@@ -2356,6 +2805,7 @@ struct ContentView: View {
         }
         .task {
             Pane.ruleProvider = { host in shields.rules(for: host) }
+            Pane.youtubeProvider = { host in shields.youtubeOn(for: host) }
             Pane.onBlocked = { shields.countBlocked() }
             tabs.configure = { p in configure(p) }
             tabs.allLive.forEach { configure($0) }
@@ -2389,7 +2839,7 @@ struct ContentView: View {
         GeometryReader { geo in
             let horizontal = !portrait
             let total = horizontal ? geo.size.width : geo.size.height
-            let gap: CGFloat = 3
+            let gap: CGFloat = 5
             let firstSize = (total - gap) * split
             ZStack(alignment: .topLeading) {
                 if tabs.split {
@@ -2505,7 +2955,7 @@ struct ContentView: View {
     @ViewBuilder private func sheetView(_ s: Sheet) -> some View {
         switch s {
         case .vault: VaultView(vault: vault, fill: fill)
-        case .settings: SettingsView(sites: sites, shields: shields, openVault: { sheet = .vault }, openVPN: { sheet = .vpn })
+        case .settings: SettingsView(sites: sites, shields: shields, themes: themes, openVault: { sheet = .vault }, openVPN: { sheet = .vpn })
         case .calendar: EventEditor(title: calTitle, url: calURL).ignoresSafeArea()
         case .vpn: VPNView(vpn: vpnService)
         case .tabs: TabsView(tabs: tabs)
