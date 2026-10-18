@@ -1383,6 +1383,11 @@ final class HistoryStore: ObservableObject {
         trimAndSave()
     }
 
+    func clearSearches() {
+        items.removeAll { $0.isSearch }
+        trimAndSave()
+    }
+
     // since == nil clears everything.
     func clear(since: Date?) {
         if let since { items.removeAll { $0.date >= since } } else { items.removeAll() }
@@ -2295,8 +2300,8 @@ struct PaneView: View {
     private var spring: Animation? { saver ? nil : .spring(response: 0.35, dampingFraction: 0.82) }
     private var smooth: Animation? { saver ? nil : .smooth(duration: 0.4) }
     @Namespace private var ns
-    private var barH: CGFloat { compact ? 36 : 48 }
-    private var iconW: CGFloat { compact ? 32 : 40 }
+    private var barH: CGFloat { compact ? 36 : 54 }
+    private var iconW: CGFloat { compact ? 32 : 44 }
 
     // Shows just the site name until you tap in, then the full address.
     private var addressText: Binding<String> {
@@ -2371,7 +2376,15 @@ struct PaneView: View {
                         StartPage(sites: sites, blocked: actions.totalBlocked) { pane.load($0) }
                     }
                 }
-                if focused {
+                if focused && !compact {
+                    FocusSplash(sites: sites, history: history,
+                                query: pane.address == pane.webView.url?.absoluteString ? "" : pane.address,
+                                isPrivate: pane.isPrivate) { value in
+                        focused = false
+                        pane.load(value)
+                    }
+                    .transition(.opacity)
+                } else if focused {
                     Color.black.opacity(0.001)
                         .contentShape(Rectangle())
                         .onTapGesture { focused = false }
@@ -2394,7 +2407,14 @@ struct PaneView: View {
         .animation(spring, value: pane.hiding)
         .animation(spring, value: showBanner)
         .animation(spring, value: suggestions.count)
-        .onChange(of: focused) { _, f in pane.editing = f }
+        .onChange(of: focused) { _, f in
+            pane.editing = f
+            if f && !pane.address.isEmpty {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    UIApplication.shared.sendAction(#selector(UIResponder.selectAll(_:)), to: nil, from: nil, for: nil)
+                }
+            }
+        }
         .onAppear { pane.setAmbient(ambientMode && !saver && !pane.isPrivate) }
         .onDisappear { pane.setAmbient(false) }
         .onChange(of: ambientMode) { _, _ in pane.setAmbient(ambientMode && !saver && !pane.isPrivate) }
@@ -2405,7 +2425,7 @@ struct PaneView: View {
         VStack(spacing: 6) {
             bar.frame(height: barH)
             if showBanner { fillBanner }
-            if !suggestions.isEmpty { suggestionList }
+            if compact && !suggestions.isEmpty { suggestionList }
         }
         .environment(\.colorScheme, dark ? .dark : .light)
         .padding(.leading, 12)
@@ -2418,7 +2438,7 @@ struct PaneView: View {
 
     private var bottomRow: some View {
         VStack(spacing: 8) {
-            if !suggestions.isEmpty { suggestionList }
+            if compact && !suggestions.isEmpty { suggestionList }
             if showBanner { fillBanner }
             bar
         }
@@ -2479,7 +2499,7 @@ struct PaneView: View {
     private func icon(_ name: String, enabled: Bool = true, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: name)
-                .font(.system(size: compact ? 14 : 16, weight: .semibold))
+                .font(.system(size: compact ? 14 : 18, weight: .semibold))
                 .foregroundStyle(ink)
                 .frame(width: iconW, height: barH)
                 .contentShape(Rectangle())
@@ -2523,7 +2543,7 @@ struct PaneView: View {
     private var field: some View {
         TextField(pane.isPrivate ? "Search privately" : "Search or enter site", text: addressText)
             .textFieldStyle(.plain)
-            .font(compact ? .subheadline : .body)
+            .font(compact ? .subheadline : .system(size: 17, weight: .medium))
             .foregroundStyle(ink)
             .multilineTextAlignment(focused ? .leading : .center)
             .textInputAutocapitalization(.never)
@@ -2598,6 +2618,16 @@ struct PaneView: View {
             .padding(.horizontal, 2)
             .frame(height: barH)
             .sdGlass(Capsule(), dark: dark)
+            .padding(.trailing, focused && !compact ? 78 : 0)
+            .overlay(alignment: .trailing) {
+                if focused && !compact {
+                    Button("Cancel") { focused = false }
+                        .font(.system(size: 17, weight: .regular))
+                        .foregroundStyle(ink)
+                        .frame(width: 70, height: barH)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
+            }
             .matchedGeometryEffect(id: "bar", in: ns)
             .transition(.opacity)
         }
@@ -2667,6 +2697,124 @@ struct PaneView: View {
                 .contentShape(Rectangle())
         }
         .environment(\.colorScheme, sys)
+    }
+}
+
+// MARK: Address bar focus screen
+
+func siteShortName(_ h: String) -> String {
+    let parts = h.split(separator: ".")
+    let base = parts.count >= 2 ? parts[parts.count - 2] : Substring(h)
+    return base.prefix(1).uppercased() + base.dropFirst()
+}
+
+// Safari-style: tapping the address in full screen shows favourites and recent searches,
+// then live suggestions as you type.
+struct FocusSplash: View {
+    @ObservedObject var sites: Sites
+    @ObservedObject var history: HistoryStore
+    var query: String
+    var isPrivate: Bool
+    var open: (String) -> Void
+    @Environment(\.sdTheme) private var theme
+
+    private var typed: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    private var results: [Suggestion] {
+        if isPrivate {
+            var out = [Suggestion(kind: .search, title: typed, subtitle: "Search", value: typed)]
+            let q = typed.lowercased()
+            for h in (sites.custom + sites.frequent) where h.contains(q) && !out.contains(where: { $0.value == h }) {
+                out.append(Suggestion(kind: .site, title: h, subtitle: "Favourite", value: h))
+                if out.count >= 6 { break }
+            }
+            return out
+        }
+        return Suggest.make(query: typed, history: history, sites: sites, limit: 9)
+    }
+
+    private func row(_ s: Suggestion) -> some View {
+        Button { open(s.value) } label: {
+            HStack(spacing: 14) {
+                Group {
+                    switch s.kind {
+                    case .search: Image(systemName: "magnifyingglass")
+                    case .recent: Image(systemName: "clock.arrow.circlepath")
+                    case .site: Image(systemName: "globe")
+                    }
+                }
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 28)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(s.title).font(.body).foregroundStyle(.primary).lineLimit(1)
+                    Text(s.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 0)
+                Image(systemName: "arrow.up.left").font(.system(size: 13, weight: .semibold)).foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 16)
+            .frame(height: 54)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                if typed.isEmpty {
+                    let favs = sites.custom.isEmpty ? sites.frequent : sites.custom
+                    if !favs.isEmpty {
+                        Text(sites.custom.isEmpty ? "Frequently Visited" : "Favourites").font(.title3.bold())
+                        LazyVGrid(columns: [GridItem(.adaptive(minimum: 72), spacing: 14)], spacing: 18) {
+                            ForEach(Array(favs.prefix(12)), id: \.self) { h in
+                                Button { open(h) } label: {
+                                    VStack(spacing: 6) {
+                                        SiteIcon(host: h)
+                                        Text(siteShortName(h)).font(.caption).foregroundStyle(.primary).lineLimit(1)
+                                    }
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                    }
+                    let recents = isPrivate ? [] : Array(history.recentSearches.prefix(6))
+                    if !recents.isEmpty {
+                        HStack {
+                            Text("Recent Searches").font(.title3.bold())
+                            Spacer()
+                            Button("Clear") { withAnimation { history.clearSearches() } }.font(.subheadline)
+                        }
+                        VStack(spacing: 0) {
+                            ForEach(Array(recents.enumerated()), id: \.offset) { i, r in
+                                if i > 0 { Divider().padding(.leading, 58) }
+                                row(Suggestion(kind: .recent, title: r, subtitle: "Recent search", value: r))
+                            }
+                        }
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    }
+                    if favs.isEmpty && recents.isEmpty {
+                        Text("Type a search or an address.").foregroundStyle(.secondary)
+                    }
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(Array(results.enumerated()), id: \.element.id) { i, s in
+                            if i > 0 { Divider().padding(.leading, 58) }
+                            row(s)
+                        }
+                    }
+                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .background(isPrivate
+                    ? AnyShapeStyle(Color(red: 0.10, green: 0.07, blue: 0.17))
+                    : AnyShapeStyle(LinearGradient(colors: [theme.top, theme.bottom], startPoint: .top, endPoint: .bottom)))
     }
 }
 
