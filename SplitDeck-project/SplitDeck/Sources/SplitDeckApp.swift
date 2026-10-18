@@ -324,52 +324,6 @@ enum Rules {
     })();
     """#
 
-    // Ambient mode inside pages: a blurred, colour-matched glow spills out around whatever video is playing.
-    // Drawn into a tiny canvas (displaying a cross-site video frame is allowed; reading its pixels isn't needed).
-    static let ambient = #"""
-    (function () {
-      if (window.__sdAmbient) return;
-      window.__sdAmbient = true;
-      var cv = document.createElement('canvas');
-      cv.width = 32; cv.height = 18;
-      cv.setAttribute('aria-hidden', 'true');
-      cv.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;pointer-events:none;z-index:2147483646;' +
-        'filter:blur(34px) saturate(1.8);opacity:0;mix-blend-mode:screen;transition:opacity .6s ease';
-      var ctx = cv.getContext('2d');
-      function add() { (document.body || document.documentElement).appendChild(cv); }
-      if (document.body) add(); else document.addEventListener('DOMContentLoaded', add);
-      function pick() {
-        var vs = document.querySelectorAll('video'), best = null, area = 0;
-        for (var i = 0; i < vs.length; i++) {
-          var v = vs[i];
-          if (v.paused || v.readyState < 2) continue;
-          var r = v.getBoundingClientRect(), a = r.width * r.height;
-          if (a > area && r.bottom > 0 && r.top < innerHeight) { best = v; area = a; }
-        }
-        return best;
-      }
-      function tick() {
-        var on = window.__sdAmbientOn !== false;
-        var v = on ? pick() : null;
-        if (v) {
-          var r = v.getBoundingClientRect(), pad = Math.max(r.width, r.height) * 0.14;
-          var w = r.width + pad * 2, h = r.height + pad * 2;
-          cv.style.left = (r.left - pad) + 'px'; cv.style.top = (r.top - pad) + 'px';
-          cv.style.width = w + 'px'; cv.style.height = h + 'px';
-          var ix = pad / w * 100, iy = pad / h * 100;
-          cv.style.clipPath = 'polygon(evenodd,0% 0%,100% 0%,100% 100%,0% 100%,0% 0%,' +
-            ix + '% ' + iy + '%,' + ix + '% ' + (100 - iy) + '%,' + (100 - ix) + '% ' + (100 - iy) + '%,' +
-            (100 - ix) + '% ' + iy + '%,' + ix + '% ' + iy + '%)';
-          try { ctx.drawImage(v, 0, 0, cv.width, cv.height); cv.style.opacity = '0.6'; } catch (e) { cv.style.opacity = '0'; }
-        } else {
-          cv.style.opacity = '0';
-        }
-        setTimeout(function () { requestAnimationFrame(tick); }, on ? 110 : 1000);
-      }
-      tick();
-    })();
-    """#
-
     static let raf = "(function(){var raf=window.requestAnimationFrame.bind(window);var last=0;window.requestAnimationFrame=function(cb){return raf(function ts(t){var f=window.__sdFps||0;if(f&&t-last<1000/f-2){raf(ts);return}last=t;cb(t)})}})();"
 
 }
@@ -737,22 +691,10 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         }
     }
 
-    // Re-applies page scripts after Ambient Mode is switched (keeps the YouTube setting as it was).
-    func refreshScripts() {
-        let yt = appliedRules?.contains("youtube-script") ?? false
-        Pane.installScripts(webView.configuration.userContentController, youtube: yt)
-        webView.evaluateJavaScript("window.__sdAmbientOn=\(Pane.ambientOn)")
-    }
-
-    static var ambientOn = false
 
     static func installScripts(_ u: WKUserContentController, youtube: Bool) {
         u.removeAllUserScripts()
         u.addUserScript(WKUserScript(source: Rules.raf, injectionTime: .atDocumentStart, forMainFrameOnly: true))
-        u.addUserScript(WKUserScript(source: "window.__sdAmbientOn=\(ambientOn);", injectionTime: .atDocumentStart, forMainFrameOnly: false))
-        if ambientOn {
-            u.addUserScript(WKUserScript(source: Rules.ambient, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
-        }
         if youtube {
             u.addUserScript(WKUserScript(source: Rules.youtube, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
@@ -2278,6 +2220,7 @@ struct PaneActions {
     var islandShown: Bool
     var exitPrivate: () -> Void
     var closePrivate: () -> Void
+    var splitEnabled: Bool
 }
 
 struct PaneView: View {
@@ -2299,6 +2242,36 @@ struct PaneView: View {
     @Environment(\.scenePhase) private var phase
 
     private var ambientActive: Bool { ambientMode && !saver && !pane.isPrivate && !pane.isHome }
+
+    private var ambientActive: Bool { ambientMode && !saver && !pane.isPrivate && !pane.isHome }
+
+    // Ambient: only the edge you never tap (status bar or home indicator) glows with the colours of the page
+    // edge next to it; the part of the strip holding the address bar stays a plain colour.
+    @ViewBuilder private func stripBackground(top: Bool) -> some View {
+        let zone = top ? safeTop : bottomInset
+        if ambientActive, zone > 0, let img = pane.ambient {
+            ZStack {
+                stripColor
+                GeometryReader { g in
+                    Image(uiImage: img)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: g.size.width, height: max(g.size.height * 3, 140), alignment: top ? .top : .bottom)
+                        .frame(width: g.size.width, height: g.size.height, alignment: top ? .top : .bottom)
+                        .blur(radius: 22, opaque: true)
+                        .saturation(1.5)
+                        .clipped()
+                }
+                .mask(alignment: top ? .top : .bottom) {
+                    LinearGradient(colors: [.black, .black, .clear], startPoint: top ? .top : .bottom, endPoint: top ? .bottom : .top)
+                        .frame(height: zone + 10)
+                }
+            }
+            .animation(.easeInOut(duration: 0.5), value: img)
+        } else {
+            stripColor
+        }
+    }
 
     // Ambient: the strip shows a blurred, saturated slice of the page edge it touches, so light seems to spill out.
     @ViewBuilder private func stripBackground(top: Bool) -> some View {
@@ -2638,7 +2611,7 @@ struct PaneView: View {
                     if !pane.isHome && pane.hasLogin { icon("key.fill") { actions.autofill() } }
                     if !pane.isHome && pane.hasCard { icon("creditcard.fill") { actions.autofill() } }
                     if !pane.isHome { reloadButton }
-                    if !actions.islandShown { splitButton }
+                    if !actions.islandShown && actions.splitEnabled { splitButton }
                     if !compact || !actions.islandShown { tabsButton }
                     menu
                 }
@@ -2653,46 +2626,60 @@ struct PaneView: View {
 
     private var menu: some View {
         Menu {
-            Button { pane.goHome() } label: { Label("Home", systemImage: "house") }
-            Button { actions.newTab() } label: { Label("New Tab", systemImage: "plus.square.on.square") }
-            if pane.isPrivate {
-                Button { actions.exitPrivate() } label: { Label("Leave Private Mode", systemImage: "eye") }
-                Button(role: .destructive) { actions.closePrivate() } label: { Label("Close Private Tab", systemImage: "xmark") }
-            } else {
-                Button { actions.newPrivateTab() } label: { Label("New Private Tab", systemImage: "eye.slash") }
+            ControlGroup {
+                Button { actions.settings() } label: { Label("Settings", systemImage: "gearshape") }
+                Button { actions.history() } label: { Label("History", systemImage: "clock") }
+                Button { pane.goHome() } label: { Label("Home", systemImage: "house") }
             }
-            Button { actions.history() } label: { Label("History", systemImage: "clock") }
-            Button { actions.toggleSplit() } label: {
-                Label(actions.splitOn ? "Close Split View" : "Split View",
-                      systemImage: actions.splitOn ? "rectangle.split.1x2.fill" : "rectangle.split.1x2")
-            }
-            if actions.canSwap {
-                Button { actions.swapTabs() } label: { Label("Switch to Last Tab", systemImage: "arrow.left.arrow.right") }
-            }
-            if !pane.isHome, let url = pane.webView.url {
-                ShareLink(item: url, subject: Text(pane.title)) {
-                    Label("Share", systemImage: "square.and.arrow.up")
+            .controlGroupStyle(.compactMenu)
+            Section {
+                Button { actions.newTab() } label: { Label("New Tab", systemImage: "plus.square.on.square") }
+                if pane.isPrivate {
+                    Button { actions.exitPrivate() } label: { Label("Leave Private Mode", systemImage: "eye") }
+                    Button(role: .destructive) { actions.closePrivate() } label: { Label("Close Private Tab", systemImage: "xmark") }
+                } else {
+                    Button { actions.newPrivateTab() } label: { Label("New Private Tab", systemImage: "eye.slash") }
                 }
             }
             if !pane.isHome {
-                Button { desktop.toggle(); pane.setDesktop(desktop) } label: {
-                    Label(desktop ? "Mobile Site" : "Desktop Site", systemImage: desktop ? "iphone" : "desktopcomputer")
+                Section {
+                    if let url = pane.webView.url {
+                        ShareLink(item: url, subject: Text(pane.title)) {
+                            Label("Share", systemImage: "square.and.arrow.up")
+                        }
+                    }
+                    Button { actions.shields() } label: {
+                        Label(actions.shieldsUp ? "Shields · \(pane.blockedCount) blocked" : "Shields Down",
+                              systemImage: actions.shieldsUp ? "shield.lefthalf.filled" : "shield.slash")
+                    }
+                    Menu {
+                        Button { desktop.toggle(); pane.setDesktop(desktop) } label: {
+                            Label(desktop ? "Mobile Site" : "Desktop Site", systemImage: desktop ? "iphone" : "desktopcomputer")
+                        }
+                        Button { pane.startHiding() } label: { Label("Hide Distracting Items", systemImage: "eye.slash") }
+                        if pane.hiddenCount > 0 {
+                            Button { pane.showAllHidden() } label: { Label("Show Hidden Items (\(pane.hiddenCount))", systemImage: "eye") }
+                        }
+                        Button { actions.calendar() } label: { Label("Add to Calendar", systemImage: "calendar.badge.plus") }
+                    } label: {
+                        Label("Page Tools", systemImage: "wrench.and.screwdriver")
+                    }
                 }
-                Button { pane.startHiding() } label: { Label("Hide Distracting Items", systemImage: "eye.slash") }
-                if pane.hiddenCount > 0 {
-                    Button { pane.showAllHidden() } label: { Label("Show Hidden Items (\(pane.hiddenCount))", systemImage: "eye") }
-                }
-                Button { actions.calendar() } label: { Label("Add to Calendar", systemImage: "calendar.badge.plus") }
             }
-            Divider()
-            if !pane.isHome {
-                Button { actions.shields() } label: {
-                    Label(actions.shieldsUp ? "Shields · \(pane.blockedCount) blocked" : "Shields Down",
-                          systemImage: actions.shieldsUp ? "shield.lefthalf.filled" : "shield.slash")
+            Section {
+                if actions.splitEnabled {
+                    Button { actions.toggleSplit() } label: {
+                        Label(actions.splitOn ? "Close Split View" : "Split View",
+                              systemImage: actions.splitOn ? "rectangle.split.1x2.fill" : "rectangle.split.1x2")
+                    }
+                }
+                if actions.canSwap {
+                    Button { actions.swapTabs() } label: { Label("Switch to Last Tab", systemImage: "arrow.left.arrow.right") }
+                }
+                Button { actions.vpn() } label: {
+                    Label(actions.vpnOn ? "VPN (On)" : "VPN", systemImage: actions.vpnOn ? "lock.shield.fill" : "lock.shield")
                 }
             }
-            Button { actions.vpn() } label: { Label(actions.vpnOn ? "VPN (On)" : "VPN", systemImage: actions.vpnOn ? "lock.shield.fill" : "lock.shield") }
-            Button { actions.settings() } label: { Label("Settings", systemImage: "gearshape") }
         } label: {
             Image(systemName: "ellipsis")
                 .font(.system(size: compact ? 14 : 16, weight: .semibold))
@@ -2797,6 +2784,7 @@ struct EdgeDock: View {
     var privateMode: Bool
     var openTabs: () -> Void
     @AppStorage("dockTucked") private var tucked = false
+    @AppStorage("splitEnabled") private var splitEnabled = true
     @AppStorage("dockY") private var dockY = 0.45
     @AppStorage("adaptiveText") private var adaptiveText = true
     @AppStorage("textColor") private var textColor = "System"
@@ -2834,8 +2822,10 @@ struct EdgeDock: View {
             }
             .disabled(!tabs.canSwap)
             .opacity(tabs.canSwap ? 1 : 0.4)
-            button(tabs.split ? "Close split view" : "Split view", { withAnimation(anim) { tabs.toggleSplit() } }) {
-                Image(systemName: tabs.split ? "rectangle.split.1x2.fill" : "rectangle.split.1x2")
+            if splitEnabled {
+                button(tabs.split ? "Close split view" : "Split view", { withAnimation(anim) { tabs.toggleSplit() } }) {
+                    Image(systemName: tabs.split ? "rectangle.split.1x2.fill" : "rectangle.split.1x2")
+                }
             }
             button("Tuck away", { withAnimation(anim) { tucked = true } }) {
                 Image(systemName: "chevron.compact.right").font(.system(size: 14, weight: .bold))
@@ -3347,6 +3337,7 @@ struct SettingsView: View {
     @AppStorage("lockPrivate") private var lockPrivate = true
     @AppStorage("autoSavePasswords") private var autoSave = false
     @AppStorage("showIsland") private var showIsland = true
+    @AppStorage("splitEnabled") private var splitEnabled = true
     @AppStorage("ambientMode") private var ambientMode = false
     var openVault: () -> Void
     var openVPN: () -> Void
@@ -3413,13 +3404,15 @@ struct SettingsView: View {
                          : "Icons and text use \(textColor == "System" ? "your phone's light or dark mode" : textColor.lowercased()), with the bar shaded to keep it readable.")
                 }
                 Section {
-                    Toggle("Show Split View Island", isOn: $showIsland)
+                    Toggle("Split View", isOn: $splitEnabled)
+                    Toggle("Show Floating Island", isOn: $showIsland)
                 } header: {
-                    Text("Address Bar")
+                    Text("Split View")
                 } footer: {
-                    Text(showIsland
-                         ? "The island on the right edge holds tabs, last-tab switching and split view. Swipe it right to tuck it away."
-                         : "Island hidden: split view and tabs buttons sit in the address bar instead. Split View and Switch to Last Tab are also in the ⋯ menu.")
+                    Text((splitEnabled ? "Split View lets you show two pages at once. " : "Split View is off: SplitDeck always shows one page. ")
+                         + (showIsland
+                            ? "The floating island on the right edge holds tabs, last-tab switching" + (splitEnabled ? " and split view" : "") + ". Swipe it right to tuck it away."
+                            : "With the island hidden, its buttons sit in the address bar and the ⋯ menu."))
                 }
                 Section("Home Page") {
                     Picker("Show", selection: $homeMode) {
@@ -3447,7 +3440,7 @@ struct SettingsView: View {
                 } footer: {
                     Text(saver
                          ? "Unavailable while Extreme Battery Saver is on."
-                         : "The bars glow with the colours of what's on screen, and playing videos cast a soft light around them, like YouTube's ambient mode. Uses a little more battery.")
+                         : "The very top and bottom edges of the screen (around the clock and the home bar) glow softly with the colours of the page next to them. Uses a little more battery.")
                 }
                 Section {
                     Toggle("Extreme Battery Saver", isOn: $saver)
@@ -4009,7 +4002,7 @@ struct ContentView: View {
     @AppStorage("autoFillPrompt") private var autoPrompt = true
     @AppStorage("autoSavePasswords") private var autoSave = false
     @AppStorage("showIsland") private var showIsland = true
-    @AppStorage("ambientMode") private var ambientMode = false
+    @AppStorage("splitEnabled") private var splitEnabled = true
     @State private var toast: String?
     @State private var tabsSlot = 0
 
@@ -4090,15 +4083,16 @@ struct ContentView: View {
             Pane.youtubeProvider = { host in shields.youtubeOn(for: host) }
             Pane.onBlocked = { shields.countBlocked() }
             tabs.configure = { p in configure(p) }
-            Pane.ambientOn = ambientMode && !saver
             tabs.allLive.forEach { configure($0) }
             applySaver()
             await shields.prepare()
         }
         .onChange(of: shields.version) { _, _ in applyShields() }
         .onChange(of: blockOn) { _, _ in shields.masterChanged() }
-        .onChange(of: saver) { _, _ in applySaver(); applyAmbient() }
-        .onChange(of: ambientMode) { _, _ in applyAmbient() }
+        .onChange(of: saver) { _, _ in applySaver() }
+        .onChange(of: splitEnabled) { _, on in
+            if !on && tabs.split { withAnimation(anim(.snappy)) { tabs.closeSplit(keep: 0) } }
+        }
         .onChange(of: themes.current) { _, _ in tabs.allLive.forEach { $0.objectWillChange.send() } }
         .onChange(of: engine) { _, _ in tabs.visible.forEach { tabs.pane($0).goHome() } }
         .onChange(of: phase) { _, p in
@@ -4261,7 +4255,8 @@ struct ContentView: View {
                 canSwap: tabs.canSwap,
                 islandShown: showIsland,
                 exitPrivate: { withAnimation(anim(.snappy)) { tabs.exitPrivate(slot: slot) } },
-                closePrivate: { withAnimation(anim(.snappy)) { tabs.closePrivate(slot: slot) } }
+                closePrivate: { withAnimation(anim(.snappy)) { tabs.closePrivate(slot: slot) } },
+                splitEnabled: splitEnabled
             ),
             compact: compact,
             atTop: atTop,
@@ -4337,11 +4332,6 @@ struct ContentView: View {
             let changed = p.applyRules(host: p.host)
             if changed && reload && !p.isHome { p.webView.reload() }
         }
-    }
-
-    private func applyAmbient() {
-        Pane.ambientOn = ambientMode && !saver
-        tabs.allLive.forEach { $0.refreshScripts() }
     }
 
     private func applySaver() {
