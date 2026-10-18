@@ -257,7 +257,7 @@ final class VPNService: ObservableObject {
             let proto = NEVPNProtocolIKEv2()
             proto.serverAddress = server.address
             proto.remoteIdentifier = server.remoteID
-            proto.authenticationMethod = .usernamePassword
+            proto.authenticationMethod = .none
             proto.useExtendedAuthentication = true
             proto.username = username
             proto.passwordReference = passwordRef
