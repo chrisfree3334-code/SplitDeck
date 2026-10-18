@@ -2157,6 +2157,11 @@ struct PaneActions {
     var unlockPrivate: () -> Void
     var openTabs: () -> Void
     var tabCount: Int
+    var toggleSplit: () -> Void
+    var splitOn: Bool
+    var swapTabs: () -> Void
+    var canSwap: Bool
+    var islandShown: Bool
 }
 
 struct PaneView: View {
@@ -2334,6 +2339,18 @@ struct PaneView: View {
         .animation(saver ? nil : .easeInOut(duration: 0.25), value: dark)
     }
 
+    // Split view toggle, shown in the bar when the edge island is switched off.
+    private var splitButton: some View {
+        Button { actions.toggleSplit() } label: {
+            Image(systemName: actions.splitOn ? "rectangle.split.1x2.fill" : "rectangle.split.1x2")
+                .font(.system(size: compact ? 12 : 14, weight: .semibold))
+                .foregroundStyle(ink)
+                .frame(width: compact ? 28 : 34, height: barH)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel(actions.splitOn ? "Close split view" : "Split view")
+    }
+
     // Tab count in the full-screen bar (split view keeps it in the edge dock to save room).
     private var tabsButton: some View {
         Button { actions.openTabs() } label: {
@@ -2478,7 +2495,8 @@ struct PaneView: View {
                     if !pane.isHome && pane.hasLogin { icon("key.fill") { actions.autofill() } }
                     if !pane.isHome && pane.hasCard { icon("creditcard.fill") { actions.autofill() } }
                     if !pane.isHome { reloadButton }
-                    if !compact { tabsButton }
+                    if !actions.islandShown { splitButton }
+                    if !compact || !actions.islandShown { tabsButton }
                     menu
                 }
             }
@@ -2496,6 +2514,13 @@ struct PaneView: View {
             Button { actions.newTab() } label: { Label("New Tab", systemImage: "plus.square.on.square") }
             Button { actions.newPrivateTab() } label: { Label("New Private Tab", systemImage: "eye.slash") }
             Button { actions.history() } label: { Label("History", systemImage: "clock") }
+            Button { actions.toggleSplit() } label: {
+                Label(actions.splitOn ? "Close Split View" : "Split View",
+                      systemImage: actions.splitOn ? "rectangle.split.1x2.fill" : "rectangle.split.1x2")
+            }
+            if actions.canSwap {
+                Button { actions.swapTabs() } label: { Label("Switch to Last Tab", systemImage: "arrow.left.arrow.right") }
+            }
             if !pane.isHome, let url = pane.webView.url {
                 ShareLink(item: url, subject: Text(pane.title)) {
                     Label("Share", systemImage: "square.and.arrow.up")
@@ -3137,6 +3162,7 @@ struct SettingsView: View {
     @AppStorage("textColor") private var textColor = "System"
     @AppStorage("lockPrivate") private var lockPrivate = true
     @AppStorage("autoSavePasswords") private var autoSave = false
+    @AppStorage("showIsland") private var showIsland = true
     var openVault: () -> Void
     var openVPN: () -> Void
     @Environment(\.dismiss) private var dismiss
@@ -3200,6 +3226,15 @@ struct SettingsView: View {
                     Text(adaptiveText
                          ? "Icons and text switch between light and dark to stay readable on each page."
                          : "Icons and text use \(textColor == "System" ? "your phone's light or dark mode" : textColor.lowercased()), with the bar shaded to keep it readable.")
+                }
+                Section {
+                    Toggle("Show Split View Island", isOn: $showIsland)
+                } header: {
+                    Text("Address Bar")
+                } footer: {
+                    Text(showIsland
+                         ? "The island on the right edge holds tabs, last-tab switching and split view. Swipe it right to tuck it away."
+                         : "Island hidden: split view and tabs buttons sit in the address bar instead. Split View and Switch to Last Tab are also in the ⋯ menu.")
                 }
                 Section("Home Page") {
                     Picker("Show", selection: $homeMode) {
@@ -3778,6 +3813,7 @@ struct ContentView: View {
     @State private var chooseList: [Login] = []
     @AppStorage("autoFillPrompt") private var autoPrompt = true
     @AppStorage("autoSavePasswords") private var autoSave = false
+    @AppStorage("showIsland") private var showIsland = true
     @State private var toast: String?
 
     // Battery saver: dark only. Private tab on top: dark. Otherwise the theme decides.
@@ -3807,7 +3843,10 @@ struct ContentView: View {
             .ignoresSafeArea(.container, edges: .vertical)
             .background(themes.current.strip.ignoresSafeArea())
             .overlay {
-                EdgeDock(tabs: tabs, saver: saver, privateMode: leftIsPrivate, openTabs: openTabs)
+                if showIsland {
+                    EdgeDock(tabs: tabs, saver: saver, privateMode: leftIsPrivate, openTabs: openTabs)
+                        .transition(.opacity)
+                }
             }
             .overlay(alignment: .top) {
                 if let toast {
@@ -4007,7 +4046,12 @@ struct ContentView: View {
                 privateLocked: privateLocked,
                 unlockPrivate: unlockPrivate,
                 openTabs: openTabs,
-                tabCount: p.isPrivate ? tabs.privateCount : tabs.normalCount
+                tabCount: p.isPrivate ? tabs.privateCount : tabs.normalCount,
+                toggleSplit: { withAnimation(anim(.snappy)) { tabs.toggleSplit() } },
+                splitOn: tabs.split,
+                swapTabs: { withAnimation(anim(.snappy)) { tabs.swap() } },
+                canSwap: tabs.canSwap,
+                islandShown: showIsland
             ),
             compact: compact,
             atTop: atTop,
