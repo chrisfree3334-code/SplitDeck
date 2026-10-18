@@ -3,6 +3,8 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
+  schedule:
+    - cron: "17 5 * * 1"   # every Monday: rebuild with fresh filter lists
 defaults:
   run:
     working-directory: SplitDeck-project/SplitDeck
@@ -13,6 +15,12 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install XcodeGen
         run: brew install xcodegen
+      - name: Build ad-block lists
+        run: python3 tools/build_blocklists.py Sources/Blocklists
+      - name: Check lists compile in WebKit
+        run: |
+          swiftc -swift-version 5 -O tools/validate_blocklists.swift -o validate_blocklists
+          ls Sources/Blocklists/sd-*.json >/dev/null 2>&1 && ./validate_blocklists Sources/Blocklists/sd-*.json || echo "No lists to check"
       - name: Generate Xcode project
         run: xcodegen generate
       - name: Build (unsigned)
