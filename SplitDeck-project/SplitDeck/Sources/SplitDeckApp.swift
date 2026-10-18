@@ -324,6 +324,52 @@ enum Rules {
     })();
     """#
 
+    // Ambient mode inside pages: a blurred, colour-matched glow spills out around whatever video is playing.
+    // Drawn into a tiny canvas (displaying a cross-site video frame is allowed; reading its pixels isn't needed).
+    static let ambient = #"""
+    (function () {
+      if (window.__sdAmbient) return;
+      window.__sdAmbient = true;
+      var cv = document.createElement('canvas');
+      cv.width = 32; cv.height = 18;
+      cv.setAttribute('aria-hidden', 'true');
+      cv.style.cssText = 'position:fixed;left:0;top:0;width:0;height:0;pointer-events:none;z-index:2147483646;' +
+        'filter:blur(34px) saturate(1.8);opacity:0;mix-blend-mode:screen;transition:opacity .6s ease';
+      var ctx = cv.getContext('2d');
+      function add() { (document.body || document.documentElement).appendChild(cv); }
+      if (document.body) add(); else document.addEventListener('DOMContentLoaded', add);
+      function pick() {
+        var vs = document.querySelectorAll('video'), best = null, area = 0;
+        for (var i = 0; i < vs.length; i++) {
+          var v = vs[i];
+          if (v.paused || v.readyState < 2) continue;
+          var r = v.getBoundingClientRect(), a = r.width * r.height;
+          if (a > area && r.bottom > 0 && r.top < innerHeight) { best = v; area = a; }
+        }
+        return best;
+      }
+      function tick() {
+        var on = window.__sdAmbientOn !== false;
+        var v = on ? pick() : null;
+        if (v) {
+          var r = v.getBoundingClientRect(), pad = Math.max(r.width, r.height) * 0.14;
+          var w = r.width + pad * 2, h = r.height + pad * 2;
+          cv.style.left = (r.left - pad) + 'px'; cv.style.top = (r.top - pad) + 'px';
+          cv.style.width = w + 'px'; cv.style.height = h + 'px';
+          var ix = pad / w * 100, iy = pad / h * 100;
+          cv.style.clipPath = 'polygon(evenodd,0% 0%,100% 0%,100% 100%,0% 100%,0% 0%,' +
+            ix + '% ' + iy + '%,' + ix + '% ' + (100 - iy) + '%,' + (100 - ix) + '% ' + (100 - iy) + '%,' +
+            (100 - ix) + '% ' + iy + '%,' + ix + '% ' + iy + '%)';
+          try { ctx.drawImage(v, 0, 0, cv.width, cv.height); cv.style.opacity = '0.6'; } catch (e) { cv.style.opacity = '0'; }
+        } else {
+          cv.style.opacity = '0';
+        }
+        setTimeout(function () { requestAnimationFrame(tick); }, on ? 110 : 1000);
+      }
+      tick();
+    })();
+    """#
+
     static let raf = "(function(){var raf=window.requestAnimationFrame.bind(window);var last=0;window.requestAnimationFrame=function(cb){return raf(function ts(t){var f=window.__sdFps||0;if(f&&t-last<1000/f-2){raf(ts);return}last=t;cb(t)})}})();"
 
 }
@@ -668,10 +714,45 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     static var youtubeProvider: ((String) -> Bool)?
     @Published var loading = false
     private var loadObs: NSKeyValueObservation?
+    @Published var ambient: UIImage?
+    private var ambientTimer: Timer?
+
+    // A tiny, frequently refreshed picture of the page; the bars blur it into a glow that follows the content.
+    func setAmbient(_ on: Bool) {
+        ambientTimer?.invalidate()
+        ambientTimer = nil
+        guard on else { if ambient != nil { ambient = nil }; return }
+        ambientTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.captureAmbient() }
+        captureAmbient()
+    }
+
+    private func captureAmbient() {
+        guard !isHome, webView.window != nil, webView.bounds.width > 0,
+              UIApplication.shared.applicationState == .active else { return }
+        let c = WKSnapshotConfiguration()
+        c.snapshotWidth = 40
+        c.afterScreenUpdates = false
+        webView.takeSnapshot(with: c) { [weak self] img, _ in
+            if let img { self?.ambient = img }
+        }
+    }
+
+    // Re-applies page scripts after Ambient Mode is switched (keeps the YouTube setting as it was).
+    func refreshScripts() {
+        let yt = appliedRules?.contains("youtube-script") ?? false
+        Pane.installScripts(webView.configuration.userContentController, youtube: yt)
+        webView.evaluateJavaScript("window.__sdAmbientOn=\(Pane.ambientOn)")
+    }
+
+    static var ambientOn = false
 
     static func installScripts(_ u: WKUserContentController, youtube: Bool) {
         u.removeAllUserScripts()
         u.addUserScript(WKUserScript(source: Rules.raf, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        u.addUserScript(WKUserScript(source: "window.__sdAmbientOn=\(ambientOn);", injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        if ambientOn {
+            u.addUserScript(WKUserScript(source: Rules.ambient, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
+        }
         if youtube {
             u.addUserScript(WKUserScript(source: Rules.youtube, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
@@ -2211,10 +2292,33 @@ struct PaneView: View {
     var trailingRoom: CGFloat = 0  // space left for the tab pill beside a top bar
     @Environment(\.colorScheme) private var sys
     @AppStorage("saver") private var saver = false
+    @AppStorage("ambientMode") private var ambientMode = false
     @AppStorage("adaptiveText") private var adaptiveText = true
     @AppStorage("textColor") private var textColor = "System"
     @Environment(\.sdTheme) private var theme
     @Environment(\.scenePhase) private var phase
+
+    private var ambientActive: Bool { ambientMode && !saver && !pane.isPrivate && !pane.isHome }
+
+    // Ambient: the strip shows a blurred, saturated slice of the page edge it touches, so light seems to spill out.
+    @ViewBuilder private func stripBackground(top: Bool) -> some View {
+        if ambientActive, let img = pane.ambient {
+            GeometryReader { g in
+                Image(uiImage: img)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: g.size.width, height: max(g.size.height * 3, 140), alignment: top ? .top : .bottom)
+                    .frame(width: g.size.width, height: g.size.height, alignment: top ? .top : .bottom)
+                    .blur(radius: 22, opaque: true)
+                    .saturation(1.5)
+                    .clipped()
+            }
+            .overlay(stripColor.opacity(0.2))
+            .animation(.easeInOut(duration: 0.5), value: img)
+        } else {
+            stripColor
+        }
+    }
     @State private var desktop = false
     @FocusState private var focused: Bool
 
@@ -2339,6 +2443,10 @@ struct PaneView: View {
         .animation(spring, value: showBanner)
         .animation(spring, value: suggestions.count)
         .onChange(of: focused) { _, f in pane.editing = f }
+        .onAppear { pane.setAmbient(ambientMode && !saver && !pane.isPrivate) }
+        .onDisappear { pane.setAmbient(false) }
+        .onChange(of: ambientMode) { _, _ in pane.setAmbient(ambientMode && !saver && !pane.isPrivate) }
+        .onChange(of: saver) { _, _ in pane.setAmbient(ambientMode && !saver && !pane.isPrivate) }
     }
 
     private var topRow: some View {
@@ -2353,7 +2461,7 @@ struct PaneView: View {
         .padding(.top, safeTop + 4)
         .padding(.bottom, 4)
         .frame(maxWidth: .infinity)
-        .background(stripColor)
+        .background(stripBackground(top: true))
     }
 
     private var bottomRow: some View {
@@ -2367,7 +2475,7 @@ struct PaneView: View {
         .padding(.top, mini ? 4 : (compact ? 6 : 8))
         .padding(.bottom, bottomPad)
         .frame(maxWidth: .infinity)
-        .background(stripColor)
+        .background(stripBackground(top: false))
         .simultaneousGesture(DragGesture(minimumDistance: 12).onEnded { v in
             if focused && v.translation.height > 20 { focused = false }
         })
@@ -2790,12 +2898,30 @@ struct TopStrip: View {
     @ObservedObject var pane: Pane
     var safeTop: CGFloat
     @Environment(\.sdTheme) private var theme
+    @AppStorage("ambientMode") private var ambientMode = false
+    @AppStorage("saver") private var saver = false
 
     var body: some View {
         Color.clear
             .frame(height: safeTop)
             .frame(maxWidth: .infinity)
-            .background(pane.isPrivate ? Color(red: 0.14, green: 0.10, blue: 0.23) : theme.strip)
+            .background {
+                if ambientMode && !saver && !pane.isPrivate && !pane.isHome, let img = pane.ambient {
+                    GeometryReader { g in
+                        Image(uiImage: img)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: g.size.width, height: max(g.size.height * 3, 140), alignment: .top)
+                            .frame(width: g.size.width, height: g.size.height, alignment: .top)
+                            .blur(radius: 22, opaque: true)
+                            .saturation(1.5)
+                            .clipped()
+                    }
+                    .overlay(theme.strip.opacity(0.2))
+                } else {
+                    pane.isPrivate ? Color(red: 0.14, green: 0.10, blue: 0.23) : theme.strip
+                }
+            }
     }
 }
 
@@ -3221,6 +3347,7 @@ struct SettingsView: View {
     @AppStorage("lockPrivate") private var lockPrivate = true
     @AppStorage("autoSavePasswords") private var autoSave = false
     @AppStorage("showIsland") private var showIsland = true
+    @AppStorage("ambientMode") private var ambientMode = false
     var openVault: () -> Void
     var openVPN: () -> Void
     @Environment(\.dismiss) private var dismiss
@@ -3311,6 +3438,16 @@ struct SettingsView: View {
                     Text("Privacy")
                 } footer: {
                     Text("Private tabs are hidden behind Face ID when you leave the app, and covered in the app switcher. VPN connects only to a provider you set up yourself: SplitDeck doesn't host VPN servers, as we don't yet have the resources to run them securely.")
+                }
+                Section {
+                    Toggle("Ambient Mode", isOn: $ambientMode)
+                        .disabled(saver)
+                } header: {
+                    Text("Ambient Mode")
+                } footer: {
+                    Text(saver
+                         ? "Unavailable while Extreme Battery Saver is on."
+                         : "The bars glow with the colours of what's on screen, and playing videos cast a soft light around them, like YouTube's ambient mode. Uses a little more battery.")
                 }
                 Section {
                     Toggle("Extreme Battery Saver", isOn: $saver)
@@ -3872,6 +4009,7 @@ struct ContentView: View {
     @AppStorage("autoFillPrompt") private var autoPrompt = true
     @AppStorage("autoSavePasswords") private var autoSave = false
     @AppStorage("showIsland") private var showIsland = true
+    @AppStorage("ambientMode") private var ambientMode = false
     @State private var toast: String?
     @State private var tabsSlot = 0
 
@@ -3952,13 +4090,15 @@ struct ContentView: View {
             Pane.youtubeProvider = { host in shields.youtubeOn(for: host) }
             Pane.onBlocked = { shields.countBlocked() }
             tabs.configure = { p in configure(p) }
+            Pane.ambientOn = ambientMode && !saver
             tabs.allLive.forEach { configure($0) }
             applySaver()
             await shields.prepare()
         }
         .onChange(of: shields.version) { _, _ in applyShields() }
         .onChange(of: blockOn) { _, _ in shields.masterChanged() }
-        .onChange(of: saver) { _, _ in applySaver() }
+        .onChange(of: saver) { _, _ in applySaver(); applyAmbient() }
+        .onChange(of: ambientMode) { _, _ in applyAmbient() }
         .onChange(of: themes.current) { _, _ in tabs.allLive.forEach { $0.objectWillChange.send() } }
         .onChange(of: engine) { _, _ in tabs.visible.forEach { tabs.pane($0).goHome() } }
         .onChange(of: phase) { _, p in
@@ -4019,10 +4159,12 @@ struct ContentView: View {
                     handle(horizontal: horizontal, total: total, pos: firstSize + gap / 2, size: geo.size)
                 } else {
                     paneView(tabs.left, slot: 0, bottomInset: safe.bottom)
+                        .frame(width: geo.size.width, height: geo.size.height)
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
-            .background(Color(.separator).opacity(dragging ? 0.9 : 0.55))
+            // The divider colour only exists between two panes; full screen has nothing behind the page.
+            .background(tabs.split ? Color(.separator).opacity(dragging ? 0.9 : 0.55) : Color.clear)
             .coordinateSpace(.named("deck"))
         }
     }
@@ -4195,6 +4337,11 @@ struct ContentView: View {
             let changed = p.applyRules(host: p.host)
             if changed && reload && !p.isHome { p.webView.reload() }
         }
+    }
+
+    private func applyAmbient() {
+        Pane.ambientOn = ambientMode && !saver
+        tabs.allLive.forEach { $0.refreshScripts() }
     }
 
     private func applySaver() {
