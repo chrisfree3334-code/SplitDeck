@@ -343,30 +343,18 @@ struct VPNServer: Identifiable, Codable, Hashable {
 
 @MainActor
 final class VPNService: ObservableObject {
-    static let presets: [VPNServer] = [
-        // hide.me (Audited, verified no-log, native free IKEv2 servers)
-        VPNServer(provider: "hide.me", name: "hide.me – Netherlands (Free)", address: "free-nl.hide.me", remoteID: "hide.me"),
-        VPNServer(provider: "hide.me", name: "hide.me – United States (Free)", address: "free-us.hide.me", remoteID: "hide.me"),
-        VPNServer(provider: "hide.me", name: "hide.me – Germany (Free)", address: "free-de.hide.me", remoteID: "hide.me"),
-        VPNServer(provider: "hide.me", name: "hide.me – Canada (Free)", address: "free-ca.hide.me", remoteID: "hide.me"),
-
-        // Proton VPN (Swiss privacy, free endpoints)
-        VPNServer(provider: "Proton VPN", name: "Proton – Netherlands (Free)", address: "nl-free-01.protonvpn.net", remoteID: "nl-free-01.protonvpn.net"),
-        VPNServer(provider: "Proton VPN", name: "Proton – United States (Free)", address: "us-free-01.protonvpn.net", remoteID: "us-free-01.protonvpn.net"),
-        VPNServer(provider: "Proton VPN", name: "Proton – Japan (Free)", address: "jp-free-01.protonvpn.net", remoteID: "jp-free-01.protonvpn.net"),
-    ]
-
     @Published var status: NEVPNStatus = .disconnected
     @Published var errorMessage: String?
-    @Published var selectedServer: VPNServer = presets[0]
+    @Published var selectedServer = VPNServer(provider: "", name: "", address: "", remoteID: "")
     @Published var isConfigured: Bool = false
 
     private let manager = NEVPNManager.shared()
 
     init() {
-        if let savedAddr = UserDefaults.standard.string(forKey: "vpn_server_address"),
-           let match = Self.presets.first(where: { $0.address == savedAddr }) {
-            selectedServer = match
+        if let addr = UserDefaults.standard.string(forKey: "vpn_server_address"), !addr.isEmpty {
+            let provider = UserDefaults.standard.string(forKey: "vpn_provider") ?? ""
+            selectedServer = VPNServer(provider: provider, name: provider.isEmpty ? addr : provider, address: addr,
+                                       remoteID: UserDefaults.standard.string(forKey: "vpn_remote_id") ?? addr)
         }
 
         NotificationCenter.default.addObserver(
@@ -454,11 +442,13 @@ final class VPNService: ObservableObject {
             proto.deadPeerDetectionRate = .medium
 
             manager.protocolConfiguration = proto
-            manager.localizedDescription = "SplitDeck VPN (\(server.provider))"
+            manager.localizedDescription = server.provider.isEmpty ? "SplitDeck VPN" : "SplitDeck VPN (\(server.provider))"
             manager.isEnabled = true
             selectedServer = server
 
             UserDefaults.standard.set(server.address, forKey: "vpn_server_address")
+            UserDefaults.standard.set(server.remoteID, forKey: "vpn_remote_id")
+            UserDefaults.standard.set(server.provider, forKey: "vpn_provider")
             UserDefaults.standard.set(username, forKey: "vpn_saved_username")
 
             try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
@@ -521,16 +511,16 @@ struct VPNView: View {
     @ObservedObject var vpn: VPNService
     @Environment(\.dismiss) private var dismiss
 
+    @State private var provider = UserDefaults.standard.string(forKey: "vpn_provider") ?? ""
+    @State private var server = UserDefaults.standard.string(forKey: "vpn_server_address") ?? ""
+    @State private var remoteID = UserDefaults.standard.string(forKey: "vpn_remote_id") ?? ""
     @State private var username = UserDefaults.standard.string(forKey: "vpn_saved_username") ?? ""
     @State private var password = ""
-    @State private var useCustom = false
-    @State private var customServer = ""
-    @State private var customRemoteID = ""
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Connection Status") {
+                Section("Connection") {
                     HStack {
                         Circle().fill(vpn.statusColor).frame(width: 12, height: 12)
                         VStack(alignment: .leading, spacing: 2) {
@@ -555,76 +545,47 @@ struct VPNView: View {
                     }
                 }
 
-                Section("Free Trusted Provider") {
-                    Picker("Server", selection: $vpn.selectedServer) {
-                        Section("hide.me (Audited No-Logs, Free IKEv2)") {
-                            ForEach(VPNService.presets.filter { $0.provider == "hide.me" }) { s in
-                                Text(s.name).tag(s)
-                            }
-                        }
-                        Section("Proton VPN (Free Tier)") {
-                            ForEach(VPNService.presets.filter { $0.provider == "Proton VPN" }) { s in
-                                Text(s.name).tag(s)
-                            }
-                        }
-                    }
-                    .pickerStyle(.navigationLink)
-
-                    Toggle("Use custom IKEv2 server", isOn: $useCustom.animation())
-                    if useCustom {
-                        TextField("Server Hostname or IP", text: $customServer)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                            .keyboardType(.URL)
-                        TextField("Remote ID", text: $customRemoteID)
-                            .textInputAutocapitalization(.never)
-                            .autocorrectionDisabled()
-                    }
-                }
-
                 Section {
-                    TextField("VPN Username", text: $username)
+                    TextField("Provider name (optional)", text: $provider)
+                    TextField("Server address", text: $server)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                    TextField("Remote ID (if your provider gives one)", text: $remoteID)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    TextField("Username", text: $username)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .textContentType(.username)
-                    SecureField("VPN Password", text: $password)
+                    SecureField(vpn.isConfigured ? "Password (re-enter to change)" : "Password", text: $password)
                         .textContentType(.password)
                 } header: {
-                    Text("Credentials")
+                    Text("Your VPN Provider")
                 } footer: {
-                    VStack(alignment: .leading, spacing: 6) {
-                        if vpn.selectedServer.provider == "hide.me" {
-                            Text("• **hide.me Free**: Sign up free at hide.me (no credit card required). Enter your hide.me account username and password above.")
-                        } else if vpn.selectedServer.provider == "Proton VPN" {
-                            Text("• **Proton VPN**: Sign up free at protonvpn.com. Go to Account → Settings → OpenVPN / IKEv2 credentials and copy your generated credentials.")
-                        } else {
-                            Text("• Enter standard credentials for your self-hosted strongSwan or private IKEv2 server.")
-                        }
-                    }
-                    .font(.caption)
+                    Text("Use the manual IKEv2 settings from your VPN provider's website or account page. Your VPN password is stored in the iPhone Keychain.")
                 }
 
                 Section {
                     Button {
-                        let targetServer = useCustom
-                            ? VPNServer(provider: "Custom", name: "Custom (\(customServer))", address: customServer, remoteID: customRemoteID.isEmpty ? customServer : customRemoteID)
-                            : vpn.selectedServer
-
+                        let addr = server.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let rid = remoteID.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let name = provider.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let target = VPNServer(provider: name, name: name.isEmpty ? addr : name, address: addr,
+                                               remoteID: rid.isEmpty ? addr : rid)
                         Task {
-                            await vpn.configure(server: targetServer, username: username, password: password)
-                            if vpn.errorMessage == nil {
-                                await vpn.connect()
-                            }
+                            await vpn.configure(server: target, username: username, password: password)
+                            if vpn.errorMessage == nil { await vpn.connect() }
                         }
                     } label: {
                         HStack {
                             Spacer()
-                            Label(vpn.status == .connected ? "Update Configuration" : "Save & Connect", systemImage: "lock.shield")
+                            Label(vpn.status == .connected ? "Update and Reconnect" : "Save and Connect", systemImage: "lock.shield")
                                 .fontWeight(.semibold)
                             Spacer()
                         }
                     }
-                    .disabled(username.isEmpty || password.isEmpty || (useCustom && customServer.isEmpty))
+                    .disabled(server.trimmingCharacters(in: .whitespaces).isEmpty || username.isEmpty || password.isEmpty)
                 }
 
                 if let err = vpn.errorMessage {
@@ -634,8 +595,22 @@ struct VPNView: View {
                             .font(.subheadline)
                     }
                 }
+
+                Section {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label("SplitDeck doesn't host VPN servers", systemImage: "info.circle")
+                            .font(.subheadline.weight(.semibold))
+                        Text("Running a VPN that people can trust takes dedicated servers and constant security work, and we don't have the resources to do that well yet. We also chose not to build in free VPN services, because we can't vouch for how they protect or use your data.")
+                        Text("So SplitDeck only connects to a VPN provider you choose and enter yourself. Your traffic goes straight from your iPhone to that provider; it never passes through us.")
+                    }
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .padding(.vertical, 4)
+                } header: {
+                    Text("Why bring your own VPN?")
+                }
             }
-            .navigationTitle("VPN Shield")
+            .navigationTitle("VPN")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -3242,7 +3217,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Privacy")
                 } footer: {
-                    Text("Private tabs are hidden behind Face ID when you leave the app, and covered in the app switcher.")
+                    Text("Private tabs are hidden behind Face ID when you leave the app, and covered in the app switcher. VPN connects only to a provider you set up yourself: SplitDeck doesn't host VPN servers, as we don't yet have the resources to run them securely.")
                 }
                 Section {
                     Toggle("Extreme Battery Saver", isOn: $saver)
