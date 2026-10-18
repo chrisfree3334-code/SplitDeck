@@ -2993,6 +2993,15 @@ struct PaneView: View {
             .overlay(alignment: atTop ? .top : .bottom) {
                 if floating { AnyView(floatingBar) }
             }
+            // Split view: suggestions sit over the page, just above (or below) the bar; the page keeps its size.
+            .overlay(alignment: atTop ? .top : .bottom) {
+                if compact && !suggestions.isEmpty {
+                    AnyView(suggestionList
+                        .environment(\.colorScheme, dark ? .dark : .light)
+                        .padding(.horizontal, 12)
+                        .padding(atTop ? .top : .bottom, 8))
+                }
+            }
             .overlay(alignment: .bottom) {
                 if floating && atTop && showToolbar { floatingToolbar }
             }
@@ -3035,7 +3044,6 @@ struct PaneView: View {
     private var topRow: some View {
         VStack(spacing: 6) {
             bar.frame(height: barH)
-            if compact && !suggestions.isEmpty { suggestionList }
         }
         .environment(\.colorScheme, dark ? .dark : .light)
         .padding(.leading, 12)
@@ -3048,7 +3056,6 @@ struct PaneView: View {
 
     private var bottomRow: some View {
         VStack(spacing: 8) {
-            if compact && !suggestions.isEmpty { suggestionList }
             bar
             if showToolbar {
                 toolbar.transition(.move(edge: .bottom).combined(with: .opacity))
