@@ -5120,6 +5120,73 @@ enum VaultDeletion: Identifiable {
     }
 }
 
+// The vault's padlock: the shackle lifts and swings open when the vault unlocks,
+// and the keyhole glows while Face ID checks it's you.
+struct ShackleShape: Shape {
+    func path(in r: CGRect) -> Path {
+        var p = Path()
+        let radius = r.width / 2
+        p.move(to: CGPoint(x: r.minX, y: r.maxY))
+        p.addLine(to: CGPoint(x: r.minX, y: r.minY + radius))
+        p.addArc(center: CGPoint(x: r.midX, y: r.minY + radius), radius: radius,
+                 startAngle: .degrees(180), endAngle: .degrees(0), clockwise: false)
+        p.addLine(to: CGPoint(x: r.maxX, y: r.maxY))
+        return p
+    }
+}
+
+struct Padlock: View {
+    var open: Bool
+    var scanning = false
+    var size: CGFloat = 64
+    var accent: Color = .cyan
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: nil, paused: !scanning)) { tl in
+            let t = scanning ? tl.date.timeIntervalSinceReferenceDate : 0
+            let glow = scanning ? 0.5 + 0.5 * sin(t * 5) : 0
+            ZStack(alignment: .top) {
+                ShackleShape()
+                    .stroke(LinearGradient(colors: [.white, .white.opacity(0.75)], startPoint: .top, endPoint: .bottom),
+                            style: StrokeStyle(lineWidth: size * 0.12, lineCap: .round))
+                    .frame(width: size * 0.52, height: size * 0.5)
+                    .offset(y: size * 0.04)
+                    // Lifts out of the body, then swings open on its left leg.
+                    .offset(y: open ? -size * 0.2 : 0)
+                    .rotationEffect(.degrees(open ? -28 : 0), anchor: .bottomLeading)
+                RoundedRectangle(cornerRadius: size * 0.16, style: .continuous)
+                    .fill(LinearGradient(colors: [.white, Color(white: 0.82)], startPoint: .top, endPoint: .bottom))
+                    .frame(width: size * 0.8, height: size * 0.58)
+                    .overlay {
+                        VStack(spacing: 0) {
+                            Circle().frame(width: size * 0.13, height: size * 0.13)
+                            Capsule().frame(width: size * 0.06, height: size * 0.13)
+                        }
+                        .foregroundStyle(open ? accent : Color(white: 0.25).mix(accent, glow))
+                        .shadow(color: accent.opacity(open ? 0.9 : glow * 0.9), radius: size * 0.08)
+                    }
+                    .shadow(color: .black.opacity(0.35), radius: size * 0.08, y: size * 0.04)
+                    .offset(y: size * 0.4)
+            }
+            .frame(width: size, height: size)
+        }
+        .animation(.spring(response: 0.42, dampingFraction: 0.55), value: open)
+        .accessibilityLabel(open ? "Unlocked" : "Locked")
+    }
+}
+
+extension Color {
+    // Blends towards another colour (0 = this colour, 1 = the other).
+    func mix(_ other: Color, _ amount: Double) -> Color {
+        var r1: CGFloat = 0, g1: CGFloat = 0, b1: CGFloat = 0, a1: CGFloat = 0
+        var r2: CGFloat = 0, g2: CGFloat = 0, b2: CGFloat = 0, a2: CGFloat = 0
+        _ = UIColor(self).getRed(&r1, green: &g1, blue: &b1, alpha: &a1)
+        _ = UIColor(other).getRed(&r2, green: &g2, blue: &b2, alpha: &a2)
+        let k = CGFloat(min(max(amount, 0), 1))
+        return Color(red: Double(r1 + (r2 - r1) * k), green: Double(g1 + (g2 - g1) * k), blue: Double(b1 + (b2 - b1) * k))
+    }
+}
+
 // Blur, fade and scale together, for the vault opening.
 struct BlurFade: ViewModifier {
     var blur: CGFloat
@@ -5207,12 +5274,8 @@ struct VaultView: View {
                 } else {
                     lockView.transition(.asymmetric(insertion: .opacity, removal: .vaultDoor))
                 }
-                if phase != .active {
-                    // Hidden in the app switcher.
-                    ZStack {
-                        Color.black.ignoresSafeArea()
-                        Image(systemName: "lock.fill").font(.system(size: 40)).foregroundStyle(.white)
-                    }
+                if open && phase != .active {
+                    privacyCover.transition(.opacity)
                 }
             }
             .onChange(of: vault.unlocked) { _, on in
@@ -5263,38 +5326,37 @@ struct VaultView: View {
     // MARK: Locked
 
     private var lockView: some View {
-        VStack(spacing: 22) {
+        let o = AppIconOption.named(iconName)
+        return VStack(spacing: 26) {
             ZStack {
-                let o = AppIconOption.named(iconName)
                 Circle()
                     .stroke(AngularGradient(colors: [o.left, .cyan, o.right, o.left], center: .center), lineWidth: 3)
-                    .frame(width: 150, height: 150)
+                    .frame(width: 156, height: 156)
                     .rotationEffect(.degrees(spin ? 360 : 0))
-                    .animation(.linear(duration: 5).repeatForever(autoreverses: false), value: spin)
+                    .animation(.linear(duration: unlocking ? 1.6 : 6).repeatForever(autoreverses: false), value: spin)
+                    .opacity(opening ? 0 : 1)
+                    .scaleEffect(opening ? 1.25 : 1)
                 Circle()
                     .fill(.ultraThinMaterial)
-                    .frame(width: 118, height: 118)
-                BrandMark(size: 74)
-                    .scaleEffect(opening ? 1.12 : 1)
-                    .overlay(alignment: .bottomTrailing) {
-                        Image(systemName: opening ? "lock.open.fill" : (unlocking ? "faceid" : "lock.fill"))
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundStyle(.white)
-                            .frame(width: 30, height: 30)
-                            .background(Circle().fill(LinearGradient(colors: [.cyan, .blue], startPoint: .top, endPoint: .bottom)))
-                            .overlay(Circle().stroke(Color.black.opacity(0.5), lineWidth: 2))
-                            .contentTransition(.symbolEffect(.replace))
-                            .symbolEffect(.pulse, isActive: unlocking)
-                            .symbolEffect(.bounce, value: opening)
-                            .offset(x: 9, y: 9)
-                    }
+                    .frame(width: 124, height: 124)
+                    .overlay(Circle().stroke(.white.opacity(0.12), lineWidth: 1))
+                Padlock(open: opening, scanning: unlocking, size: 66, accent: .cyan)
+                    .scaleEffect(opening ? 1.08 : 1)
             }
-            .shadow(color: .cyan.opacity(opening ? 0.6 : 0), radius: 30)
-            VStack(spacing: 6) {
-                Text(opening ? "Unlocked" : "Vault Locked").font(.title2.bold()).foregroundStyle(.white)
+            .shadow(color: .cyan.opacity(opening ? 0.55 : 0.15), radius: opening ? 34 : 18)
+            .animation(.spring(response: 0.45, dampingFraction: 0.7), value: opening)
+            VStack(spacing: 8) {
+                Text(opening ? "Unlocked" : (unlocking ? "Checking it's you…" : "Vault Locked"))
+                    .font(.title2.bold())
+                    .foregroundStyle(.white)
                     .contentTransition(.opacity)
-                Text("SplitDeck Vault · protected by Face ID and the iPhone Keychain")
-                    .font(.subheadline).foregroundStyle(.white.opacity(0.6))
+                    .animation(.easeInOut(duration: 0.2), value: unlocking)
+                HStack(spacing: 7) {
+                    BrandMark(size: 18, glow: false)
+                    Text("SplitDeck Vault · Face ID and the iPhone Keychain")
+                }
+                .font(.subheadline)
+                .foregroundStyle(.white.opacity(0.6))
             }
             Button { Task { await unlock() } } label: {
                 Label("Unlock with Face ID", systemImage: "faceid")
@@ -5304,8 +5366,26 @@ struct VaultView: View {
             .buttonStyle(.borderedProminent)
             .tint(.blue)
             .padding(.horizontal, 40)
+            .opacity(unlocking || opening ? 0 : 1)
+            .animation(.easeInOut(duration: 0.2), value: unlocking || opening)
         }
         .onAppear { spin = true }
+    }
+
+    // Shown over the open vault in the app switcher, so nothing can be read there.
+    private var privacyCover: some View {
+        ZStack {
+            bg.ignoresSafeArea()
+            VStack(spacing: 18) {
+                Padlock(open: false, size: 60)
+                HStack(spacing: 7) {
+                    BrandMark(size: 18, glow: false)
+                    Text("SplitDeck Vault")
+                }
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.7))
+            }
+        }
     }
 
     // MARK: Unlocked
@@ -5973,7 +6053,7 @@ struct IntroView: View {
                               text: "Open two sites at once. Tap the split button in the address bar, drag the divider to resize, and drag it off the edge to go back to one page.",
                               art: IntroSplitArt(option: o, active: page == 1 && !still)).tag(1)
                     IntroPage(title: "Switch in one tap",
-                              text: "The ⇄ button jumps straight back to the last tab you used. In split view it swaps the two pages.",
+                              text: "The switch button jumps straight back to the last tab you used. In split view it swaps the top and bottom pages.",
                               art: IntroSwitchArt(option: o, active: page == 2 && !still)).tag(2)
                     IntroPage(title: "Private by design",
                               text: "Shields block ads, trackers and cookie pop-ups. Private tabs leave no trace and lock behind Face ID. Your history and settings never leave this iPhone.",
@@ -6012,7 +6092,7 @@ struct IntroBackground: View {
             let t = still ? 0 : tl.date.timeIntervalSinceReferenceDate
             GeometryReader { g in
                 ZStack {
-                    LinearGradient(colors: [base.opacity(0.92), base, .black], startPoint: .top, endPoint: .bottom)
+                    LinearGradient(colors: [base, base, .black], startPoint: .top, endPoint: .bottom)
                     RadialGradient(colors: [option.left.opacity(0.45), .clear], center: .center, startRadius: 0, endRadius: g.size.width * 0.75)
                         .offset(x: CGFloat(sin(t / 7)) * g.size.width * 0.25, y: -g.size.height * 0.28 + CGFloat(cos(t / 9)) * 40)
                     RadialGradient(colors: [option.right.opacity(0.25), .clear], center: .center, startRadius: 0, endRadius: g.size.width * 0.7)
@@ -6148,6 +6228,58 @@ struct IntroMiniPage: View {
     }
 }
 
+// A phone outline with a fixed size; pages inside are laid out to exact heights so it never stretches.
+struct IntroPhone<Content: View>: View {
+    static var width: CGFloat { 170 }
+    static var height: CGFloat { 300 }
+    static var pad: CGFloat { 10 }
+    static var barH: CGFloat { 22 }
+    static var gap: CGFloat { 6 }
+    // Height left for pages once the address bar is in.
+    static var inner: CGFloat { height - pad * 2 - barH - gap }
+
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        content
+            .padding(Self.pad)
+            .frame(width: Self.width, height: Self.height, alignment: .top)
+            .background(RoundedRectangle(cornerRadius: 30, style: .continuous).fill(Color.black.opacity(0.55)))
+            .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous).stroke(.white.opacity(0.25), lineWidth: 1.5))
+            .clipShape(RoundedRectangle(cornerRadius: 30, style: .continuous))
+    }
+}
+
+// The phone's address bar, with one button that lights up when it's tapped.
+struct IntroBar: View {
+    let symbol: String
+    let lit: Bool
+    let tint: Color
+    var turn: Double = 0
+    var body: some View {
+        HStack(spacing: 6) {
+            Capsule().fill(.white.opacity(0.18)).frame(height: 18)
+            Image(systemName: symbol)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(.white)
+                .rotationEffect(.degrees(turn))
+                .frame(width: 26, height: 22)
+                .background(Circle().fill(tint.opacity(lit ? 0.9 : 0)).scaleEffect(lit ? 1.3 : 0.6))
+        }
+        .frame(height: IntroPhone<EmptyView>.barH)
+    }
+}
+
+// A fingertip.
+struct IntroTouch: View {
+    var body: some View {
+        Circle()
+            .fill(.white.opacity(0.85))
+            .frame(width: 26, height: 26)
+            .shadow(color: .black.opacity(0.4), radius: 6)
+    }
+}
+
 // Page 2: one page opens into two, the divider is dragged up and down, then off the edge.
 struct IntroSplitArt: View {
     let option: AppIconOption
@@ -6158,55 +6290,33 @@ struct IntroSplitArt: View {
             // 0–1.2 one page, 1.2–2 split opens, 2.6–3.6 drag up, 4–5 drag down, 5.6–6.4 off the edge
             let open = IntroTime.span(t, 1.2, 2.0) * (1 - IntroTime.span(t, 5.6, 6.4))
             let drag = -0.16 * IntroTime.span(t, 2.6, 3.6) + 0.30 * IntroTime.span(t, 4.0, 5.0) - 0.14 * IntroTime.span(t, 5.6, 6.4)
-            let r = 1 - open * (0.5 - drag)               // top pane's share of the screen
+            let r = 1 - open * (0.5 - drag)                         // top page's share
+            let gap = IntroPhone<EmptyView>.gap * CGFloat(open)
+            let inner = IntroPhone<EmptyView>.inner
+            let topH = (inner - gap) * CGFloat(r)
+            let botH = max(inner - gap - topH, 0)
             let tapping = t > 0.7 && t < 1.3
             let holding = t > 2.4 && t < 6.4
-            GeometryReader { g in
-                let w: CGFloat = 170, h: CGFloat = 290
-                let inner = h - 20 - 34
-                let top = max(inner * CGFloat(r) - (open > 0.01 ? 3 : 0), 0)
-                ZStack(alignment: .top) {
-                    RoundedRectangle(cornerRadius: 30, style: .continuous)
-                        .fill(Color.black.opacity(0.55))
-                        .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous).stroke(.white.opacity(0.25), lineWidth: 1.5))
-                    VStack(spacing: 6) {
-                        IntroMiniPage(tint: option.left, lines: 5).frame(height: top)
-                        if open > 0.01 {
-                            IntroMiniPage(tint: option.right, lines: 4)
-                        }
-                        // address bar with the split button
-                        HStack(spacing: 6) {
-                            Capsule().fill(.white.opacity(0.18)).frame(height: 18)
-                            Image(systemName: open > 0.5 ? "rectangle.split.1x2.fill" : "rectangle.split.1x2")
-                                .font(.system(size: 11, weight: .bold))
-                                .foregroundStyle(.white)
-                                .frame(width: 26, height: 22)
-                                .background(Circle().fill(option.left.opacity(tapping ? 0.9 : 0)).scaleEffect(tapping ? 1.3 : 0.6))
-                        }
-                        .frame(height: 22)
-                    }
-                    .padding(10)
-                    // finger on the divider
-                    if holding {
-                        Circle()
-                            .fill(.white.opacity(0.85))
-                            .frame(width: 26, height: 26)
-                            .shadow(color: .black.opacity(0.4), radius: 6)
-                            .offset(y: 10 + top + 1)
-                    }
-                    if tapping {
-                        Circle().fill(.white.opacity(0.85)).frame(width: 26, height: 26)
-                            .offset(x: w / 2 - 26, y: h - 34)
-                    }
+            IntroPhone {
+                VStack(spacing: 0) {
+                    IntroMiniPage(tint: option.left, lines: 5).frame(height: topH).clipped()
+                    Color.clear.frame(height: gap)
+                    IntroMiniPage(tint: option.right, lines: 4).frame(height: botH).clipped().opacity(botH > 4 ? 1 : 0)
+                    Color.clear.frame(height: IntroPhone<EmptyView>.gap)
+                    IntroBar(symbol: open > 0.5 ? "rectangle.split.1x2.fill" : "rectangle.split.1x2", lit: tapping, tint: option.left)
                 }
-                .frame(width: w, height: h)
-                .position(x: g.size.width / 2, y: g.size.height / 2)
+            }
+            .overlay(alignment: .top) {
+                if holding { IntroTouch().offset(y: IntroPhone<EmptyView>.pad + topH + gap / 2 - 13) }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if tapping { IntroTouch().offset(x: -IntroPhone<EmptyView>.pad, y: -IntroPhone<EmptyView>.pad + 2) }
             }
         }
     }
 }
 
-// Page 3: two tabs trade places as the switch button turns.
+// Page 3: the switch button swaps the top and bottom pages, just like split view on the phone.
 struct IntroSwitchArt: View {
     let option: AppIconOption
     let active: Bool
@@ -6215,40 +6325,40 @@ struct IntroSwitchArt: View {
             let t = active ? tl.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 4) : 0
             // swap at 1.0–1.8, swap back at 3.0–3.8
             let s = IntroTime.span(t, 1.0, 1.8) * (1 - IntroTime.span(t, 3.0, 3.8))
-            let pressed = (t > 0.85 && t < 1.1) || (t > 2.85 && t < 3.1)
-            VStack(spacing: 26) {
-                ZStack {
-                    card(tint: option.left, label: "Tab A")
-                        .offset(x: CGFloat(-44 + 88 * s), y: CGFloat(-10 + 20 * s))
-                        .scaleEffect(CGFloat(1 - 0.12 * s))
-                        .zIndex(1 - s)
-                    card(tint: option.right, label: "Tab B")
-                        .offset(x: CGFloat(44 - 88 * s), y: CGFloat(10 - 20 * s))
-                        .scaleEffect(CGFloat(0.88 + 0.12 * s))
-                        .zIndex(s)
+            let tapping = (t > 0.6 && t < 1.05) || (t > 2.6 && t < 3.05)
+            let gap = IntroPhone<EmptyView>.gap
+            let paneH = (IntroPhone<EmptyView>.inner - gap) / 2
+            let travel = paneH + gap
+            let lift = CGFloat(sin(.pi * s))
+            IntroPhone {
+                VStack(spacing: 0) {
+                    ZStack(alignment: .top) {
+                        pane(tint: option.right, label: "Tab B", height: paneH)
+                            .scaleEffect(1 - 0.06 * lift)
+                            .offset(x: -8 * lift, y: travel * CGFloat(1 - s))
+                        pane(tint: option.left, label: "Tab A", height: paneH)
+                            .scaleEffect(1 - 0.06 * lift)
+                            .offset(x: 8 * lift, y: travel * CGFloat(s))
+                            .shadow(color: .black.opacity(0.5 * Double(lift)), radius: 10, y: 4)
+                    }
+                    .frame(height: IntroPhone<EmptyView>.inner, alignment: .top)
+                    Color.clear.frame(height: gap)
+                    IntroBar(symbol: "arrow.up.arrow.down", lit: tapping, tint: option.left, turn: 180 * s)
                 }
-                .frame(height: 200)
-                Image(systemName: "arrow.left.arrow.right")
-                    .font(.system(size: 22, weight: .bold))
-                    .foregroundStyle(.white)
-                    .rotationEffect(.degrees(180 * s))
-                    .frame(width: 62, height: 62)
-                    .background(Circle().fill(option.left.opacity(pressed ? 0.95 : 0.55)))
-                    .scaleEffect(pressed ? 0.88 : 1)
-                    .shadow(color: option.left.opacity(0.5), radius: 14)
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if tapping { IntroTouch().offset(x: -IntroPhone<EmptyView>.pad, y: -IntroPhone<EmptyView>.pad + 2) }
             }
         }
     }
 
-    private func card(tint: Color, label: String) -> some View {
-        IntroMiniPage(tint: tint, lines: 6)
+    private func pane(tint: Color, label: String, height: CGFloat) -> some View {
+        IntroMiniPage(tint: tint, lines: 4)
             .overlay(alignment: .bottom) {
-                Text(label).font(.caption.weight(.bold)).foregroundStyle(.white.opacity(0.9)).padding(.bottom, 10)
+                Text(label).font(.caption.weight(.bold)).foregroundStyle(.white.opacity(0.9)).padding(.bottom, 8)
             }
-            .frame(width: 130, height: 180)
-            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.black.opacity(0.6)))
-            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(.white.opacity(0.2), lineWidth: 1))
-            .shadow(color: .black.opacity(0.4), radius: 12, y: 6)
+            .frame(height: height)
+            .clipped()
     }
 }
 
