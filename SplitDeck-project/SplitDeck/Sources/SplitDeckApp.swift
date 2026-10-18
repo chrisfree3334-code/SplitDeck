@@ -1923,7 +1923,9 @@ final class LiveSuggest: ObservableObject {
                              URLQueryItem(name: "oe", value: "utf-8"), URLQueryItem(name: "q", value: q)]
         }
         // '+' must be escaped too, or engines read it as a space.
-        c?.percentEncodedQuery = c?.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+        if let encoded = c?.percentEncodedQuery {
+            c?.percentEncodedQuery = encoded.replacingOccurrences(of: "+", with: "%2B")
+        }
         return c?.url
     }
 
