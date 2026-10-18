@@ -13,11 +13,13 @@ struct SplitDeckApp: App {
 }
 
 extension View {
-    @ViewBuilder func sdGlass<S: Shape>(_ shape: S) -> some View {
+    // Liquid Glass on iOS 26+, tinted towards the page colour so controls stay readable.
+    @ViewBuilder func sdGlass<S: Shape>(_ shape: S, dark: Bool? = nil) -> some View {
+        let tint: Color? = dark.map { $0 ? Color.black.opacity(0.28) : Color.white.opacity(0.45) }
         if #available(iOS 26.0, *) {
-            self.glassEffect(.regular.interactive(), in: shape)
+            self.glassEffect(Glass.regular.tint(tint).interactive(), in: shape)
         } else {
-            self.background(.ultraThinMaterial, in: shape)
+            self.background(shape.fill(tint ?? Color.clear)).background(.ultraThinMaterial, in: shape)
         }
     }
 }
@@ -148,7 +150,6 @@ enum Rules {
 
     static let raf = "(function(){var raf=window.requestAnimationFrame.bind(window);var last=0;window.requestAnimationFrame=function(cb){return raf(function ts(t){var f=window.__sdFps||0;if(f&&t-last<1000/f-2){raf(ts);return}last=t;cb(t)})}})();"
 
-    static let popupKill = "(function(){document.querySelectorAll('*').forEach(function(e){var s=getComputedStyle(e);if((s.position==='fixed'||s.position==='sticky')&&(parseInt(s.zIndex)||0)>=100&&e.getBoundingClientRect().height>80){e.remove()}});document.documentElement.style.overflow='auto';if(document.body)document.body.style.overflow='auto'})();"
 }
 
 // MARK: - VPN Service (IKEv2 via NEVPNManager)
@@ -471,10 +472,18 @@ struct VPNView: View {
 
 // MARK: One browser pane
 
+final class WeakHandler: NSObject, WKScriptMessageHandler {
+    weak var target: WKScriptMessageHandler?
+    init(_ t: WKScriptMessageHandler) { target = t }
+    func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+        target?.userContentController(c, didReceive: m)
+    }
+}
+
 final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
-    let id = UUID()
+    let id: UUID
     let webView: WKWebView
-    @Published var address: String
+    @Published var address = ""
     @Published var collapsed = false
     @Published var hasLogin = false
     @Published var hasCard = false
@@ -482,13 +491,41 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     @Published var canForward = false
     @Published var host = ""
     @Published var title = ""
+    @Published var isHome = true
+    @Published var pageDark: Bool? = nil
+    @Published var topDark: Bool? = nil
+    @Published var hiding = false
+    @Published var hiddenCount = 0
+    @Published var canUndoHide = false
+    private var lastHidden: String?
+    var editing = false
     var onCredential: ((Login) -> Void)?
+    var onVisit: ((String) -> Void)?
+    var onChange: (() -> Void)?
     static var fps = 0
     private var obs: NSKeyValueObservation?
     private var lastY: CGFloat = 0
+    private var tintWork: DispatchWorkItem?
     static let setJS = "function S(e,v){Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,v);e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}))}"
+    // Safari-style "Hide Distracting Items": tap an element to fade it out and remember it for this site.
+    static let hideStartJS = "(function(){if(window.__sdHiding)return;window.__sdHiding=true;var cur=null;function sel(e){var p=[];while(e&&e.nodeType===1&&e!==document.body&&e!==document.documentElement){if(e.id&&!/\\d{3,}/.test(e.id)){p.unshift('#'+CSS.escape(e.id));return p.join('>')}var i=1,x=e;while((x=x.previousElementSibling))if(x.tagName===e.tagName)i++;p.unshift(e.tagName.toLowerCase()+':nth-of-type('+i+')');e=e.parentElement}return 'body>'+p.join('>')}function pick(e){var r;while(e&&e!==document.body){r=e.getBoundingClientRect();if(r.width*r.height>2500)break;e=e.parentElement}if(!e||e===document.body||e===document.documentElement)return null;r=e.getBoundingClientRect();if(r.width>=innerWidth*0.98&&r.height>=innerHeight*0.9)return null;return e}function mark(e){if(cur){cur.style.outline=cur.__sdO||'';cur.style.outlineOffset=''}cur=e;if(e){e.__sdO=e.style.outline;e.style.outline='3px solid rgba(10,132,255,.9)';e.style.outlineOffset='-3px'}}window.__sdMark=mark;window.__sdDown=function(ev){mark(pick(ev.target))};window.__sdClick=function(ev){ev.preventDefault();ev.stopPropagation();ev.stopImmediatePropagation();var e=pick(ev.target);mark(null);if(!e)return;var s=sel(e);e.style.transition='opacity .25s ease,transform .25s ease';e.style.opacity='0';e.style.transform='scale(.94)';setTimeout(function(){e.style.setProperty('display','none','important')},260);window.webkit.messageHandlers.hide.postMessage(s)};document.addEventListener('pointerdown',window.__sdDown,true);document.addEventListener('click',window.__sdClick,true)})()"
+    static let hideStopJS = "(function(){window.__sdHiding=false;if(window.__sdMark)window.__sdMark(null);document.removeEventListener('pointerdown',window.__sdDown,true);document.removeEventListener('click',window.__sdClick,true)})()"
 
-    init(start: String) {
+    static func hiddenList(_ host: String) -> [String] {
+        let all = UserDefaults.standard.dictionary(forKey: "hidden") as? [String: [String]] ?? [:]
+        return all[host] ?? []
+    }
+
+    static func setHidden(_ list: [String], for host: String) {
+        var all = UserDefaults.standard.dictionary(forKey: "hidden") as? [String: [String]] ?? [:]
+        all[host] = list.isEmpty ? nil : list
+        UserDefaults.standard.set(all, forKey: "hidden")
+    }
+
+    static let tintJS = "(function(){function L(c){var m=c&&c.match(/[\\d.]+/g);if(!m||m.length<3)return -1;if(m.length>3&&+m[3]<0.5)return -1;return 0.299*m[0]+0.587*m[1]+0.114*m[2]}function at(x,y){var e=document.elementFromPoint(x,y);while(e){var v=L(getComputedStyle(e).backgroundColor);if(v>=0)return v;e=e.parentElement}return 255}var w=innerWidth/2;return [at(w,50),at(w,innerHeight-70)]})()"
+
+    init(id: UUID, start: String?) {
+        self.id = id
         let config = WKWebViewConfiguration()
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
@@ -501,12 +538,14 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         config.userContentController.addUserScript(WKUserScript(source: Rules.capture, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.allowsBackForwardNavigationGestures = true
+        wv.scrollView.keyboardDismissMode = .interactive
+        wv.isOpaque = false
         webView = wv
-        address = start
         super.init()
         wv.navigationDelegate = self
         wv.uiDelegate = self
-        config.userContentController.add(self, name: "cred")
+        config.userContentController.add(WeakHandler(self), name: "cred")
+        config.userContentController.add(WeakHandler(self), name: "hide")
         obs = wv.scrollView.observe(\.contentOffset, options: [.new]) { [weak self] sv, _ in
             guard let self else { return }
             let y = sv.contentOffset.y
@@ -514,9 +553,13 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             self.lastY = y
             if dy > 6 && y > 80 { if !self.collapsed { self.collapsed = true } }
             else if dy < -6 { if self.collapsed { self.collapsed = false } }
+            self.scheduleTint()
         }
-        load(start)
+        if let start, !start.isEmpty { load(start) }
     }
+
+    var backEnabled: Bool { !isHome }
+    var forwardEnabled: Bool { isHome ? webView.url != nil : canForward }
 
     func load(_ text: String) {
         var t = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -530,7 +573,39 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             if !t.lowercased().hasPrefix("http") { t = "https://" + t }
             url = URL(string: t)
         }
-        if let url { webView.load(URLRequest(url: url)) }
+        guard let url else { return }
+        isHome = false
+        collapsed = false
+        webView.load(URLRequest(url: url))
+    }
+
+    func goHome() {
+        if hiding { stopHiding() }
+        webView.evaluateJavaScript("document.querySelectorAll('video,audio').forEach(function(m){m.pause()})")
+        isHome = true
+        collapsed = false
+        if !editing { address = "" }
+        title = ""
+        host = ""
+        hasLogin = false
+        hasCard = false
+        onChange?()
+    }
+
+    func back() {
+        guard !isHome else { return }
+        if webView.canGoBack { webView.goBack() } else { goHome() }
+    }
+
+    func forward() {
+        if isHome {
+            guard webView.url != nil else { return }
+            isHome = false
+            refreshMeta()
+            onChange?()
+        } else {
+            webView.goForward()
+        }
     }
 
     func setDesktop(_ on: Bool) {
@@ -542,6 +617,12 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
 
     func applyFPS() { webView.evaluateJavaScript("window.__sdFps=\(Pane.fps)") }
 
+    func sleep() {
+        webView.stopLoading()
+        webView.configuration.userContentController.removeAllScriptMessageHandlers()
+        webView.removeFromSuperview()
+    }
+
     func fill(login l: Login) {
         webView.evaluateJavaScript("(function(u,p){\(Pane.setJS)var w=document.querySelector('input[type=password]');if(!w)return;var f=w.form||document;var e=f.querySelector('input[type=email],input[type=text],input[autocomplete=username]');if(e)S(e,u);S(w,p)})(\(q(l.user)),\(q(l.pass)))")
     }
@@ -550,7 +631,89 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         webView.evaluateJavaScript("(function(c){\(Pane.setJS)[['cc-number',c[0]],['cc-name',c[1]],['cc-exp',c[2]],['cc-csc',c[3]]].forEach(function(x){var e=document.querySelector('[autocomplete='+x[0]+']');if(e)S(e,x[1])})})([\(q(c.number)),\(q(c.name)),\(q(c.exp)),\(q(c.cvc))])")
     }
 
+    private var hideKey: String { host.replacingOccurrences(of: "www.", with: "") }
+
+    func applyHidden() {
+        let list = Pane.hiddenList(hideKey)
+        hiddenCount = list.count
+        let css = list.isEmpty ? "" : list.joined(separator: ",") + "{display:none!important}"
+        webView.evaluateJavaScript("(function(){var d=document.documentElement;if(!d)return;var s=document.getElementById('sd-hidden');if(!s){s=document.createElement('style');s.id='sd-hidden';d.appendChild(s)}s.textContent=\(q(css))})()")
+    }
+
+    func startHiding() {
+        guard !isHome else { return }
+        hiding = true
+        canUndoHide = false
+        lastHidden = nil
+        webView.evaluateJavaScript(Pane.hideStartJS)
+    }
+
+    func stopHiding() {
+        hiding = false
+        canUndoHide = false
+        lastHidden = nil
+        webView.evaluateJavaScript(Pane.hideStopJS)
+    }
+
+    func undoHide() {
+        guard let last = lastHidden else { return }
+        var list = Pane.hiddenList(hideKey)
+        list.removeAll { $0 == last }
+        Pane.setHidden(list, for: hideKey)
+        webView.evaluateJavaScript("document.querySelectorAll(\(q(last))).forEach(function(e){e.style.removeProperty('display');e.style.opacity='';e.style.transform=''})")
+        applyHidden()
+        lastHidden = nil
+        canUndoHide = false
+    }
+
+    func showAllHidden() {
+        let list = Pane.hiddenList(hideKey)
+        Pane.setHidden([], for: hideKey)
+        for sel in list {
+            webView.evaluateJavaScript("document.querySelectorAll(\(q(sel))).forEach(function(e){e.style.removeProperty('display');e.style.opacity='';e.style.transform=''})")
+        }
+        applyHidden()
+    }
+
+    private func refreshMeta() {
+        if let u = webView.url {
+            if !editing { address = u.absoluteString }
+            host = u.host ?? ""
+        }
+        title = webView.title ?? ""
+        canBack = webView.canGoBack
+        canForward = webView.canGoForward
+    }
+
+    private func scheduleTint() {
+        tintWork?.cancel()
+        let w = DispatchWorkItem { [weak self] in self?.detectTint() }
+        tintWork = w
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: w)
+    }
+
+    private func detectTint() {
+        guard !isHome else { return }
+        webView.evaluateJavaScript(Pane.tintJS) { [weak self] r, _ in
+            guard let self, let a = r as? [NSNumber], a.count == 2 else { return }
+            let top = a[0].doubleValue < 128
+            let bottom = a[1].doubleValue < 128
+            if self.topDark != top { self.topDark = top }
+            if self.pageDark != bottom { self.pageDark = bottom }
+        }
+    }
+
     func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
+        if m.name == "hide" {
+            guard let sel = m.body as? String, !sel.isEmpty else { return }
+            var list = Pane.hiddenList(hideKey)
+            if !list.contains(sel) { list.append(sel) }
+            Pane.setHidden(list, for: hideKey)
+            hiddenCount = list.count
+            lastHidden = sel
+            canUndoHide = true
+            return
+        }
         guard let d = m.body as? [String: String], let p = d["pass"], !p.isEmpty else { return }
         onCredential?(Login(site: d["site"] ?? "", user: d["user"] ?? "", pass: p))
     }
@@ -563,17 +726,40 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         return nil
     }
 
+    // Keep web links in SplitDeck. Policy raw value 3 is WebKit's "allow without trying app link",
+    // which stops universal links (YouTube, Amazon, etc.) jumping out to their apps.
+    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+        guard let url = navigationAction.request.url, let scheme = url.scheme?.lowercased() else {
+            decisionHandler(.allow)
+            return
+        }
+        if scheme == "http" || scheme == "https" {
+            decisionHandler(WKNavigationActionPolicy(rawValue: WKNavigationActionPolicy.allow.rawValue + 2) ?? .allow)
+            return
+        }
+        if ["about", "data", "blob", "javascript", "file"].contains(scheme) {
+            decisionHandler(.allow)
+            return
+        }
+        if ["tel", "mailto", "sms", "facetime"].contains(scheme), navigationAction.navigationType == .linkActivated {
+            UIApplication.shared.open(url)
+        }
+        decisionHandler(.cancel)
+    }
+
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         webView.evaluateJavaScript("window.__sdFps=\(Pane.fps)")
-        canBack = webView.canGoBack
-        canForward = webView.canGoForward
+        if hiding { hiding = false; canUndoHide = false }
+        refreshMeta()
+        applyHidden()
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        if let u = webView.url { address = u.absoluteString; host = u.host ?? "" }
-        title = webView.title ?? ""
-        canBack = webView.canGoBack
-        canForward = webView.canGoForward
+        refreshMeta()
+        applyHidden()
+        detectTint()
+        if !host.isEmpty { onVisit?(host) }
+        onChange?()
         webView.evaluateJavaScript("((document.querySelector('input[type=password]')?1:0)+(document.querySelector('[autocomplete=cc-number]')?2:0))") { [weak self] r, _ in
             let v = (r as? Int) ?? 0
             self?.hasLogin = (v & 1) != 0
@@ -582,48 +768,442 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     }
 }
 
+// Hosts a web view. Only takes the web view if no other host owns it,
+// so two hosts briefly on screen during an animation can't steal it back and forth.
+final class HostView: UIView {
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        subviews.forEach { $0.frame = bounds }
+    }
+}
+
 struct WebHost: UIViewRepresentable {
     let webView: WKWebView
-    func makeUIView(context: Context) -> UIView {
-        let v = UIView()
+    func makeUIView(context: Context) -> HostView {
+        let v = HostView()
         v.backgroundColor = .clear
-        attach(v)
+        v.addSubview(webView)
         return v
     }
-    func updateUIView(_ v: UIView, context: Context) { attach(v) }
-    private func attach(_ v: UIView) {
-        guard webView.superview !== v else { return }
-        v.subviews.forEach { $0.removeFromSuperview() }
-        webView.frame = v.bounds
-        webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        v.addSubview(webView)
+    func updateUIView(_ v: HostView, context: Context) {
+        if webView.superview == nil {
+            v.addSubview(webView)
+            v.setNeedsLayout()
+        }
     }
+}
+
+// MARK: Tabs
+
+struct TabInfo: Identifiable, Codable {
+    var id = UUID()
+    var url = ""
+    var title = ""
+}
+
+final class Tabs: ObservableObject {
+    @Published var list: [TabInfo]
+    @Published var left: UUID
+    @Published var right: UUID
+    @Published var split = false
+    @Published var previous: UUID? = nil
+    private var live: [UUID: Pane] = [:]
+    private var used: [UUID: Date] = [:]
+    var maxLive = 4
+    var configure: ((Pane) -> Void)?
+
+    init() {
+        var saved: [TabInfo] = []
+        if let d = UserDefaults.standard.data(forKey: "tabs"),
+           let l = try? JSONDecoder().decode([TabInfo].self, from: d) { saved = l }
+        if saved.isEmpty { saved = [TabInfo()] }
+        var first = saved[0].id
+        if let s = UserDefaults.standard.string(forKey: "leftTab"), let id = UUID(uuidString: s),
+           saved.contains(where: { $0.id == id }) { first = id }
+        list = saved
+        left = first
+        right = first
+    }
+
+    var visible: [UUID] { split ? [left, right] : [left] }
+    var allLive: [Pane] { Array(live.values) }
+    var canSwap: Bool { split || validPrevious != nil }
+    func isLive(_ id: UUID) -> Bool { live[id] != nil }
+
+    private var validPrevious: UUID? {
+        guard let p = previous, p != left, list.contains(where: { $0.id == p }) else { return nil }
+        return p
+    }
+
+    func pane(_ id: UUID) -> Pane {
+        used[id] = Date()
+        if let p = live[id] { return p }
+        let info = list.first { $0.id == id }
+        let p = Pane(id: id, start: info?.url)
+        p.title = info?.title ?? ""
+        p.onChange = { [weak self, weak p] in
+            if let self, let p { self.sync(p) }
+        }
+        configure?(p)
+        live[id] = p
+        DispatchQueue.main.async { self.trim() }
+        return p
+    }
+
+    func info(_ id: UUID) -> TabInfo? { list.first { $0.id == id } }
+
+    func sync(_ p: Pane) {
+        guard let i = list.firstIndex(where: { $0.id == p.id }) else { return }
+        let url = p.isHome ? "" : (p.webView.url?.absoluteString ?? list[i].url)
+        let title = p.isHome ? "" : (p.title.isEmpty ? p.host : p.title)
+        if list[i].url != url || list[i].title != title {
+            list[i].url = url
+            list[i].title = title
+            save()
+        }
+    }
+
+    func trim() {
+        let keep = Set(visible)
+        let candidates = live.keys
+            .filter { !keep.contains($0) }
+            .sorted { (used[$0] ?? .distantPast) < (used[$1] ?? .distantPast) }
+        var extra = live.count - maxLive
+        for id in candidates where extra > 0 {
+            sleep(id)
+            extra -= 1
+        }
+    }
+
+    func sleepHidden() {
+        let keep = Set(visible)
+        for id in live.keys where !keep.contains(id) { sleep(id) }
+    }
+
+    private func sleep(_ id: UUID) {
+        guard let p = live[id] else { return }
+        sync(p)
+        p.sleep()
+        live[id] = nil
+        objectWillChange.send()
+    }
+
+    func show(_ id: UUID, slot: Int) {
+        let cur = slot == 0 ? left : right
+        guard cur != id else { return }
+        if split {
+            if slot == 0, right == id { right = left }
+            if slot == 1, left == id { left = right }
+        }
+        previous = cur
+        if slot == 0 { left = id } else { right = id }
+        used[id] = Date()
+        save()
+        DispatchQueue.main.async { self.trim() }
+    }
+
+    func newTab(slot: Int) {
+        let t = TabInfo()
+        list.append(t)
+        show(t.id, slot: slot)
+    }
+
+    func close(_ id: UUID) {
+        sleep(id)
+        list.removeAll { $0.id == id }
+        if previous == id { previous = nil }
+        if list.isEmpty {
+            let t = TabInfo()
+            list = [t]
+            left = t.id
+            right = t.id
+            split = false
+        }
+        if !list.contains(where: { $0.id == left }) { left = list.first { $0.id != right }?.id ?? list[0].id }
+        if !list.contains(where: { $0.id == right }) { right = list.first { $0.id != left }?.id ?? list[0].id }
+        if split && left == right {
+            let t = TabInfo()
+            list.append(t)
+            right = t.id
+        }
+        save()
+    }
+
+    func toggleSplit() {
+        if split {
+            split = false
+            DispatchQueue.main.async { self.trim() }
+        } else {
+            if let p = validPrevious {
+                right = p
+            } else if right == left || !list.contains(where: { $0.id == right }) {
+                let t = TabInfo()
+                list.append(t)
+                right = t.id
+            }
+            split = true
+        }
+        save()
+    }
+
+    func closeSplit(keep slot: Int) {
+        guard split else { return }
+        if slot == 1 {
+            previous = left
+            left = right
+        } else {
+            previous = right
+        }
+        split = false
+        save()
+        DispatchQueue.main.async { self.trim() }
+    }
+
+    func swap() {
+        if split {
+            let l = left
+            left = right
+            right = l
+        } else if let p = validPrevious {
+            previous = left
+            left = p
+            used[p] = Date()
+            DispatchQueue.main.async { self.trim() }
+        }
+        save()
+    }
+
+    func save() {
+        if let d = try? JSONEncoder().encode(list) { UserDefaults.standard.set(d, forKey: "tabs") }
+        UserDefaults.standard.set(left.uuidString, forKey: "leftTab")
+    }
+}
+
+// MARK: Start page sites
+
+final class Sites: ObservableObject {
+    @Published var visits: [String: Int] = (UserDefaults.standard.dictionary(forKey: "visits") as? [String: Int]) ?? [:]
+    @Published var custom: [String] = UserDefaults.standard.stringArray(forKey: "mySites") ?? []
+
+    var frequent: [String] {
+        visits.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
+            .prefix(12).map { $0.key }
+    }
+
+    static func clean(_ s: String) -> String {
+        var t = s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !t.contains("://") { t = "https://" + t }
+        let h = URL(string: t)?.host ?? ""
+        return h.hasPrefix("www.") ? String(h.dropFirst(4)) : h
+    }
+
+    func record(_ host: String) {
+        let h = Sites.clean(host)
+        guard !h.isEmpty else { return }
+        visits[h, default: 0] += 1
+        UserDefaults.standard.set(visits, forKey: "visits")
+    }
+
+    func add(_ s: String) {
+        let h = Sites.clean(s)
+        guard !h.isEmpty, !custom.contains(h) else { return }
+        custom.append(h)
+        save()
+    }
+
+    func remove(_ h: String) { custom.removeAll { $0 == h }; save() }
+
+    func forget(_ h: String) {
+        visits[h] = nil
+        UserDefaults.standard.set(visits, forKey: "visits")
+    }
+
+    func clearVisits() {
+        visits = [:]
+        UserDefaults.standard.set(visits, forKey: "visits")
+    }
+
+    func save() { UserDefaults.standard.set(custom, forKey: "mySites") }
+}
+
+struct SiteIcon: View {
+    let host: String
+    var size: CGFloat = 56
+    var body: some View {
+        AsyncImage(url: URL(string: "https://icons.duckduckgo.com/ip3/\(host).ico")) { phase in
+            if let img = phase.image {
+                img.resizable().scaledToFit().frame(width: size * 0.5, height: size * 0.5)
+            } else {
+                Text(String(host.prefix(1)).uppercased())
+                    .font(.system(size: size * 0.4, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .frame(width: size, height: size)
+        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: size * 0.28, style: .continuous))
+    }
+}
+
+struct StartPage: View {
+    @ObservedObject var sites: Sites
+    var topPad: CGFloat = 72
+    var open: (String) -> Void
+    @AppStorage("homeMode") private var mode = 0
+    @State private var adding = false
+    @State private var newSite = ""
+
+    private func name(_ h: String) -> String {
+        let parts = h.split(separator: ".")
+        let base = parts.count >= 2 ? parts[parts.count - 2] : Substring(h)
+        return base.prefix(1).uppercased() + base.dropFirst()
+    }
+
+    var body: some View {
+        let hosts = mode == 1 ? sites.custom : sites.frequent
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                Menu {
+                    Picker("Show", selection: $mode) {
+                        Text("Frequently Visited").tag(0)
+                        Text("My Sites").tag(1)
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(mode == 1 ? "My Sites" : "Frequently Visited").font(.title2.bold())
+                        Image(systemName: "chevron.down").font(.footnote.weight(.bold)).foregroundStyle(.secondary)
+                    }
+                    .foregroundStyle(.primary)
+                }
+                if hosts.isEmpty && mode == 0 {
+                    Text("Sites you visit most will appear here.").foregroundStyle(.secondary)
+                }
+                LazyVGrid(columns: [GridItem(.adaptive(minimum: 72), spacing: 14)], spacing: 18) {
+                    ForEach(hosts, id: \.self) { h in
+                        Button { open(h) } label: {
+                            VStack(spacing: 6) {
+                                SiteIcon(host: h)
+                                Text(name(h)).font(.caption).foregroundStyle(.primary).lineLimit(1)
+                            }
+                        }
+                        .contextMenu {
+                            if mode == 1 {
+                                Button(role: .destructive) { sites.remove(h) } label: { Label("Remove from My Sites", systemImage: "minus.circle") }
+                            } else {
+                                if !sites.custom.contains(h) {
+                                    Button { sites.add(h) } label: { Label("Add to My Sites", systemImage: "star") }
+                                }
+                                Button(role: .destructive) { sites.forget(h) } label: { Label("Hide", systemImage: "eye.slash") }
+                            }
+                        }
+                    }
+                    if mode == 1 {
+                        Button { adding = true } label: {
+                            VStack(spacing: 6) {
+                                Image(systemName: "plus")
+                                    .font(.title2.weight(.medium))
+                                    .foregroundStyle(.secondary)
+                                    .frame(width: 56, height: 56)
+                                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                                Text("Add").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.top, topPad)
+            .padding(.bottom, 140)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .background(Color(.systemBackground))
+        .alert("Add a site", isPresented: $adding) {
+            TextField("example.com", text: $newSite)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .keyboardType(.URL)
+            Button("Add") { sites.add(newSite); newSite = "" }
+            Button("Cancel", role: .cancel) { newSite = "" }
+        }
+    }
+}
+
+// MARK: Pane view
+
+struct PaneActions {
+    var autofill: () -> Void
+    var calendar: () -> Void
+    var settings: () -> Void
+    var vpn: () -> Void
+    var vpnOn: Bool
+    var newTab: () -> Void
 }
 
 struct PaneView: View {
     @ObservedObject var pane: Pane
+    @ObservedObject var sites: Sites
     var bottomGap: CGFloat
-    var autofill: () -> Void
-    var calendar: () -> Void
-    var removePopups: () -> Void
-    var settings: () -> Void
-    var vpn: () -> Void
-    var vpnOn: Bool
+    var actions: PaneActions
+    var compact = false          // slim bar used in split view
+    var atTop = false            // bar pinned to the top edge (top pane in portrait split)
+    var topInset: CGFloat = 0    // status bar height
+    var trailingRoom: CGFloat = 0 // space left for the tab pill beside a top bar
+    var contentTop: CGFloat = 72 // where the start page content begins
+    @Environment(\.colorScheme) private var sys
+    @AppStorage("saver") private var saver = false
     @State private var desktop = false
     @FocusState private var focused: Bool
 
-    private var mini: Bool { pane.collapsed && !focused }
+    private var mini: Bool { pane.collapsed && !focused && !pane.isHome }
+    private var dark: Bool { pane.isHome ? sys == .dark : (pane.pageDark ?? (sys == .dark)) }
+    private var spring: Animation? { saver ? nil : .spring(response: 0.35, dampingFraction: 0.82) }
+    private var barH: CGFloat { compact ? 36 : 48 }
+    private var iconW: CGFloat { compact ? 32 : 40 }
+
+    // Shows just the site name until you tap in, then the full address.
+    private var addressText: Binding<String> {
+        Binding(
+            get: { focused || pane.isHome ? pane.address : pane.host.replacingOccurrences(of: "www.", with: "") },
+            set: { pane.address = $0 }
+        )
+    }
+
+    private var edgePad: CGFloat {
+        if atTop { return topInset + 2 }
+        if focused { return 8 }
+        return mini ? max(bottomGap - (compact ? 12 : 22), 4) : bottomGap
+    }
 
     var body: some View {
-        ZStack(alignment: .bottom) {
+        ZStack(alignment: atTop ? .top : .bottom) {
             WebHost(webView: pane.webView)
+                .opacity(pane.isHome ? 0 : 1)
+            if pane.isHome {
+                StartPage(sites: sites, topPad: contentTop) { pane.load($0) }
+            }
+            if focused {
+                Color.black.opacity(0.001)
+                    .contentShape(Rectangle())
+                    .onTapGesture { focused = false }
+                    .gesture(DragGesture(minimumDistance: 8).onEnded { v in
+                        if v.translation.height > 16 { focused = false }
+                    })
+            }
             bar
-                .padding(.horizontal, 12)
-                .padding(.bottom, focused ? 8 : (mini ? max(bottomGap - 22, 4) : bottomGap))
-                .animation(.spring(response: 0.35, dampingFraction: 0.82), value: mini)
-                .animation(.spring(response: 0.35, dampingFraction: 0.82), value: focused)
+                .environment(\.colorScheme, dark ? .dark : .light)
+                .padding(.leading, 12)
+                .padding(.trailing, 12 + trailingRoom)
+                .padding(atTop ? .top : .bottom, edgePad)
+                .simultaneousGesture(DragGesture(minimumDistance: 12).onEnded { v in
+                    if focused && abs(v.translation.height) > 20 { focused = false }
+                })
+                .animation(spring, value: mini)
+                .animation(spring, value: focused)
+                .animation(spring, value: pane.hiding)
+                .animation(saver ? nil : .easeInOut(duration: 0.25), value: dark)
         }
         .clipped()
+        .onChange(of: focused) { _, f in pane.editing = f }
     }
 
     private func roundButton(_ icon: String, _ enabled: Bool, _ action: @escaping () -> Void) -> some View {
@@ -634,76 +1214,259 @@ struct PaneView: View {
                 .frame(width: 48, height: 48)
                 .contentShape(Circle())
         }
-        .sdGlass(Circle())
+        .sdGlass(Circle(), dark: dark)
         .opacity(enabled ? 1 : 0.45)
         .disabled(!enabled)
     }
 
-    private func icon(_ name: String, _ action: @escaping () -> Void) -> some View {
+    private func icon(_ name: String, enabled: Bool = true, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: name)
-                .font(.system(size: 16, weight: .semibold))
+                .font(.system(size: compact ? 14 : 16, weight: .semibold))
                 .foregroundStyle(.primary)
-                .frame(width: 40, height: 44)
+                .frame(width: iconW, height: barH)
                 .contentShape(Rectangle())
         }
+        .opacity(enabled ? 1 : 0.35)
+        .disabled(!enabled)
+    }
+
+    private var field: some View {
+        TextField("Search or enter site", text: addressText)
+            .textFieldStyle(.plain)
+            .font(compact ? .subheadline : .body)
+            .foregroundStyle(.primary)
+            .multilineTextAlignment(focused ? .leading : .center)
+            .textInputAutocapitalization(.never)
+            .autocorrectionDisabled()
+            .keyboardType(.webSearch)
+            .submitLabel(.go)
+            .focused($focused)
+            .onSubmit { pane.load(pane.address); focused = false }
     }
 
     @ViewBuilder private var bar: some View {
-        if mini {
+        if pane.hiding {
+            HStack(spacing: 0) {
+                Text("Tap items to hide")
+                    .font(compact ? .footnote.weight(.medium) : .subheadline.weight(.medium))
+                    .foregroundStyle(.primary)
+                    .padding(.leading, compact ? 14 : 18)
+                Spacer(minLength: 8)
+                if pane.canUndoHide { icon("arrow.uturn.backward") { pane.undoHide() } }
+                Button { pane.stopHiding() } label: {
+                    Text("Done")
+                        .font(compact ? .footnote.weight(.semibold) : .subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, compact ? 12 : 16)
+                        .frame(height: barH - 12)
+                        .background(Color.accentColor, in: Capsule())
+                }
+                .padding(.trailing, 6)
+            }
+            .frame(height: barH)
+            .sdGlass(Capsule(), dark: dark)
+            .transition(.scale(scale: 0.95).combined(with: .opacity))
+        } else if mini {
             Button { pane.collapsed = false } label: {
                 Text(pane.host.isEmpty ? "Search" : pane.host.replacingOccurrences(of: "www.", with: ""))
-                    .font(.caption.weight(.semibold))
+                    .font(compact ? .caption2.weight(.semibold) : .caption.weight(.semibold))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 7)
+                    .padding(.horizontal, compact ? 12 : 16)
+                    .padding(.vertical, compact ? 5 : 7)
             }
-            .sdGlass(Capsule())
+            .sdGlass(Capsule(), dark: dark)
             .transition(.scale(scale: 0.85).combined(with: .opacity))
+        } else if compact {
+            // One slim capsule: back, forward, address, extras, menu.
+            HStack(spacing: 0) {
+                if !focused {
+                    icon("chevron.left", enabled: pane.backEnabled) { pane.back() }
+                    icon("chevron.right", enabled: pane.forwardEnabled) { pane.forward() }
+                }
+                field.padding(.leading, focused ? 14 : 2)
+                if focused {
+                    if !pane.address.isEmpty { icon("xmark.circle.fill") { pane.address = "" } }
+                } else {
+                    if !pane.isHome && pane.hasLogin { icon("key.fill") { actions.autofill() } }
+                    if !pane.isHome && pane.hasCard { icon("creditcard.fill") { actions.autofill() } }
+                    menu
+                }
+            }
+            .padding(.horizontal, 2)
+            .frame(height: barH)
+            .sdGlass(Capsule(), dark: dark)
+            .transition(.scale(scale: 0.95).combined(with: .opacity))
         } else {
             HStack(spacing: 8) {
-                if !focused { roundButton("chevron.left", pane.canBack) { pane.webView.goBack() } }
+                if !focused { roundButton("chevron.left", pane.backEnabled) { pane.back() } }
                 HStack(spacing: 0) {
-                    TextField("Search or enter site", text: $pane.address)
-                        .textFieldStyle(.plain)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
-                        .keyboardType(.webSearch)
-                        .submitLabel(.go)
-                        .focused($focused)
-                        .onSubmit { pane.load(pane.address); focused = false }
-                    if !focused {
-                        if pane.hasLogin { icon("key.fill") { autofill() } }
-                        if pane.hasCard { icon("creditcard.fill") { autofill() } }
-                        Menu {
-                            Button { pane.webView.reload() } label: { Label("Reload", systemImage: "arrow.clockwise") }
-                            Button { desktop.toggle(); pane.setDesktop(desktop) } label: {
-                                Label(desktop ? "Mobile site" : "Desktop site", systemImage: desktop ? "iphone" : "desktopcomputer")
-                            }
-                            Button { removePopups() } label: { Label("Remove popups", systemImage: "xmark.rectangle") }
-                            Button { calendar() } label: { Label("Add to Calendar", systemImage: "calendar.badge.plus") }
-                            Divider()
-                            Button { vpn() } label: { Label(vpnOn ? "VPN (on)" : "VPN", systemImage: vpnOn ? "lock.shield.fill" : "lock.shield") }
-                            Button { settings() } label: { Label("Settings", systemImage: "gearshape") }
-                        } label: {
-                            Image(systemName: "ellipsis")
-                                .font(.system(size: 16, weight: .semibold))
-                                .foregroundStyle(.primary)
-                                .frame(width: 40, height: 44)
-                                .contentShape(Rectangle())
-                        }
+                    field
+                    if focused {
+                        if !pane.address.isEmpty { icon("xmark.circle.fill") { pane.address = "" } }
                     } else {
-                        icon("xmark.circle.fill") { focused = false }
+                        if !pane.isHome && pane.hasLogin { icon("key.fill") { actions.autofill() } }
+                        if !pane.isHome && pane.hasCard { icon("creditcard.fill") { actions.autofill() } }
+                        menu
                     }
                 }
                 .padding(.leading, 16)
                 .padding(.trailing, 4)
-                .frame(height: 48)
-                .sdGlass(Capsule())
-                if !focused { roundButton("chevron.right", pane.canForward) { pane.webView.goForward() } }
+                .frame(height: barH)
+                .sdGlass(Capsule(), dark: dark)
+                if !focused { roundButton("chevron.right", pane.forwardEnabled) { pane.forward() } }
             }
             .transition(.scale(scale: 0.95).combined(with: .opacity))
+        }
+    }
+
+    private var menu: some View {
+        Menu {
+            Button { pane.goHome() } label: { Label("Home", systemImage: "house") }
+            Button { actions.newTab() } label: { Label("New Tab", systemImage: "plus.square.on.square") }
+            if !pane.isHome {
+                Button { pane.webView.reload() } label: { Label("Reload", systemImage: "arrow.clockwise") }
+                Button { desktop.toggle(); pane.setDesktop(desktop) } label: {
+                    Label(desktop ? "Mobile Site" : "Desktop Site", systemImage: desktop ? "iphone" : "desktopcomputer")
+                }
+                Button { pane.startHiding() } label: { Label("Hide Distracting Items", systemImage: "eye.slash") }
+                if pane.hiddenCount > 0 {
+                    Button { pane.showAllHidden() } label: { Label("Show Hidden Items (\(pane.hiddenCount))", systemImage: "eye") }
+                }
+                Button { actions.calendar() } label: { Label("Add to Calendar", systemImage: "calendar.badge.plus") }
+            }
+            Divider()
+            Button { actions.vpn() } label: { Label(actions.vpnOn ? "VPN (On)" : "VPN", systemImage: actions.vpnOn ? "lock.shield.fill" : "lock.shield") }
+            Button { actions.settings() } label: { Label("Settings", systemImage: "gearshape") }
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.system(size: compact ? 14 : 16, weight: .semibold))
+                .foregroundStyle(.primary)
+                .frame(width: iconW, height: barH)
+                .contentShape(Rectangle())
+        }
+    }
+}
+
+// MARK: Top controls
+
+struct TopBar: View {
+    @ObservedObject var pane: Pane
+    @ObservedObject var tabs: Tabs
+    var saver: Bool
+    var openTabs: () -> Void
+    @Environment(\.colorScheme) private var sys
+
+    private func button<L: View>(_ action: @escaping () -> Void, @ViewBuilder label: () -> L) -> some View {
+        Button(action: action) {
+            label()
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.primary)
+                .frame(minWidth: 40, minHeight: 36)
+                .contentShape(Rectangle())
+        }
+    }
+
+    var body: some View {
+        let dark = pane.isHome ? sys == .dark : (pane.topDark ?? (sys == .dark))
+        HStack {
+            Spacer()
+            HStack(spacing: 0) {
+                button(openTabs) {
+                    Text("\(tabs.list.count)")
+                        .font(.caption.weight(.bold))
+                        .monospacedDigit()
+                        .frame(minWidth: 20, minHeight: 20)
+                        .padding(.horizontal, 2)
+                        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(.primary, lineWidth: 1.6))
+                }
+                button({ withAnimation(saver ? nil : .snappy) { tabs.swap() } }) {
+                    Image(systemName: "arrow.left.arrow.right")
+                }
+                .disabled(!tabs.canSwap)
+                .opacity(tabs.canSwap ? 1 : 0.4)
+                button({ withAnimation(saver ? nil : .snappy) { tabs.toggleSplit() } }) {
+                    Image(systemName: tabs.split ? "rectangle.split.2x1.fill" : "rectangle.split.2x1")
+                }
+            }
+            .padding(.horizontal, 4)
+            .sdGlass(Capsule(), dark: dark)
+        }
+        .environment(\.colorScheme, dark ? .dark : .light)
+        .animation(saver ? nil : .easeInOut(duration: 0.25), value: dark)
+        .padding(.horizontal, 12)
+        .padding(.top, 2)
+    }
+}
+
+// MARK: Tab switcher
+
+struct TabsView: View {
+    @ObservedObject var tabs: Tabs
+    @Environment(\.dismiss) private var dismiss
+    @State private var slot = 0
+
+    var body: some View {
+        NavigationStack {
+            List {
+                if tabs.split {
+                    Picker("Open in", selection: $slot) {
+                        Text("First Pane").tag(0)
+                        Text("Second Pane").tag(1)
+                    }
+                    .pickerStyle(.segmented)
+                    .listRowBackground(Color.clear)
+                }
+                Section {
+                    ForEach(tabs.list) { t in
+                        let host = URL(string: t.url)?.host ?? ""
+                        Button {
+                            tabs.show(t.id, slot: tabs.split ? slot : 0)
+                            dismiss()
+                        } label: {
+                            HStack(spacing: 12) {
+                                if host.isEmpty {
+                                    Image(systemName: "house")
+                                        .frame(width: 36, height: 36)
+                                        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                } else {
+                                    SiteIcon(host: host.replacingOccurrences(of: "www.", with: ""), size: 36)
+                                }
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(t.title.isEmpty ? (host.isEmpty ? "Home" : host) : t.title).lineLimit(1)
+                                    if !host.isEmpty {
+                                        Text(host).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                    }
+                                }
+                                Spacer()
+                                if tabs.visible.contains(t.id) {
+                                    Image(systemName: "eye.fill").foregroundStyle(.secondary)
+                                } else if !tabs.isLive(t.id) {
+                                    Image(systemName: "moon.zzz").foregroundStyle(.tertiary)
+                                }
+                            }
+                        }
+                        .foregroundStyle(.primary)
+                    }
+                    .onDelete { idx in
+                        idx.map { tabs.list[$0].id }.forEach { tabs.close($0) }
+                    }
+                } footer: {
+                    Text("Tabs you haven't used recently go to sleep to save memory and battery, then reload when you open them. Swipe left to close.")
+                }
+            }
+            .navigationTitle(tabs.list.count == 1 ? "1 Tab" : "\(tabs.list.count) Tabs")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        tabs.newTab(slot: tabs.split ? slot : 0)
+                        dismiss()
+                    } label: { Image(systemName: "plus") }
+                }
+            }
         }
     }
 }
@@ -741,37 +1504,91 @@ struct EventEditor: UIViewControllerRepresentable {
 
 // MARK: Settings
 
+struct MySitesEditor: View {
+    @ObservedObject var sites: Sites
+    @State private var new = ""
+
+    var body: some View {
+        List {
+            Section {
+                HStack {
+                    TextField("example.com", text: $new)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.URL)
+                        .onSubmit(add)
+                    Button("Add", action: add).disabled(new.isEmpty)
+                }
+            }
+            Section("My Sites") {
+                ForEach(sites.custom, id: \.self) { h in
+                    HStack(spacing: 12) {
+                        SiteIcon(host: h, size: 30)
+                        Text(h)
+                    }
+                }
+                .onDelete { sites.custom.remove(atOffsets: $0); sites.save() }
+                .onMove { sites.custom.move(fromOffsets: $0, toOffset: $1); sites.save() }
+            }
+            let suggestions = sites.frequent.filter { !sites.custom.contains($0) }
+            if !suggestions.isEmpty {
+                Section("Add from Frequently Visited") {
+                    ForEach(suggestions, id: \.self) { h in
+                        Button { sites.add(h) } label: { Label(h, systemImage: "plus.circle") }
+                    }
+                }
+            }
+        }
+        .navigationTitle("My Sites")
+        .toolbar { EditButton() }
+    }
+
+    private func add() {
+        sites.add(new)
+        new = ""
+    }
+}
+
 struct SettingsView: View {
+    @ObservedObject var sites: Sites
     @AppStorage("engine") private var engine = "DuckDuckGo"
     @AppStorage("block") private var blockOn = true
-    @AppStorage("battery") private var battery = 0
+    @AppStorage("saver") private var saver = false
+    @AppStorage("homeMode") private var homeMode = 0
     var openVault: () -> Void
+    var openVPN: () -> Void
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
         NavigationStack {
             Form {
-                Section("Default search engine") {
+                Section("Search Engine") {
                     Picker("Search with", selection: $engine) {
                         ForEach(Engines.names, id: \.self) { Text($0).tag($0) }
                     }
                 }
+                Section("Home Page") {
+                    Picker("Show", selection: $homeMode) {
+                        Text("Frequently Visited").tag(0)
+                        Text("My Sites").tag(1)
+                    }
+                    .pickerStyle(.segmented)
+                    NavigationLink("Edit My Sites") { MySitesEditor(sites: sites) }
+                    Button("Clear Visit History", role: .destructive) { sites.clearVisits() }
+                }
                 Section("Privacy") {
-                    Toggle("Block ads and trackers", isOn: $blockOn)
+                    Toggle("Block Ads and Trackers", isOn: $blockOn)
+                    Button("VPN") { openVPN() }
                 }
                 Section {
-                    Picker("Mode", selection: $battery) {
-                        Text("Off").tag(0)
-                        Text("Auto (follows Low Power Mode)").tag(1)
-                        Text("Saver (60 fps animations)").tag(2)
-                        Text("Max saver (30 fps animations)").tag(3)
-                    }
-                } header: { Text("Battery saver") } footer: {
-                    Text("This slows page animations. iOS controls scrolling smoothness, so for that also use Low Power Mode or Settings > Accessibility > Motion > Limit Frame Rate.")
+                    Toggle("Extreme Battery Saver", isOn: $saver)
+                } footer: {
+                    Text("Turns off app animations, caps page animations at 30 fps and keeps only 2 tabs awake. Scrolling smoothness is controlled by iOS.")
                 }
-                Section { Button("Passwords and cards") { openVault() } }
+                Section { Button("Passwords and Cards") { openVault() } }
             }
             .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
             .toolbar { Button("Done") { dismiss() } }
         }
     }
@@ -861,41 +1678,43 @@ struct VaultView: View {
 // MARK: Main screen
 
 enum Sheet: Identifiable {
-    case vault, settings, calendar, vpn
+    case vault, settings, calendar, vpn, tabs
     var id: Int {
         switch self {
         case .vault: return 0
         case .settings: return 1
         case .calendar: return 2
         case .vpn: return 3
+        case .tabs: return 4
         }
     }
 }
 
 struct ContentView: View {
-    @StateObject private var first = Pane(start: Engines.currentHome)
-    @StateObject private var second = Pane(start: "https://en.wikipedia.org")
+    @StateObject private var tabs = Tabs()
+    @StateObject private var sites = Sites()
     @StateObject private var vault = Vault()
     @StateObject private var vpnService = VPNService()
     @Environment(\.scenePhase) private var phase
     @AppStorage("block") private var blockOn = true
-    @AppStorage("battery") private var battery = 0
+    @AppStorage("saver") private var saver = false
     @AppStorage("engine") private var engine = "DuckDuckGo"
     @State private var split: CGFloat = 0.5
-    @State private var splitOn = false
-    @State private var showSecond = false
+    @State private var dragging = false
+    @State private var lastTap = Date.distantPast
     @State private var rules: WKContentRuleList?
     @State private var sheet: Sheet?
     @State private var pending: Login?
     @State private var calTitle = ""
     @State private var calURL = ""
-    private let handle: CGFloat = 16
 
     var body: some View {
-        ZStack(alignment: .top) {
-            Color(.systemBackground).ignoresSafeArea()
-            deck.ignoresSafeArea(.container)
-            topBar
+        GeometryReader { root in
+            ZStack(alignment: .top) {
+                Color(.systemBackground).ignoresSafeArea()
+                deck(topInset: root.safeAreaInsets.top).ignoresSafeArea(.container)
+                TopBar(pane: tabs.pane(tabs.left), tabs: tabs, saver: saver, openTabs: { sheet = .tabs })
+            }
         }
         .sheet(item: $sheet) { s in sheetView(s) }
         .alert("Save password?", isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } })) {
@@ -903,90 +1722,156 @@ struct ContentView: View {
             Button("Not now", role: .cancel) { pending = nil }
         } message: { Text(pending?.site ?? "") }
         .task {
-            first.onCredential = { pending = $0 }
-            second.onCredential = { pending = $0 }
+            tabs.configure = { p in configure(p) }
+            tabs.allLive.forEach { configure($0) }
+            applySaver()
             rules = await Rules.compile()
-            apply()
-            applyFPS()
+            apply(reload: false)
         }
-        .onChange(of: blockOn) { _, _ in apply() }
-        .onChange(of: battery) { _, _ in applyFPS() }
-        .onChange(of: engine) { _, _ in loadHome() }
+        .onChange(of: blockOn) { _, _ in apply(reload: true) }
+        .onChange(of: saver) { _, _ in applySaver() }
+        .onChange(of: engine) { _, _ in tabs.visible.forEach { tabs.pane($0).goHome() } }
         .onChange(of: phase) { _, p in if p != .active { vault.lock() } }
-        .onReceive(NotificationCenter.default.publisher(for: .NSProcessInfoPowerStateDidChange)) { _ in applyFPS() }
-    }
-
-    private var topBar: some View {
-        HStack {
-            Spacer()
-            HStack(spacing: 0) {
-                if !splitOn {
-                    Button { withAnimation(.snappy) { showSecond.toggle() } } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "square.on.square")
-                            Text(showSecond ? "2" : "1").monospacedDigit()
-                        }
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.primary)
-                        .frame(height: 36)
-                        .padding(.horizontal, 10)
-                        .contentShape(Rectangle())
-                    }
-                }
-                Button { withAnimation(.snappy) { splitOn.toggle() } } label: {
-                    Image(systemName: splitOn ? "rectangle.split.2x1.fill" : "rectangle.split.2x1")
-                        .font(.subheadline.weight(.semibold))
-                        .foregroundStyle(.primary)
-                        .frame(width: 40, height: 36)
-                        .contentShape(Rectangle())
-                }
-            }
-            .padding(.horizontal, 4)
-            .sdGlass(Capsule())
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
+            tabs.sleepHidden()
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 2)
     }
 
-    private var deck: some View {
+    // MARK: Layout
+
+    private func deck(topInset: CGFloat) -> some View {
         GeometryReader { geo in
             let horizontal = geo.size.width > geo.size.height
             let total = horizontal ? geo.size.width : geo.size.height
-            let firstSize = (total - handle) * split
-            let layout = horizontal ? AnyLayout(HStackLayout(spacing: 0)) : AnyLayout(VStackLayout(spacing: 0))
-            if splitOn {
-                layout {
-                    pane(first, gap: horizontal ? 30 : 12)
-                        .frame(width: horizontal ? firstSize : nil, height: horizontal ? nil : firstSize)
-                    divider(horizontal: horizontal, total: total)
-                    pane(second, gap: 30)
+            let gap: CGFloat = 1
+            let firstSize = (total - gap) * split
+            ZStack(alignment: .topLeading) {
+                if tabs.split {
+                    let layout = horizontal ? AnyLayout(HStackLayout(spacing: gap)) : AnyLayout(VStackLayout(spacing: gap))
+                    layout {
+                        // Portrait: top pane's bar sits at the top beside the tab pill, bottom pane's at the bottom.
+                        // Landscape: both slim bars sit at the bottom of their side.
+                        paneView(tabs.left, slot: 0, gap: 16, compact: true, atTop: !horizontal,
+                                 topInset: topInset, contentTop: topInset + 52)
+                            .frame(width: horizontal ? firstSize : nil, height: horizontal ? nil : firstSize)
+                        paneView(tabs.right, slot: 1, gap: horizontal ? 16 : 24, compact: true,
+                                 topInset: topInset, contentTop: horizontal ? topInset + 52 : 20)
+                    }
+                    handle(horizontal: horizontal, total: total, pos: firstSize + gap / 2, size: geo.size)
+                } else {
+                    paneView(tabs.left, slot: 0, gap: 30, topInset: topInset, contentTop: topInset + 52)
                 }
-                .coordinateSpace(.named("deck"))
-            } else {
-                pane(showSecond ? second : first, gap: 30)
             }
+            .frame(width: geo.size.width, height: geo.size.height)
+            .background(Color(.separator).opacity(dragging ? 0.8 : 0.3))
+            .coordinateSpace(.named("deck"))
         }
     }
 
-    private func pane(_ p: Pane, gap: CGFloat) -> some View {
-        PaneView(pane: p,
-                 bottomGap: gap,
-                 autofill: { autofill(p) },
-                 calendar: { calTitle = p.title.isEmpty ? p.host : p.title; calURL = p.address; sheet = .calendar },
-                 removePopups: { p.webView.evaluateJavaScript(Rules.popupKill) },
-                 settings: { sheet = .settings },
-                 vpn: { sheet = .vpn },
-                 vpnOn: vpnService.status == .connected)
-            .id(p.id)
+    private func anim(_ a: Animation) -> Animation? { saver ? nil : a }
+
+    // Invisible when idle: a 1pt hairline plus a wide, transparent touch strip.
+    // The grip only appears while it's held or dragged.
+    private func handle(horizontal: Bool, total: CGFloat, pos: CGFloat, size: CGSize) -> some View {
+        let hit: CGFloat = 36
+        return ZStack {
+            Color.clear
+            Capsule()
+                .fill(Color.primary.opacity(0.55))
+                .frame(width: horizontal ? 5 : (dragging ? 64 : 40), height: horizontal ? (dragging ? 64 : 40) : 5)
+                .opacity(dragging ? 1 : 0)
+                .scaleEffect(dragging ? 1 : 0.5)
+                .shadow(color: .black.opacity(dragging ? 0.2 : 0), radius: 6)
+        }
+        .frame(width: horizontal ? hit : size.width, height: horizontal ? size.height : hit)
+        .contentShape(Rectangle())
+        .position(x: horizontal ? pos : size.width / 2, y: horizontal ? size.height / 2 : pos)
+        .gesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .named("deck"))
+                .onChanged { v in
+                    if !dragging {
+                        withAnimation(anim(.spring(response: 0.25, dampingFraction: 0.7))) { dragging = true }
+                    }
+                    let moved = abs(horizontal ? v.translation.width : v.translation.height)
+                    if moved > 2 {
+                        let p = horizontal ? v.location.x : v.location.y
+                        withAnimation(anim(.interactiveSpring(response: 0.2, dampingFraction: 0.86))) {
+                            split = min(0.98, max(0.02, p / total))
+                        }
+                    }
+                }
+                .onEnded { v in
+                    let moved = abs(horizontal ? v.translation.width : v.translation.height)
+                    let predicted = (horizontal ? v.predictedEndLocation.x : v.predictedEndLocation.y) / total
+                    if moved < 4 {
+                        if Date().timeIntervalSince(lastTap) < 0.35 {
+                            withAnimation(anim(.spring(response: 0.4, dampingFraction: 0.8))) { split = 0.5 }
+                        }
+                        lastTap = Date()
+                    } else if split > 0.9 || predicted > 1.0 {
+                        collapse(keep: 0)
+                    } else if split < 0.1 || predicted < 0.0 {
+                        collapse(keep: 1)
+                    } else {
+                        withAnimation(anim(.spring(response: 0.35, dampingFraction: 0.8))) {
+                            split = min(0.85, max(0.15, split))
+                        }
+                    }
+                    withAnimation(anim(.easeOut(duration: 0.35))) { dragging = false }
+                }
+        )
+    }
+
+    // Dragging the divider off an edge closes split view, keeping the pane that filled the screen.
+    private func collapse(keep slot: Int) {
+        withAnimation(anim(.spring(response: 0.3, dampingFraction: 0.9))) { split = slot == 0 ? 1 : 0 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + (saver ? 0 : 0.28)) {
+            tabs.closeSplit(keep: slot)
+            split = 0.5
+        }
+    }
+
+    private func paneView(_ id: UUID, slot: Int, gap: CGFloat, compact: Bool = false, atTop: Bool = false,
+                          topInset: CGFloat = 0, contentTop: CGFloat = 72) -> some View {
+        let p = tabs.pane(id)
+        return PaneView(
+            pane: p,
+            sites: sites,
+            bottomGap: gap,
+            actions: PaneActions(
+                autofill: { autofill(p) },
+                calendar: { calTitle = p.title.isEmpty ? p.host : p.title; calURL = p.address; sheet = .calendar },
+                settings: { sheet = .settings },
+                vpn: { sheet = .vpn },
+                vpnOn: vpnService.status == .connected,
+                newTab: { withAnimation(anim(.snappy)) { tabs.newTab(slot: slot) } }
+            ),
+            compact: compact,
+            atTop: atTop,
+            topInset: topInset,
+            trailingRoom: atTop ? 136 : 0,
+            contentTop: contentTop
+        )
+        .id(id)
     }
 
     @ViewBuilder private func sheetView(_ s: Sheet) -> some View {
         switch s {
         case .vault: VaultView(vault: vault, fill: fill)
-        case .settings: SettingsView(openVault: { sheet = .vault })
+        case .settings: SettingsView(sites: sites, openVault: { sheet = .vault }, openVPN: { sheet = .vpn })
         case .calendar: EventEditor(title: calTitle, url: calURL).ignoresSafeArea()
         case .vpn: VPNView(vpn: vpnService)
+        case .tabs: TabsView(tabs: tabs)
         }
+    }
+
+    // MARK: Behaviour
+
+    private func configure(_ p: Pane) {
+        p.onCredential = { pending = $0 }
+        p.onVisit = { sites.record($0) }
+        if blockOn, let r = rules { p.webView.configuration.userContentController.add(r) }
+        p.applyFPS()
     }
 
     private func autofill(_ p: Pane) {
@@ -999,53 +1884,27 @@ struct ContentView: View {
         }
     }
 
-    private func apply() {
-        for p in [first, second] {
+    private func apply(reload: Bool) {
+        for p in tabs.allLive {
             let u = p.webView.configuration.userContentController
             u.removeAllContentRuleLists()
             if blockOn, let r = rules { u.add(r) }
-            p.webView.reload()
+            if reload && !p.isHome { p.webView.reload() }
         }
     }
 
-    private func loadHome() {
-        let url = Engines.home[engine] ?? "https://duckduckgo.com"
-        first.load(url)
-        second.load(url)
-    }
-
-    private func applyFPS() {
-        let low = ProcessInfo.processInfo.isLowPowerModeEnabled
-        if battery == 3 { Pane.fps = 30 }
-        else if battery == 2 || (battery == 1 && low) { Pane.fps = 60 }
-        else { Pane.fps = 0 }
-        first.applyFPS()
-        second.applyFPS()
+    private func applySaver() {
+        Pane.fps = saver ? 30 : 0
+        tabs.maxLive = saver ? 2 : 4
+        tabs.allLive.forEach { $0.applyFPS() }
+        tabs.trim()
     }
 
     private func fill(_ l: Login?, _ c: Card?) {
-        let panes = splitOn ? [first, second] : [showSecond ? second : first]
-        for p in panes {
+        for id in tabs.visible {
+            let p = tabs.pane(id)
             if let l { p.fill(login: l) }
             if let c { p.fill(card: c) }
         }
-    }
-
-    private func divider(horizontal: Bool, total: CGFloat) -> some View {
-        ZStack {
-            Color(.systemBackground)
-            Capsule().fill(Color.secondary.opacity(0.6))
-                .frame(width: horizontal ? 4 : 40, height: horizontal ? 40 : 4)
-        }
-        .frame(width: horizontal ? handle : nil, height: horizontal ? nil : handle)
-        .contentShape(Rectangle())
-        .gesture(
-            DragGesture(coordinateSpace: .named("deck"))
-                .onChanged { v in
-                    let pos = horizontal ? v.location.x : v.location.y
-                    split = min(0.8, max(0.2, (pos - handle / 2) / (total - handle)))
-                }
-        )
-        .onTapGesture(count: 2) { split = 0.5 }
     }
 }
