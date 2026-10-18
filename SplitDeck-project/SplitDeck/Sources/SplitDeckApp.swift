@@ -542,6 +542,10 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     @Published var isHome = true
     @Published var pageDark: Bool? = nil
     @Published var topDark: Bool? = nil
+    @Published var bottomColor: Color? = nil
+    @Published var blockedCount = 0
+    private var bottomRGB: [Int] = []
+    private var appliedRules: [String]?
     @Published var hiding = false
     @Published var hiddenCount = 0
     @Published var canUndoHide = false
@@ -554,6 +558,8 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     var onVisit: ((String) -> Void)?
     var onChange: (() -> Void)?
     static var fps = 0
+    static var ruleProvider: ((String) -> [WKContentRuleList])?
+    static var onBlocked: (() -> Void)?
     private var obs: NSKeyValueObservation?
     private var lastY: CGFloat = 0
     private var scrollRun: CGFloat = 0
@@ -563,7 +569,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     static let hideStartJS = "(function(){if(window.__sdHiding)return;window.__sdHiding=true;var cur=null;function sel(e){var p=[];while(e&&e.nodeType===1&&e!==document.body&&e!==document.documentElement){if(e.id&&!/\\d{3,}/.test(e.id)){p.unshift('#'+CSS.escape(e.id));return p.join('>')}var i=1,x=e;while((x=x.previousElementSibling))if(x.tagName===e.tagName)i++;p.unshift(e.tagName.toLowerCase()+':nth-of-type('+i+')');e=e.parentElement}return 'body>'+p.join('>')}function pick(e){var r;while(e&&e!==document.body){r=e.getBoundingClientRect();if(r.width*r.height>2500)break;e=e.parentElement}if(!e||e===document.body||e===document.documentElement)return null;r=e.getBoundingClientRect();if(r.width>=innerWidth*0.98&&r.height>=innerHeight*0.9)return null;return e}function mark(e){if(cur){cur.style.outline=cur.__sdO||'';cur.style.outlineOffset=''}cur=e;if(e){e.__sdO=e.style.outline;e.style.outline='3px solid rgba(10,132,255,.9)';e.style.outlineOffset='-3px'}}window.__sdMark=mark;window.__sdDown=function(ev){mark(pick(ev.target))};window.__sdClick=function(ev){ev.preventDefault();ev.stopPropagation();ev.stopImmediatePropagation();var e=pick(ev.target);mark(null);if(!e)return;var s=sel(e);e.style.transition='opacity .25s ease,transform .25s ease';e.style.opacity='0';e.style.transform='scale(.94)';setTimeout(function(){e.style.setProperty('display','none','important')},260);window.webkit.messageHandlers.hide.postMessage(s)};document.addEventListener('pointerdown',window.__sdDown,true);document.addEventListener('click',window.__sdClick,true)})()"
     static let hideStopJS = "(function(){window.__sdHiding=false;if(window.__sdMark)window.__sdMark(null);document.removeEventListener('pointerdown',window.__sdDown,true);document.removeEventListener('click',window.__sdClick,true)})()"
 
-    static let tintJS = "(function(){function L(c){var m=c&&c.match(/[\\d.]+/g);if(!m||m.length<3)return -1;if(m.length>3&&+m[3]<0.5)return -1;return 0.299*m[0]+0.587*m[1]+0.114*m[2]}function at(x,y){var e=document.elementFromPoint(x,y);while(e){var v=L(getComputedStyle(e).backgroundColor);if(v>=0)return v;e=e.parentElement}return 255}var w=innerWidth/2;return [at(w,50),at(w,innerHeight-70)]})()"
+    static let tintJS = "(function(){function C(c){var m=c&&c.match(/[\\d.]+/g);if(!m||m.length<3)return null;if(m.length>3&&+m[3]<0.5)return null;return [+m[0],+m[1],+m[2]]}function at(x,y){var e=document.elementFromPoint(x,y);while(e){var v=C(getComputedStyle(e).backgroundColor);if(v)return v;e=e.parentElement}return C(getComputedStyle(document.documentElement).backgroundColor)||(document.body&&C(getComputedStyle(document.body).backgroundColor))||[255,255,255]}var w=innerWidth/2;return at(w,3).concat(at(w,innerHeight-3))})()"
 
     init(id: UUID, start: String?) {
         self.id = id
@@ -733,12 +739,46 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     private func detectTint() {
         guard !isHome else { return }
         webView.evaluateJavaScript(Pane.tintJS) { [weak self] r, _ in
-            guard let self, let a = r as? [NSNumber], a.count == 2 else { return }
-            let top = a[0].doubleValue < 128
-            let bottom = a[1].doubleValue < 128
+            guard let self, let a = r as? [NSNumber], a.count == 6 else { return }
+            let v = a.map { Int($0.doubleValue.rounded()) }
+            let lum = { (i: Int) in 0.299 * Double(v[i]) + 0.587 * Double(v[i + 1]) + 0.114 * Double(v[i + 2]) }
+            let top = lum(0) < 128
+            let bottom = lum(3) < 128
             if self.topDark != top { self.topDark = top }
             if self.pageDark != bottom { self.pageDark = bottom }
+            let rgb = Array(v[3...5])
+            if rgb != self.bottomRGB {
+                self.bottomRGB = rgb
+                self.bottomColor = Color(red: Double(rgb[0]) / 255, green: Double(rgb[1]) / 255, blue: Double(rgb[2]) / 255)
+            }
         }
+    }
+
+    // Puts the right block lists on this tab for a site. Returns true if they changed.
+    @discardableResult
+    func applyRules(host: String) -> Bool {
+        let lists = Pane.ruleProvider?(host) ?? []
+        let ids = lists.map { $0.identifier ?? "" }
+        guard ids != appliedRules else { return false }
+        let u = webView.configuration.userContentController
+        u.removeAllContentRuleLists()
+        lists.forEach { u.add($0) }
+        appliedRules = ids
+        return true
+    }
+
+    // WebKit reports each content-blocker action through this undocumented delegate callback.
+    // It is only used to count blocked requests; if WebKit stops calling it, the count just stays at 0.
+    @objc(_webView:contentRuleListWithIdentifier:performedAction:forURL:)
+    func contentRuleAction(_ webView: WKWebView, identifier: String?, action: AnyObject?, url: URL?) {
+        guard let o = action as? NSObject, o.responds(to: NSSelectorFromString("blockedLoad")),
+              (o.value(forKey: "blockedLoad") as? Bool) == true else { return }
+        blockedCount += 1
+        Pane.onBlocked?()
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        blockedCount = 0
     }
 
     func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
@@ -770,6 +810,15 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             return
         }
         if scheme == "http" || scheme == "https" {
+            // Shields changed for this site: swap the block lists, then restart the load so they apply to it.
+            if navigationAction.targetFrame?.isMainFrame ?? true, let host = url.host,
+               ![WKNavigationType.backForward, .formSubmitted, .formResubmitted].contains(navigationAction.navigationType),
+               applyRules(host: host) {
+                decisionHandler(.cancel)
+                let req = navigationAction.request
+                DispatchQueue.main.async { webView.load(req) }
+                return
+            }
             decisionHandler(WKNavigationActionPolicy(rawValue: WKNavigationActionPolicy.allow.rawValue + 2) ?? .allow)
             return
         }
@@ -1138,7 +1187,8 @@ struct SiteIcon: View {
 
 struct StartPage: View {
     @ObservedObject var sites: Sites
-    var topPad: CGFloat = 72
+    var topPad: CGFloat = 24
+    var blocked: Int = 0
     var open: (String) -> Void
     @AppStorage("homeMode") private var mode = 0
     @State private var adding = false
@@ -1154,6 +1204,14 @@ struct StartPage: View {
         let hosts = mode == 1 ? sites.custom : sites.frequent
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
+                if blocked > 0 {
+                    HStack(spacing: 8) {
+                        Image(systemName: "shield.lefthalf.filled").foregroundStyle(.orange)
+                        Text("\(blocked.formatted()) ads and trackers blocked")
+                            .font(.footnote.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Menu {
                     Picker("Show", selection: $mode) {
                         Text("Frequently Visited").tag(0)
@@ -1204,7 +1262,7 @@ struct StartPage: View {
             }
             .padding(.horizontal, 20)
             .padding(.top, topPad)
-            .padding(.bottom, 140)
+            .padding(.bottom, 40)
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .scrollDismissesKeyboard(.interactively)
@@ -1220,6 +1278,244 @@ struct StartPage: View {
     }
 }
 
+// MARK: Shields (Brave-style blocking)
+
+final class Shields: ObservableObject {
+    struct BlockList: Identifiable {
+        let id: String
+        let name: String
+        let detail: String
+        let defaultOn: Bool
+    }
+
+    static let lists = [
+        BlockList(id: "ads", name: "Ads", detail: "EasyList", defaultOn: true),
+        BlockList(id: "trackers", name: "Trackers", detail: "EasyPrivacy and Peter Lowe's list", defaultOn: true),
+        BlockList(id: "cookies", name: "Cookie Notices", detail: "Hides consent pop-ups", defaultOn: true),
+        BlockList(id: "annoyances", name: "Annoyances", detail: "Newsletter pop-ups, social widgets, chat bubbles", defaultOn: false),
+    ]
+
+    @Published private(set) var compiled: [String: WKContentRuleList] = [:]
+    @Published private(set) var preparing = false
+    @Published private(set) var totalBlocked = UserDefaults.standard.integer(forKey: "blockedTotal")
+    @Published private(set) var siteOff: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "shieldsOff") ?? [])
+    @Published private(set) var version = 0
+    var pendingReload = false
+    private var base: WKContentRuleList?
+    private var unsaved = 0
+    private var flushScheduled = false
+
+    static func key(_ host: String) -> String {
+        let h = host.lowercased()
+        return h.hasPrefix("www.") ? String(h.dropFirst(4)) : h
+    }
+
+    var available: Bool { Bundle.main.url(forResource: "sd-ads", withExtension: "json") != nil }
+
+    func isEnabled(_ id: String) -> Bool {
+        UserDefaults.standard.object(forKey: "list_" + id) as? Bool
+            ?? (Shields.lists.first { $0.id == id }?.defaultOn ?? false)
+    }
+
+    func setEnabled(_ id: String, _ on: Bool) {
+        UserDefaults.standard.set(on, forKey: "list_" + id)
+        pendingReload = true
+        version += 1
+        if on && compiled[id] == nil { Task { await prepare() } }
+    }
+
+    func isUp(_ host: String) -> Bool { host.isEmpty || !siteOff.contains(Shields.key(host)) }
+
+    func setUp(_ host: String, _ up: Bool) {
+        let k = Shields.key(host)
+        guard !k.isEmpty else { return }
+        if up { siteOff.remove(k) } else { siteOff.insert(k) }
+        UserDefaults.standard.set(siteOff.sorted(), forKey: "shieldsOff")
+        pendingReload = true
+        version += 1
+    }
+
+    func masterChanged() {
+        pendingReload = true
+        version += 1
+    }
+
+    func rules(for host: String) -> [WKContentRuleList] {
+        let master = UserDefaults.standard.object(forKey: "block") as? Bool ?? true
+        guard master, isUp(host) else { return [] }
+        var out: [WKContentRuleList] = []
+        if let base { out.append(base) }
+        for l in Shields.lists where isEnabled(l.id) {
+            if let c = compiled[l.id] { out.append(c) }
+        }
+        return out
+    }
+
+    // Counts are batched so a page full of blocked ads doesn't redraw the UI dozens of times.
+    func countBlocked() {
+        unsaved += 1
+        guard !flushScheduled else { return }
+        flushScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+            guard let self else { return }
+            self.totalBlocked += self.unsaved
+            self.unsaved = 0
+            self.flushScheduled = false
+            UserDefaults.standard.set(self.totalBlocked, forKey: "blockedTotal")
+        }
+    }
+
+    // Compiles the bundled lists once; afterwards WebKit loads them from its cache instantly.
+    @MainActor
+    func prepare() async {
+        guard !preparing else { return }
+        preparing = true
+        defer { preparing = false }
+        if base == nil {
+            base = await Rules.compile()
+            version += 1
+        }
+        guard let store = WKContentRuleListStore.default() else { return }
+        let ver = Bundle.main.url(forResource: "blocklists-version", withExtension: "txt")
+            .flatMap { try? String(contentsOf: $0, encoding: .utf8) }?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
+        for l in Shields.lists where isEnabled(l.id) && compiled[l.id] == nil {
+            guard let url = Bundle.main.url(forResource: "sd-" + l.id, withExtension: "json") else { continue }
+            let ident = "sd-\(l.id)-\(ver)"
+            if let found = await Shields.lookUp(store, ident) {
+                compiled[l.id] = found
+                version += 1
+                continue
+            }
+            let json = await Task.detached(priority: .utility) { try? String(contentsOf: url, encoding: .utf8) }.value
+            guard let json, json.count > 2 else { continue }
+            if let list = try? await store.compileContentRuleList(forIdentifier: ident, encodedContentRuleList: json) {
+                compiled[l.id] = list
+                version += 1
+            }
+        }
+        store.getAvailableContentRuleListIdentifiers { ids in
+            for id in ids ?? [] where id.hasPrefix("sd-") && !id.hasSuffix("-" + ver) {
+                store.removeContentRuleList(forIdentifier: id) { _ in }
+            }
+        }
+    }
+
+    private static func lookUp(_ store: WKContentRuleListStore, _ id: String) async -> WKContentRuleList? {
+        await withCheckedContinuation { c in
+            store.lookUpContentRuleList(forIdentifier: id) { list, _ in c.resume(returning: list) }
+        }
+    }
+}
+
+struct ShieldsView: View {
+    @ObservedObject var shields: Shields
+    @ObservedObject var pane: Pane
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        let host = Shields.key(pane.host)
+        let up = shields.isUp(host)
+        NavigationStack {
+            List {
+                Section {
+                    VStack(spacing: 12) {
+                        if !host.isEmpty { SiteIcon(host: host, size: 52) }
+                        Text(host.isEmpty ? "This page" : host).font(.headline)
+                        Button { shields.setUp(host, !up) } label: {
+                            Label(up ? "Shields are UP" : "Shields are DOWN",
+                                  systemImage: up ? "shield.lefthalf.filled" : "shield.slash")
+                                .font(.headline)
+                                .foregroundStyle(.white)
+                                .frame(maxWidth: .infinity, minHeight: 48)
+                                .background(up ? Color.orange : Color.gray, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(host.isEmpty)
+                        Text(up ? "\(pane.blockedCount) ads and trackers blocked on this page"
+                                : "Ads and trackers are allowed on this site")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+                }
+                Section {
+                    ForEach(Shields.lists) { l in
+                        Toggle(isOn: Binding(get: { shields.isEnabled(l.id) }, set: { shields.setEnabled(l.id, $0) })) {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(l.name)
+                                Text(l.detail).font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Block Lists")
+                } footer: {
+                    Text("Lists apply to every site. If a site breaks, turn its Shields down above.")
+                }
+                Section {
+                    LabeledContent("Blocked in total", value: shields.totalBlocked.formatted())
+                }
+            }
+            .navigationTitle("Shields")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { Button("Done") { dismiss() } }
+        }
+    }
+}
+
+struct ShieldsSettings: View {
+    @ObservedObject var shields: Shields
+    @AppStorage("block") private var blockOn = true
+
+    var body: some View {
+        Form {
+            Section {
+                Toggle("Block Ads and Trackers", isOn: $blockOn)
+            } footer: {
+                Text("\(shields.totalBlocked.formatted()) ads and trackers blocked so far.")
+            }
+            Section {
+                ForEach(Shields.lists) { l in
+                    Toggle(isOn: Binding(get: { shields.isEnabled(l.id) }, set: { shields.setEnabled(l.id, $0) })) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(l.name)
+                            Text(l.detail).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            } header: {
+                Text("Filter Lists")
+            } footer: {
+                if !shields.available {
+                    Text("The full lists aren't in this build, so only the basic built-in list is active.")
+                } else if shields.preparing {
+                    Text("Preparing lists. This takes a few seconds the first time after an update.")
+                } else {
+                    Text("Lists are built into the app and refresh every time it's rebuilt (automatically each Monday).")
+                }
+            }
+            if !shields.siteOff.isEmpty {
+                Section("Shields Down On") {
+                    ForEach(shields.siteOff.sorted(), id: \.self) { h in
+                        HStack(spacing: 12) {
+                            SiteIcon(host: h, size: 28)
+                            Text(h)
+                        }
+                    }
+                    .onDelete { idx in
+                        let sorted = shields.siteOff.sorted()
+                        idx.map { sorted[$0] }.forEach { shields.setUp($0, true) }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Shields")
+    }
+}
+
 // MARK: Pane view
 
 struct PaneActions {
@@ -1229,25 +1525,34 @@ struct PaneActions {
     var vpn: () -> Void
     var vpnOn: Bool
     var newTab: () -> Void
+    var shields: () -> Void
+    var shieldsUp: Bool
+    var totalBlocked: Int
 }
 
 struct PaneView: View {
     @ObservedObject var pane: Pane
     @ObservedObject var sites: Sites
-    var bottomGap: CGFloat
     var actions: PaneActions
-    var compact = false          // slim bar used in split view
-    var atTop = false            // bar pinned to the top edge (top pane in portrait split)
-    var topInset: CGFloat = 0    // status bar height
-    var trailingRoom: CGFloat = 0 // space left for the tab pill beside a top bar
-    var contentTop: CGFloat = 72 // where the start page content begins
+    var compact = false            // slim bar used in split view
+    var atTop = false              // bar sits in a strip above the page (top pane in portrait split)
+    var safeTop: CGFloat = 0       // status bar height, for a top strip
+    var bottomInset: CGFloat = 0   // home indicator height, for a bottom strip
+    var trailingRoom: CGFloat = 0  // space left for the tab pill beside a top bar
     @Environment(\.colorScheme) private var sys
     @AppStorage("saver") private var saver = false
     @State private var desktop = false
     @FocusState private var focused: Bool
 
     private var mini: Bool { pane.collapsed && !focused && !pane.isHome }
-    private var dark: Bool { pane.isHome ? sys == .dark : (pane.pageDark ?? (sys == .dark)) }
+    // The bottom strip takes the page's own colour so it blends in; the top strip matches the status bar.
+    private var stripColor: Color {
+        pane.isHome || atTop ? Color(.systemBackground) : (pane.bottomColor ?? Color(.systemBackground))
+    }
+    private var dark: Bool {
+        if pane.isHome || atTop { return sys == .dark }
+        return pane.pageDark ?? (sys == .dark)
+    }
     private var spring: Animation? { saver ? nil : .spring(response: 0.35, dampingFraction: 0.82) }
     private var smooth: Animation? { saver ? nil : .smooth(duration: 0.4) }
     @Namespace private var ns
@@ -1262,51 +1567,92 @@ struct PaneView: View {
         )
     }
 
-    private var edgePad: CGFloat {
-        if atTop { return topInset + 2 }
+    private var bottomPad: CGFloat {
         if focused { return 8 }
-        return mini ? max(bottomGap - (compact ? 12 : 22), 4) : bottomGap
+        if mini { return max(bottomInset - 14, 6) }
+        return max(bottomInset - (compact ? 10 : 4), compact ? 8 : 10)
     }
 
+    // The page never sits under the bars: it fills the space between them, and grows as they shrink.
     var body: some View {
-        ZStack(alignment: atTop ? .top : .bottom) {
-            WebHost(webView: pane.webView)
-                .opacity(pane.isHome ? 0 : 1)
-            if pane.isHome {
-                StartPage(sites: sites, topPad: contentTop) { pane.load($0) }
-            }
-            if focused {
-                Color.black.opacity(0.001)
-                    .contentShape(Rectangle())
-                    .onTapGesture { focused = false }
-                    .gesture(DragGesture(minimumDistance: 8).onEnded { v in
-                        if v.translation.height > 16 { focused = false }
-                    })
-            }
-            VStack(spacing: 8) {
-                if atTop {
-                    bar
-                    if showBanner { fillBanner }
-                } else {
-                    if showBanner { fillBanner }
-                    bar
+        VStack(spacing: 0) {
+            if atTop { topRow }
+            ZStack {
+                WebHost(webView: pane.webView)
+                    .opacity(pane.isHome ? 0 : 1)
+                if pane.isHome {
+                    StartPage(sites: sites, blocked: actions.totalBlocked) { pane.load($0) }
+                }
+                if focused {
+                    Color.black.opacity(0.001)
+                        .contentShape(Rectangle())
+                        .onTapGesture { focused = false }
+                        .gesture(DragGesture(minimumDistance: 8).onEnded { v in
+                            if v.translation.height > 16 { focused = false }
+                        })
                 }
             }
-                .environment(\.colorScheme, dark ? .dark : .light)
-                .padding(.leading, 12)
-                .padding(.trailing, 12 + trailingRoom)
-                .padding(atTop ? .top : .bottom, edgePad)
-                .simultaneousGesture(DragGesture(minimumDistance: 12).onEnded { v in
-                    if focused && abs(v.translation.height) > 20 { focused = false }
-                })
-                .animation(smooth, value: mini)
-                .animation(spring, value: focused)
-                .animation(spring, value: pane.hiding)
-                .animation(spring, value: showBanner)
-                .animation(saver ? nil : .easeInOut(duration: 0.25), value: dark)
+            .clipped()
+            if !atTop { bottomRow }
         }
-        .clipped()
+        .animation(smooth, value: mini)
+        .animation(spring, value: focused)
+        .animation(spring, value: pane.hiding)
+        .animation(spring, value: showBanner)
         .onChange(of: focused) { _, f in pane.editing = f }
+    }
+
+    private var topRow: some View {
+        VStack(spacing: 6) {
+            bar.frame(height: barH)
+            if showBanner { fillBanner }
+        }
+        .environment(\.colorScheme, dark ? .dark : .light)
+        .padding(.leading, 12)
+        .padding(.trailing, 12 + trailingRoom)
+        .padding(.top, safeTop + 4)
+        .padding(.bottom, 4)
+        .frame(maxWidth: .infinity)
+        .background(stripColor)
+    }
+
+    private var bottomRow: some View {
+        VStack(spacing: 8) {
+            if showBanner { fillBanner }
+            bar
+        }
+        .environment(\.colorScheme, dark ? .dark : .light)
+        .padding(.horizontal, 12)
+        .padding(.top, mini ? 4 : (compact ? 6 : 8))
+        .padding(.bottom, bottomPad)
+        .frame(maxWidth: .infinity)
+        .background(stripColor)
+        .simultaneousGesture(DragGesture(minimumDistance: 12).onEnded { v in
+            if focused && v.translation.height > 20 { focused = false }
+        })
+        .animation(saver ? nil : .easeInOut(duration: 0.25), value: dark)
+    }
+
+    private var shieldButton: some View {
+        Button { actions.shields() } label: {
+            Image(systemName: actions.shieldsUp ? "shield.lefthalf.filled" : "shield.slash")
+                .font(.system(size: compact ? 13 : 15, weight: .semibold))
+                .foregroundStyle(actions.shieldsUp ? Color.orange : Color.secondary)
+                .frame(width: iconW, height: barH)
+                .overlay(alignment: .topTrailing) {
+                    if actions.shieldsUp && pane.blockedCount > 0 && !compact {
+                        Text(pane.blockedCount > 99 ? "99+" : "\(pane.blockedCount)")
+                            .font(.system(size: 9, weight: .bold))
+                            .monospacedDigit()
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 3)
+                            .frame(minWidth: 14, minHeight: 14)
+                            .background(Color.orange, in: Capsule())
+                            .offset(x: -1, y: 7)
+                    }
+                }
+                .contentShape(Rectangle())
+        }
     }
 
     private func navButton(_ icon: String, _ enabled: Bool, _ action: @escaping () -> Void) -> some View {
@@ -1431,6 +1777,7 @@ struct PaneView: View {
                 if !focused {
                     icon("chevron.left", enabled: pane.backEnabled) { pane.back() }
                     icon("chevron.right", enabled: pane.forwardEnabled) { pane.forward() }
+                    if !pane.isHome { shieldButton }
                 }
                 field.padding(.leading, focused ? 14 : 2)
                 if focused {
@@ -1450,7 +1797,8 @@ struct PaneView: View {
             HStack(spacing: 8) {
                 if !focused { navPair }
                 HStack(spacing: 0) {
-                    field
+                    if !focused && !pane.isHome { shieldButton }
+                    field.padding(.leading, !focused && !pane.isHome ? 0 : 16)
                     if focused {
                         if !pane.address.isEmpty { icon("xmark.circle.fill") { pane.address = "" } }
                     } else {
@@ -1459,7 +1807,7 @@ struct PaneView: View {
                         menu
                     }
                 }
-                .padding(.leading, 16)
+                .padding(.leading, 2)
                 .padding(.trailing, 4)
                 .frame(height: barH)
                 .sdGlass(Capsule(), dark: dark)
@@ -1500,11 +1848,9 @@ struct PaneView: View {
 // MARK: Top controls
 
 struct TopBar: View {
-    @ObservedObject var pane: Pane
     @ObservedObject var tabs: Tabs
     var saver: Bool
     var openTabs: () -> Void
-    @Environment(\.colorScheme) private var sys
 
     private func button<L: View>(_ action: @escaping () -> Void, @ViewBuilder label: () -> L) -> some View {
         Button(action: action) {
@@ -1517,34 +1863,55 @@ struct TopBar: View {
     }
 
     var body: some View {
-        let dark = pane.isHome ? sys == .dark : (pane.topDark ?? (sys == .dark))
-        HStack {
-            Spacer()
-            HStack(spacing: 0) {
-                button(openTabs) {
-                    Text("\(tabs.list.count)")
-                        .font(.caption.weight(.bold))
-                        .monospacedDigit()
-                        .frame(minWidth: 20, minHeight: 20)
-                        .padding(.horizontal, 2)
-                        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(.primary, lineWidth: 1.6))
-                }
-                button({ withAnimation(saver ? nil : .snappy) { tabs.swap() } }) {
-                    Image(systemName: "arrow.triangle.2.circlepath")
-                }
-                .disabled(!tabs.canSwap)
-                .opacity(tabs.canSwap ? 1 : 0.4)
-                button({ withAnimation(saver ? nil : .snappy) { tabs.toggleSplit() } }) {
-                    Image(systemName: tabs.split ? "rectangle.split.2x1.fill" : "rectangle.split.2x1")
-                }
+        HStack(spacing: 0) {
+            button(openTabs) {
+                Text("\(tabs.list.count)")
+                    .font(.caption.weight(.bold))
+                    .monospacedDigit()
+                    .frame(minWidth: 20, minHeight: 20)
+                    .padding(.horizontal, 2)
+                    .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(.primary, lineWidth: 1.6))
             }
-            .padding(.horizontal, 4)
-            .sdGlass(Capsule(), dark: dark)
+            button({ withAnimation(saver ? nil : .snappy) { tabs.swap() } }) {
+                Image(systemName: "arrow.triangle.2.circlepath")
+            }
+            .disabled(!tabs.canSwap)
+            .opacity(tabs.canSwap ? 1 : 0.4)
+            button({ withAnimation(saver ? nil : .snappy) { tabs.toggleSplit() } }) {
+                Image(systemName: tabs.split ? "rectangle.split.2x1.fill" : "rectangle.split.2x1")
+            }
         }
-        .environment(\.colorScheme, dark ? .dark : .light)
-        .animation(saver ? nil : .easeInOut(duration: 0.25), value: dark)
-        .padding(.horizontal, 12)
-        .padding(.top, 2)
+        .padding(.horizontal, 4)
+        .frame(height: 36)
+        .sdGlass(Capsule())
+    }
+}
+
+// The strip across the top: status bar area plus the tab pill. The pill row tucks away while you scroll down.
+struct TopStrip: View {
+    @ObservedObject var pane: Pane
+    @ObservedObject var tabs: Tabs
+    var saver: Bool
+    var safeTop: CGFloat
+    var openTabs: () -> Void
+
+    var body: some View {
+        let shown = !pane.collapsed || pane.isHome
+        VStack(spacing: 0) {
+            Color.clear.frame(height: safeTop)
+            if shown {
+                HStack {
+                    Spacer()
+                    TopBar(tabs: tabs, saver: saver, openTabs: openTabs)
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 6)
+                .transition(.opacity)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .background(Color(.systemBackground))
+        .animation(saver ? nil : .smooth(duration: 0.4), value: shown)
     }
 }
 
@@ -1751,8 +2118,8 @@ struct MySitesEditor: View {
 
 struct SettingsView: View {
     @ObservedObject var sites: Sites
+    @ObservedObject var shields: Shields
     @AppStorage("engine") private var engine = "DuckDuckGo"
-    @AppStorage("block") private var blockOn = true
     @AppStorage("saver") private var saver = false
     @AppStorage("homeMode") private var homeMode = 0
     @AppStorage("autoFillPrompt") private var autoPrompt = true
@@ -1807,7 +2174,7 @@ struct SettingsView: View {
                     Button("Clear Visit History", role: .destructive) { sites.clearVisits() }
                 }
                 Section("Privacy") {
-                    Toggle("Block Ads and Trackers", isOn: $blockOn)
+                    NavigationLink("Shields") { ShieldsSettings(shields: shields) }
                     Button("VPN") { openVPN() }
                 }
                 Section {
@@ -1915,7 +2282,7 @@ struct VaultView: View {
 // MARK: Main screen
 
 enum Sheet: Identifiable {
-    case vault, settings, calendar, vpn, tabs
+    case vault, settings, calendar, vpn, tabs, shields
     var id: Int {
         switch self {
         case .vault: return 0
@@ -1923,6 +2290,7 @@ enum Sheet: Identifiable {
         case .calendar: return 2
         case .vpn: return 3
         case .tabs: return 4
+        case .shields: return 5
         }
     }
 }
@@ -1932,6 +2300,7 @@ struct ContentView: View {
     @StateObject private var sites = Sites()
     @StateObject private var vault = Vault()
     @StateObject private var vpnService = VPNService()
+    @StateObject private var shields = Shields()
     @Environment(\.scenePhase) private var phase
     @AppStorage("block") private var blockOn = true
     @AppStorage("saver") private var saver = false
@@ -1939,7 +2308,7 @@ struct ContentView: View {
     @State private var split: CGFloat = 0.5
     @State private var dragging = false
     @State private var lastTap = Date.distantPast
-    @State private var rules: WKContentRuleList?
+    @State private var shieldsPane: Pane?
     @State private var sheet: Sheet?
     @State private var pending: Login?
     @State private var calTitle = ""
@@ -1950,11 +2319,24 @@ struct ContentView: View {
 
     var body: some View {
         GeometryReader { root in
-            ZStack(alignment: .top) {
-                Color(.systemBackground).ignoresSafeArea()
-                deck(topInset: root.safeAreaInsets.top).ignoresSafeArea(.container)
-                TopBar(pane: tabs.pane(tabs.left), tabs: tabs, saver: saver, openTabs: { tabs.snapshotVisible(); sheet = .tabs })
+            let safe = ContentView.windowInsets()
+            let portrait = root.size.height >= root.size.width
+            let sharedRow = tabs.split && portrait   // tab pill shares the top pane's bar row
+            VStack(spacing: 0) {
+                if !sharedRow {
+                    TopStrip(pane: tabs.pane(tabs.left), tabs: tabs, saver: saver, safeTop: safe.top, openTabs: openTabs)
+                }
+                deck(portrait: portrait, safe: safe)
             }
+            .overlay(alignment: .topTrailing) {
+                if sharedRow {
+                    TopBar(tabs: tabs, saver: saver, openTabs: openTabs)
+                        .padding(.trailing, 12)
+                        .padding(.top, safe.top + 4)
+                }
+            }
+            .ignoresSafeArea(.container, edges: .vertical)
+            .background(Color(.systemBackground).ignoresSafeArea())
         }
         .sheet(item: $sheet) { s in sheetView(s) }
         .alert("Save password?", isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } })) {
@@ -1973,13 +2355,15 @@ struct ContentView: View {
             Button("Cancel", role: .cancel) { choosePane = nil }
         }
         .task {
+            Pane.ruleProvider = { host in shields.rules(for: host) }
+            Pane.onBlocked = { shields.countBlocked() }
             tabs.configure = { p in configure(p) }
             tabs.allLive.forEach { configure($0) }
             applySaver()
-            rules = await Rules.compile()
-            apply(reload: false)
+            await shields.prepare()
         }
-        .onChange(of: blockOn) { _, _ in apply(reload: true) }
+        .onChange(of: shields.version) { _, _ in applyShields() }
+        .onChange(of: blockOn) { _, _ in shields.masterChanged() }
         .onChange(of: saver) { _, _ in applySaver() }
         .onChange(of: engine) { _, _ in tabs.visible.forEach { tabs.pane($0).goHome() } }
         .onChange(of: phase) { _, p in if p != .active { vault.lock() } }
@@ -1990,9 +2374,20 @@ struct ContentView: View {
 
     // MARK: Layout
 
-    private func deck(topInset: CGFloat) -> some View {
+    // Status bar and home indicator sizes from the window (unaffected by the keyboard).
+    static func windowInsets() -> UIEdgeInsets {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        return scenes.first?.keyWindow?.safeAreaInsets ?? .zero
+    }
+
+    private func openTabs() {
+        tabs.snapshotVisible()
+        sheet = .tabs
+    }
+
+    private func deck(portrait: Bool, safe: UIEdgeInsets) -> some View {
         GeometryReader { geo in
-            let horizontal = geo.size.width > geo.size.height
+            let horizontal = !portrait
             let total = horizontal ? geo.size.width : geo.size.height
             let gap: CGFloat = 3
             let firstSize = (total - gap) * split
@@ -2000,17 +2395,16 @@ struct ContentView: View {
                 if tabs.split {
                     let layout = horizontal ? AnyLayout(HStackLayout(spacing: gap)) : AnyLayout(VStackLayout(spacing: gap))
                     layout {
-                        // Portrait: top pane's bar sits at the top beside the tab pill, bottom pane's at the bottom.
+                        // Portrait: top pane's bar sits in a strip at the top beside the tab pill, bottom pane's at the bottom.
                         // Landscape: both slim bars sit at the bottom of their side.
-                        paneView(tabs.left, slot: 0, gap: 16, compact: true, atTop: !horizontal,
-                                 topInset: topInset, contentTop: topInset + 52)
+                        paneView(tabs.left, slot: 0, compact: true, atTop: portrait, safeTop: safe.top,
+                                 bottomInset: horizontal ? safe.bottom : 0)
                             .frame(width: horizontal ? firstSize : nil, height: horizontal ? nil : firstSize)
-                        paneView(tabs.right, slot: 1, gap: horizontal ? 16 : 24, compact: true,
-                                 topInset: topInset, contentTop: horizontal ? topInset + 52 : 20)
+                        paneView(tabs.right, slot: 1, compact: true, bottomInset: safe.bottom)
                     }
                     handle(horizontal: horizontal, total: total, pos: firstSize + gap / 2, size: geo.size)
                 } else {
-                    paneView(tabs.left, slot: 0, gap: 30, topInset: topInset, contentTop: topInset + 52)
+                    paneView(tabs.left, slot: 0, bottomInset: safe.bottom)
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
@@ -2082,26 +2476,28 @@ struct ContentView: View {
         }
     }
 
-    private func paneView(_ id: UUID, slot: Int, gap: CGFloat, compact: Bool = false, atTop: Bool = false,
-                          topInset: CGFloat = 0, contentTop: CGFloat = 72) -> some View {
+    private func paneView(_ id: UUID, slot: Int, compact: Bool = false, atTop: Bool = false,
+                          safeTop: CGFloat = 0, bottomInset: CGFloat = 0) -> some View {
         let p = tabs.pane(id)
         return PaneView(
             pane: p,
             sites: sites,
-            bottomGap: gap,
             actions: PaneActions(
                 autofill: { autofill(p) },
                 calendar: { calTitle = p.title.isEmpty ? p.host : p.title; calURL = p.address; sheet = .calendar },
                 settings: { sheet = .settings },
                 vpn: { sheet = .vpn },
                 vpnOn: vpnService.status == .connected,
-                newTab: { withAnimation(anim(.snappy)) { tabs.newTab(slot: slot) } }
+                newTab: { withAnimation(anim(.snappy)) { tabs.newTab(slot: slot) } },
+                shields: { shieldsPane = p; sheet = .shields },
+                shieldsUp: blockOn && shields.isUp(p.host),
+                totalBlocked: shields.totalBlocked
             ),
             compact: compact,
             atTop: atTop,
-            topInset: topInset,
-            trailingRoom: atTop ? 136 : 0,
-            contentTop: contentTop
+            safeTop: safeTop,
+            bottomInset: bottomInset,
+            trailingRoom: atTop ? 136 : 0
         )
         .id(id)
     }
@@ -2109,10 +2505,14 @@ struct ContentView: View {
     @ViewBuilder private func sheetView(_ s: Sheet) -> some View {
         switch s {
         case .vault: VaultView(vault: vault, fill: fill)
-        case .settings: SettingsView(sites: sites, openVault: { sheet = .vault }, openVPN: { sheet = .vpn })
+        case .settings: SettingsView(sites: sites, shields: shields, openVault: { sheet = .vault }, openVPN: { sheet = .vpn })
         case .calendar: EventEditor(title: calTitle, url: calURL).ignoresSafeArea()
         case .vpn: VPNView(vpn: vpnService)
         case .tabs: TabsView(tabs: tabs)
+        case .shields:
+            if let p = shieldsPane {
+                ShieldsView(shields: shields, pane: p).presentationDetents([.medium, .large])
+            }
         }
     }
 
@@ -2125,7 +2525,7 @@ struct ContentView: View {
             guard let p, autoPrompt, !vault.match(host: p.host).isEmpty else { return }
             p.offerFill = true
         }
-        if blockOn, let r = rules { p.webView.configuration.userContentController.add(r) }
+        p.applyRules(host: p.host)
         p.applyFPS()
     }
 
@@ -2143,12 +2543,13 @@ struct ContentView: View {
         }
     }
 
-    private func apply(reload: Bool) {
+    // Re-checks every open tab's block lists; reloads only when the change came from you.
+    private func applyShields() {
+        let reload = shields.pendingReload
+        shields.pendingReload = false
         for p in tabs.allLive {
-            let u = p.webView.configuration.userContentController
-            u.removeAllContentRuleLists()
-            if blockOn, let r = rules { u.add(r) }
-            if reload && !p.isHome { p.webView.reload() }
+            let changed = p.applyRules(host: p.host)
+            if changed && reload && !p.isHome { p.webView.reload() }
         }
     }
 
