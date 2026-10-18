@@ -94,21 +94,31 @@ struct BarCoverKey: PreferenceKey {
     }
 }
 
-// Bar surface: Liquid Glass (tinted towards the page colour for readability) or a solid colour.
+// Bar surface: a solid colour (default) or Liquid Glass. Split view bars are always solid.
+// `rim` draws a thin outline in the theme's accent so the bar reads as one piece.
 struct SDSurface: ViewModifier {
     let shape: AnyShape
     let dark: Bool?
     var clear = false
-    @AppStorage("barStyle") private var style = 0
+    var solid = false
+    var rim = false
+    @AppStorage("barStyle") private var style = 1
     @AppStorage("barColor") private var colorName = "System"
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.sdTheme) private var theme
+
+    private var isDark: Bool { dark ?? (scheme == .dark) }
+    private var rimColor: Color { theme.accent.muted().opacity(isDark ? 0.55 : 0.42) }
 
     @ViewBuilder func body(content: Content) -> some View {
-        if style == 1 {
+        if style == 1 || solid {
             content
                 .environment(\.colorScheme, BarColors.isDark(colorName, scheme: scheme) ? .dark : .light)
-                .background(BarColors.color(colorName, scheme: scheme), in: shape)
-                .overlay(shape.stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
+                .background {
+                    shape.fill(BarColors.color(colorName, scheme: scheme))
+                        .overlay(colorName == "System" ? shape.fill(theme.accent.muted().opacity(isDark ? 0.1 : 0.06)) : nil)
+                }
+                .overlay(shape.stroke(rim ? rimColor : Color.primary.opacity(0.08), lineWidth: rim ? 1.2 : 0.5))
                 .shadow(color: .black.opacity(0.14), radius: 8, y: 2)
         } else {
             let tint: Color = dark.map {
@@ -116,16 +126,18 @@ struct SDSurface: ViewModifier {
             } ?? Color(.systemBackground).opacity(clear ? 0.26 : 0.5)
             if #available(iOS 26.0, *) {
                 content.glassEffect((clear ? Glass.clear : Glass.regular).tint(tint).interactive(), in: shape)
+                    .overlay(rim ? shape.stroke(rimColor, lineWidth: 1.2) : nil)
             } else {
                 content.background(shape.fill(tint)).background(.regularMaterial, in: shape)
+                    .overlay(rim ? shape.stroke(rimColor, lineWidth: 1.2) : nil)
             }
         }
     }
 }
 
 extension View {
-    func sdGlass<S: Shape>(_ shape: S, dark: Bool? = nil, clear: Bool = false) -> some View {
-        modifier(SDSurface(shape: AnyShape(shape), dark: dark, clear: clear))
+    func sdGlass<S: Shape>(_ shape: S, dark: Bool? = nil, clear: Bool = false, solid: Bool = false, rim: Bool = false) -> some View {
+        modifier(SDSurface(shape: AnyShape(shape), dark: dark, clear: clear, solid: solid, rim: rim))
     }
 }
 
@@ -738,8 +750,11 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     private var obs: NSKeyValueObservation?
     private var lastY: CGFloat = 0
     private var scrollRun: CGFloat = 0
-    private var barLockUntil = Date.distantPast
-    private var tintWork: DispatchWorkItem?
+    private var barLockUntil: CFTimeInterval = 0
+    private var lastScrollAt: CFTimeInterval = 0
+    private var tintPending = false
+    // Off in Battery Saver, or with the minimal bar switched off: the bar never shrinks.
+    static var minimizeBars = true
     static let setJS = "function S(e,v){Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,v);e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}))}"
     // Safari-style "Hide Distracting Items": tap an element to fade it out and remember it for this site.
     static let hideStartJS = "(function(){if(window.__sdHiding)return;window.__sdHiding=true;var cur=null;function sel(e){var p=[];while(e&&e.nodeType===1&&e!==document.body&&e!==document.documentElement){if(e.id&&!/\\d{3,}/.test(e.id)){p.unshift('#'+CSS.escape(e.id));return p.join('>')}var i=1,x=e;while((x=x.previousElementSibling))if(x.tagName===e.tagName)i++;p.unshift(e.tagName.toLowerCase()+':nth-of-type('+i+')');e=e.parentElement}return 'body>'+p.join('>')}function pick(e){var r;while(e&&e!==document.body){r=e.getBoundingClientRect();if(r.width*r.height>2500)break;e=e.parentElement}if(!e||e===document.body||e===document.documentElement)return null;r=e.getBoundingClientRect();if(r.width>=innerWidth*0.98&&r.height>=innerHeight*0.9)return null;return e}function mark(e){if(cur){cur.style.outline=cur.__sdO||'';cur.style.outlineOffset=''}cur=e;if(e){e.__sdO=e.style.outline;e.style.outline='3px solid rgba(10,132,255,.9)';e.style.outlineOffset='-3px'}}window.__sdMark=mark;window.__sdDown=function(ev){mark(pick(ev.target))};window.__sdClick=function(ev){ev.preventDefault();ev.stopPropagation();ev.stopImmediatePropagation();var e=pick(ev.target);mark(null);if(!e)return;var s=sel(e);e.style.transition='opacity .25s ease,transform .25s ease';e.style.opacity='0';e.style.transform='scale(.94)';setTimeout(function(){e.style.setProperty('display','none','important')},260);window.webkit.messageHandlers.hide.postMessage(s)};document.addEventListener('pointerdown',window.__sdDown,true);document.addEventListener('click',window.__sdClick,true)})()"
@@ -774,6 +789,9 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         config.userContentController.add(WeakHandler(self), name: "hide")
         obs = wv.scrollView.observe(\.contentOffset, options: [.new]) { [weak self] sv, _ in
             guard let self else { return }
+            self.scheduleTint()
+            guard Pane.minimizeBars else { return }
+            let now = CACurrentMediaTime()
             let y = sv.contentOffset.y + sv.adjustedContentInset.top   // 0 = top of the page
             let dy = y - self.lastY
             self.lastY = y
@@ -783,22 +801,21 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             let maxY = sv.contentSize.height - sv.bounds.height + sv.adjustedContentInset.bottom + sv.adjustedContentInset.top
             let scrollable = maxY > 120
             let inBounds = y >= 0 && y <= maxY
-            let unlocked = Date() > self.barLockUntil
+            let unlocked = now > self.barLockUntil
             if (sv.isTracking || sv.isDecelerating) && scrollable && inBounds && unlocked {
                 if (dy > 0) != (self.scrollRun > 0) { self.scrollRun = 0 }
                 self.scrollRun += dy
                 if self.scrollRun > 28 && y > 60 && !self.collapsed {
                     self.collapsed = true
-                    self.barLockUntil = Date().addingTimeInterval(0.5)
+                    self.barLockUntil = now + 0.5
                     self.scrollRun = 0
                 } else if self.scrollRun < -28 && self.collapsed {
                     self.collapsed = false
-                    self.barLockUntil = Date().addingTimeInterval(0.5)
+                    self.barLockUntil = now + 0.5
                     self.scrollRun = 0
                 }
             }
             if y <= 0 && self.collapsed && unlocked && !sv.isDecelerating { self.collapsed = false }
-            self.scheduleTint()
         }
         loadObs = wv.observe(\.isLoading, options: [.new]) { [weak self] w, _ in
             DispatchQueue.main.async { self?.loading = w.isLoading }
@@ -925,11 +942,32 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         canForward = webView.canGoForward
     }
 
+    // Tapping the pill: stop any momentum scroll first, then hold the bar open for a moment,
+    // so a still-moving page can't fold it straight back into the pill.
+    func expandBar() {
+        let sv = webView.scrollView
+        if sv.isDecelerating { sv.setContentOffset(sv.contentOffset, animated: false) }
+        scrollRun = 0
+        barLockUntil = CACurrentMediaTime() + 1.2
+        if collapsed { collapsed = false }
+    }
+
+    // Re-reads the page colours once scrolling settles. One timer at a time, no allocation per scroll event.
     private func scheduleTint() {
-        tintWork?.cancel()
-        let w = DispatchWorkItem { [weak self] in self?.detectTint() }
-        tintWork = w
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: w)
+        lastScrollAt = CACurrentMediaTime()
+        guard !tintPending else { return }
+        tintPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in self?.tintCheck() }
+    }
+
+    private func tintCheck() {
+        let idle = CACurrentMediaTime() - lastScrollAt
+        if idle < 0.3 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + (0.32 - idle)) { [weak self] in self?.tintCheck() }
+            return
+        }
+        tintPending = false
+        detectTint()
     }
 
     // The floating bars cover part of the page. The page scrolls clear of them, and WebKit lays out
@@ -1560,6 +1598,7 @@ struct Theme: Equatable {
         Theme(name: "Midnight", top: hex("#1A2340"), bottom: hex("#090D19"), strip: hex("#0E1426"), accent: hex("#7FA2FF"), dark: true),
         Theme(name: "Ember", top: hex("#3A1A14"), bottom: hex("#140807"), strip: hex("#1D0D0A"), accent: hex("#FF7A45"), dark: true),
         Theme(name: "Forest", top: hex("#1F3326"), bottom: hex("#0B140E"), strip: hex("#111D15"), accent: hex("#7FD39A"), dark: true),
+        Theme(name: "Mono", top: hex("#F5F5F7"), bottom: hex("#DCDCE0"), strip: hex("#F5F5F7"), accent: hex("#1C1C1E"), dark: false),
     ]
 
     // The same theme for light or dark mode: keeps its hues and accent, changes the shades.
@@ -1569,7 +1608,8 @@ struct Theme: Equatable {
         func tone(_ c: Color, _ sat: (CGFloat) -> CGFloat, _ bright: (CGFloat) -> CGFloat) -> Color {
             var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
             guard UIColor(c).getHue(&h, saturation: &s, brightness: &b, alpha: &a) else { return c }
-            return Color(hue: Double(h), saturation: Double(min(max(sat(s), 0), 1)), brightness: Double(min(max(bright(b), 0), 1)))
+            let grey = s < 0.04   // Mono and other greys stay grey
+            return Color(hue: Double(h), saturation: grey ? 0 : Double(min(max(sat(s), 0), 1)), brightness: Double(min(max(bright(b), 0), 1)))
         }
         if wantDark {
             return Theme(name: name,
@@ -2416,7 +2456,10 @@ struct PaneView: View {
         if adaptiveText || TextColors.color(textColor) == nil { return AnyShapeStyle(dark ? Color.white : Color.black) }
         return TextColors.ink(adaptive: adaptiveText, name: textColor)
     }
-    private var mini: Bool { pane.collapsed && !focused && !pane.isHome }
+    // Never in Battery Saver, and only with the minimal bar switched on.
+    private var mini: Bool { minimalBar && !saver && pane.collapsed && !focused && !pane.isHome }
+    private var showEnds: Bool { !mini && !focused }
+    private var pillH: CGFloat { compact ? 26 : 38 }
     // Full screen: the bar floats over the page instead of sitting in a strip beside it.
     private var floating: Bool { !compact }
     // Full-screen layout choice; split view always uses the slim two-tone bar.
@@ -2443,7 +2486,8 @@ struct PaneView: View {
     }
     // Tuned for 120 Hz: critically damped enough not to wobble, quick enough to feel direct.
     private var spring: Animation? { saver ? nil : .spring(response: 0.34, dampingFraction: 0.86) }
-    private var smooth: Animation? { saver ? nil : .smooth(duration: 0.36) }
+    // The bar folding into its pill: no bounce, a soft finish, like Safari.
+    private var shrink: Animation? { saver ? nil : .spring(response: 0.42, dampingFraction: 0.9) }
     @Namespace private var ns
     private var barH: CGFloat { compact ? 36 : 54 }
 
@@ -2458,11 +2502,11 @@ struct PaneView: View {
     // ⋯ menu or share sheet (it checks again a little later instead).
     private static let idle: Double = 8
     private func scheduleCollapse(after delay: Double) {
-        guard minimalBar, !(atTop && compact), !pane.isHome else { return }
+        guard minimalBar, !saver, !(atTop && compact), !pane.isHome else { return }
         let token = UUID()
         collapseToken = token
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            guard collapseToken == token, !focused, !pane.hiding, !pane.isHome, !showBanner else { return }
+            guard collapseToken == token, !focused, !pane.hiding, !pane.isHome else { return }
             let quiet = Date().timeIntervalSince(touchedAt)
             if quiet < Self.idle { scheduleCollapse(after: Self.idle - quiet); return }
             if OverlayProbe.somethingOpen() { scheduleCollapse(after: 2); return }
@@ -2472,6 +2516,10 @@ struct PaneView: View {
     private func touched() {
         touchedAt = Date()
         scheduleCollapse(after: Self.idle)
+    }
+    private func expand() {
+        pane.expandBar()
+        touched()
     }
     private var iconW: CGFloat { compact ? 32 : 44 }
 
@@ -2484,7 +2532,7 @@ struct PaneView: View {
     }
 
     private var suggestions: [Suggestion] {
-        guard focused, !pane.isPrivate else { return [] }
+        guard focused, compact, !pane.isPrivate else { return [] }
         let typed = pane.address == pane.webView.url?.absoluteString ? "" : pane.address
         return Suggest.make(query: typed, history: history, sites: sites, limit: compact ? 4 : 6)
     }
@@ -2591,10 +2639,9 @@ struct PaneView: View {
                 PrivateCover(locked: actions.privateLocked, unlock: actions.unlockPrivate, leave: actions.exitPrivate)
             }
         }
-        .animation(smooth, value: mini)
+        .animation(shrink, value: mini)
         .animation(spring, value: focused)
         .animation(spring, value: pane.hiding)
-        .animation(spring, value: showBanner)
         .animation(spring, value: suggestions.count)
         .animation(spring, value: barLayout)
         .animation(spring, value: atTop)
@@ -2612,8 +2659,7 @@ struct PaneView: View {
 
     private var topRow: some View {
         VStack(spacing: 6) {
-            bar.frame(height: mini && !compact ? nil : barH)
-            if showBanner { fillBanner }
+            bar.frame(height: barH)
             if compact && !suggestions.isEmpty { suggestionList }
         }
         .environment(\.colorScheme, dark ? .dark : .light)
@@ -2628,7 +2674,6 @@ struct PaneView: View {
     private var bottomRow: some View {
         VStack(spacing: 8) {
             if compact && !suggestions.isEmpty { suggestionList }
-            if showBanner { fillBanner }
             bar
             if showToolbar {
                 toolbar.transition(.move(edge: .bottom).combined(with: .opacity))
@@ -2738,7 +2783,7 @@ struct PaneView: View {
     private var toolbarCapsule: some View {
         toolbar
             .padding(.horizontal, 4)
-            .sdGlass(Capsule(), dark: dark, clear: true)
+            .sdGlass(Capsule(), dark: dark, clear: true, rim: true)
     }
 
     private var floatPad: CGFloat {
@@ -2750,12 +2795,10 @@ struct PaneView: View {
     // Full screen: the bar (and toolbar) float over the page with the page showing around them.
     private var floatingBar: some View {
         VStack(spacing: 8) {
-            if !atTop && showBanner { fillBanner }
             bar
             if !atTop && showToolbar {
                 toolbarCapsule.transition(.move(edge: .bottom).combined(with: .opacity))
             }
-            if atTop && showBanner { fillBanner }
         }
         .environment(\.colorScheme, dark ? .dark : .light)
         .padding(.horizontal, 12)
@@ -2783,38 +2826,6 @@ struct PaneView: View {
             .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 
-    private var fillBanner: some View {
-        HStack(spacing: 0) {
-            Image(systemName: "key.fill")
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(ink)
-                .padding(.leading, 14)
-            Text("Use saved password")
-                .font(.footnote.weight(.semibold))
-                .foregroundStyle(ink)
-                .lineLimit(1)
-                .padding(.leading, 8)
-            Spacer(minLength: 8)
-            Button {
-                pane.offerFill = false
-                actions.autofill()
-            } label: {
-                Text("Fill")
-                    .font(.footnote.weight(.semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 14)
-                    .frame(height: 26)
-                    .background(theme.accent, in: Capsule())
-            }
-            icon("xmark") { pane.offerFill = false }
-        }
-        .frame(height: 36)
-        .sdGlass(Capsule(), dark: dark)
-        .transition(.move(edge: atTop ? .top : .bottom).combined(with: .opacity))
-    }
-
-    private var showBanner: Bool { pane.offerFill && !focused && !pane.hiding && !pane.isHome }
-
     private var field: some View {
         TextField(pane.isPrivate ? "Search privately" : "Search or enter site", text: addressText)
             .textFieldStyle(.plain)
@@ -2830,121 +2841,144 @@ struct PaneView: View {
     }
 
     @ViewBuilder private var bar: some View {
-        if pane.hiding {
-            HStack(spacing: 0) {
-                Text("Tap items to hide")
-                    .font(compact ? .footnote.weight(.medium) : .subheadline.weight(.medium))
-                    .foregroundStyle(ink)
-                    .padding(.leading, compact ? 14 : 18)
-                Spacer(minLength: 8)
-                if pane.canUndoHide { icon("arrow.uturn.backward") { pane.undoHide() } }
-                Button { pane.stopHiding() } label: {
-                    Text("Done")
-                        .font(compact ? .footnote.weight(.semibold) : .subheadline.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, compact ? 12 : 16)
-                        .frame(height: barH - 12)
-                        .background(theme.accent, in: Capsule())
-                }
-                .padding(.trailing, 6)
-            }
-            .frame(height: barH)
-            .sdGlass(Capsule(), dark: dark)
-            .matchedGeometryEffect(id: "bar", in: ns)
-            .transition(.opacity)
-        } else if mini {
-            // The expandable pill: just the site. Tap to open the full bar.
-            Button {
-                pane.collapsed = false
-                touched()
-            } label: {
-                HStack(spacing: 6) {
-                    if pane.isPrivate {
-                        Image(systemName: "eye.slash.fill").font(.system(size: compact ? 9 : 11, weight: .semibold))
-                    } else if pane.loading {
-                        ProgressView().controlSize(.mini).tint(dark ? .white : .black)
-                    } else {
-                        Image(systemName: "lock.fill").font(.system(size: compact ? 8 : 10, weight: .semibold)).opacity(0.6)
-                    }
-                    Text(pane.host.isEmpty ? "Search" : pane.host.replacingOccurrences(of: "www.", with: ""))
-                        .font(compact ? .caption2.weight(.semibold) : .footnote.weight(.semibold))
-                        .lineLimit(1)
-                }
+        if pane.hiding { hidingBar } else { mainBar }
+    }
+
+    private var hidingBar: some View {
+        HStack(spacing: 0) {
+            Text("Tap items to hide")
+                .font(compact ? .footnote.weight(.medium) : .subheadline.weight(.medium))
                 .foregroundStyle(ink)
-                .padding(.horizontal, compact ? 12 : 18)
-                .padding(.vertical, compact ? 5 : 9)
-                .contentShape(Capsule())
+                .padding(.leading, compact ? 14 : 18)
+            Spacer(minLength: 8)
+            if pane.canUndoHide { icon("arrow.uturn.backward") { pane.undoHide() } }
+            Button { pane.stopHiding() } label: {
+                Text("Done")
+                    .font(compact ? .footnote.weight(.semibold) : .subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, compact ? 12 : 16)
+                    .frame(height: barH - 12)
+                    .background(theme.accent, in: Capsule())
             }
-            .sdGlass(Capsule(), dark: dark, clear: true)
-            .accessibilityLabel("Show address bar")
-            .matchedGeometryEffect(id: "bar", in: ns)
-            .transition(.opacity)
-        } else {
-            // One capsule: back and forward built in, then the address, extras and menu.
-            HStack(spacing: 0) {
-                if !focused && toolbarLayout && pane.isPrivate {
-                    Image(systemName: "eye.slash.fill")
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(ink)
-                        .opacity(0.8)
-                        .padding(.leading, 16)
-                        .accessibilityLabel("Private tab")
-                }
-                if !focused && !toolbarLayout {
-                    // Tinted end: navigation
-                    HStack(spacing: 0) {
-                        icon("chevron.left", enabled: pane.backEnabled) { pane.back() }
-                        icon("chevron.right", enabled: pane.forwardEnabled) { pane.forward() }
-                        if pane.isPrivate {
-                            Image(systemName: "eye.slash.fill")
-                                .font(.system(size: compact ? 11 : 12, weight: .semibold))
-                                .foregroundStyle(ink)
-                                .opacity(0.8)
-                                .padding(.trailing, 6)
-                                .accessibilityLabel("Private tab")
-                        }
-                    }
-                    .frame(height: barH - 6)
-                    .background(tinted ? endTint : Color.clear, in: Capsule())
-                    .simultaneousGesture(TapGesture().onEnded { touched() })
-                    .padding(.leading, 3)
-                }
-                // Clear middle: the address
-                field.padding(.leading, focused || toolbarLayout ? (compact ? 14 : 18) : 8)
-                if focused {
-                    if !pane.address.isEmpty { icon("xmark.circle.fill") { pane.address = "" } }
-                } else {
-                    // Tinted end: page and app controls
-                    HStack(spacing: 0) {
-                        if !pane.isHome { reloadButton }
-                        if !toolbarLayout {
-                            if !actions.islandShown && actions.splitEnabled { splitButton }
-                            if !compact || !actions.islandShown { tabsButton }
-                            menu
-                        }
-                    }
-                    .frame(height: barH - 6)
-                    .background(tinted ? endTint : Color.clear, in: Capsule())
-                    .simultaneousGesture(TapGesture().onEnded { touched() })
-                    .padding(.trailing, 3)
-                }
-            }
-            .frame(height: barH)
-            .sdGlass(Capsule(), dark: dark, clear: tinted || floating)
-            .geometryGroup()
-            .padding(.trailing, focused && !compact ? 78 : 0)
-            .overlay(alignment: .trailing) {
-                if focused && !compact {
-                    Button("Cancel") { focused = false }
-                        .font(.system(size: 17, weight: .regular))
-                        .foregroundStyle(ink)
-                        .frame(width: 70, height: barH)
-                        .transition(.move(edge: .trailing).combined(with: .opacity))
-                }
-            }
-            .matchedGeometryEffect(id: "bar", in: ns)
-            .transition(.opacity)
+            .padding(.trailing, 6)
         }
+        .frame(height: barH)
+        .sdGlass(Capsule(), dark: dark, solid: compact, rim: true)
+        .matchedGeometryEffect(id: "bar", in: ns)
+        .transition(.opacity)
+    }
+
+    // Back and forward (tinted end of the two-tone bar).
+    private var leadingEnd: some View {
+        HStack(spacing: 0) {
+            icon("chevron.left", enabled: pane.backEnabled) { pane.back() }
+            icon("chevron.right", enabled: pane.forwardEnabled) { pane.forward() }
+            if pane.isPrivate {
+                Image(systemName: "eye.slash.fill")
+                    .font(.system(size: compact ? 11 : 12, weight: .semibold))
+                    .foregroundStyle(ink)
+                    .opacity(0.8)
+                    .padding(.trailing, 6)
+                    .accessibilityLabel("Private tab")
+            }
+        }
+        .frame(height: barH - 6)
+        .background(tinted ? endTint : Color.clear, in: Capsule())
+        .simultaneousGesture(TapGesture().onEnded { touched() })
+        .padding(.leading, 3)
+    }
+
+    // Page and app controls (the other tinted end).
+    private var trailingEnd: some View {
+        HStack(spacing: 0) {
+            if !pane.isHome { reloadButton }
+            if !toolbarLayout {
+                if compact && actions.splitOn && actions.canSwap {
+                    icon("arrow.left.arrow.right") { actions.swapTabs() }
+                        .accessibilityLabel("Switch to last tab")
+                }
+                if !actions.islandShown && actions.splitEnabled { splitButton }
+                if !compact || !actions.islandShown { tabsButton }
+                menu
+            }
+        }
+        .frame(height: barH - 6)
+        .background(tinted ? endTint : Color.clear, in: Capsule())
+        .simultaneousGesture(TapGesture().onEnded { touched() })
+        .padding(.trailing, 3)
+    }
+
+    // What the pill shows: a lock (or private eye, or a spinner) and the site.
+    private var pillLabel: some View {
+        HStack(spacing: 6) {
+            if pane.isPrivate {
+                Image(systemName: "eye.slash.fill").font(.system(size: compact ? 9 : 11, weight: .semibold))
+            } else if pane.loading {
+                ProgressView().controlSize(.mini).tint(dark ? .white : .black)
+            } else {
+                Image(systemName: "lock.fill").font(.system(size: compact ? 8 : 10, weight: .semibold)).opacity(0.6)
+            }
+            Text(pane.host.isEmpty ? "Search" : pane.host.replacingOccurrences(of: "www.", with: ""))
+                .font(compact ? .caption2.weight(.semibold) : .footnote.weight(.semibold))
+                .lineLimit(1)
+        }
+        .foregroundStyle(ink)
+        .fixedSize()
+    }
+
+    // One capsule that changes shape between the full bar and the small pill. The capsule itself
+    // never cross-fades: it shrinks around the address while the buttons fold away into it (like Safari),
+    // and grows back out when you tap it, even while the page is still moving.
+    private var mainBar: some View {
+        HStack(spacing: 0) {
+            if showEnds && toolbarLayout && pane.isPrivate {
+                Image(systemName: "eye.slash.fill")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(ink)
+                    .opacity(0.8)
+                    .padding(.leading, 16)
+                    .accessibilityLabel("Private tab")
+                    .transition(.opacity)
+            }
+            if showEnds && !toolbarLayout {
+                leadingEnd.transition(.opacity.combined(with: .scale(scale: 0.5, anchor: .leading)))
+            }
+            if mini {
+                pillLabel
+                    .matchedGeometryEffect(id: "addr", in: ns)
+                    .transition(.opacity)
+            } else {
+                field
+                    .padding(.leading, focused || toolbarLayout ? (compact ? 14 : 18) : 8)
+                    .matchedGeometryEffect(id: "addr", in: ns)
+                    .transition(.opacity)
+            }
+            if focused {
+                if !pane.address.isEmpty { icon("xmark.circle.fill") { pane.address = "" } }
+            } else if showEnds {
+                trailingEnd.transition(.opacity.combined(with: .scale(scale: 0.5, anchor: .trailing)))
+            }
+        }
+        .padding(.horizontal, mini ? (compact ? 12 : 18) : 0)
+        .frame(height: mini ? pillH : barH)
+        .frame(maxWidth: mini ? nil : .infinity)
+        .sdGlass(Capsule(), dark: dark, clear: tinted || floating, solid: compact, rim: true)
+        .contentShape(Capsule())
+        .gesture(TapGesture().onEnded { expand() }, including: mini ? .all : .subviews)
+        .accessibilityAddTraits(mini ? .isButton : [])
+        .geometryGroup()
+        .padding(.trailing, focused && !compact ? 78 : 0)
+        .overlay(alignment: .trailing) {
+            if focused && !compact {
+                Button("Cancel") { focused = false }
+                    .font(.system(size: 17, weight: .regular))
+                    .foregroundStyle(ink)
+                    .frame(width: 70, height: barH)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
+        }
+        .matchedGeometryEffect(id: "bar", in: ns)
+        .transition(.opacity)
     }
 
     private var menu: some View {
@@ -3274,7 +3308,9 @@ struct EdgeDock: View {
     @State private var edge = DockEdge(rawValue: UserDefaults.standard.string(forKey: "dockEdge") ?? "") ?? .right
     @State private var along = UserDefaults.standard.object(forKey: "dockPos") as? Double
         ?? UserDefaults.standard.object(forKey: "dockY") as? Double ?? 0.45
+    // Only a side can hold the island tucked away; at the top it always stays open.
     @State private var tucked = UserDefaults.standard.bool(forKey: "dockTucked")
+        && (UserDefaults.standard.string(forKey: "dockEdge") ?? "right") != "top"
 
     // While dragging
     @State private var start: CGPoint?          // resting centre when the drag began
@@ -3286,9 +3322,13 @@ struct EdgeDock: View {
     private var ink: AnyShapeStyle {
         privateMode ? AnyShapeStyle(Color.white) : TextColors.ink(adaptive: adaptiveText, name: textColor)
     }
-    private var snap: Animation? { saver ? nil : .spring(response: 0.42, dampingFraction: 0.72) }
-    private var morph: Animation? { saver ? nil : .spring(response: 0.3, dampingFraction: 0.82) }
-    private var quick: Animation? { saver ? nil : .spring(response: 0.22, dampingFraction: 0.75) }
+    // Critically damped springs: they settle without wobbling and pick up straight from your finger.
+    private var lift: Animation? { saver ? nil : .spring(response: 0.26, dampingFraction: 0.84) }
+    private var morph: Animation? { saver ? nil : .spring(response: 0.34, dampingFraction: 0.88) }
+    private var settle: Animation? { saver ? nil : .spring(response: 0.42, dampingFraction: 0.86) }
+    private func release(_ v: Double) -> Animation? {
+        saver ? nil : .interpolatingSpring(mass: 1, stiffness: 200, damping: 26, initialVelocity: v)
+    }
 
     private var shownEdge: DockEdge { target ?? edge }
     private var vertical: Bool { shownEdge != .top }
@@ -3310,7 +3350,7 @@ struct EdgeDock: View {
             let lo = safe.left + half + 12
             let hi = max(s.width - safe.right - half - 12, lo)
             let x = min(max(a * s.width, lo), hi)
-            return CGPoint(x: x, y: safe.top + (t ? 10 : girth / 2 + 6))
+            return CGPoint(x: x, y: safe.top + girth / 2 + 6)
         }
     }
 
@@ -3352,13 +3392,14 @@ struct EdgeDock: View {
     }
 
     private func setTucked(_ t: Bool) {
+        guard !t || edge != .top else { return }
         Haptics.tap()
-        withAnimation(snap) { tucked = t }
+        withAnimation(settle) { tucked = t }
         save()
     }
 
     private func move(to e: DockEdge) {
-        withAnimation(snap) { edge = e; along = e == .top ? 0.5 : 0.45; tucked = false }
+        withAnimation(settle) { edge = e; along = e == .top ? 0.5 : 0.45; tucked = false }
         save()
     }
 
@@ -3366,7 +3407,7 @@ struct EdgeDock: View {
         DragGesture(minimumDistance: 8, coordinateSpace: .named("dock"))
             .onChanged { v in
                 if start == nil {
-                    withAnimation(quick) {
+                    withAnimation(lift) {
                         start = rest(edge, along, tucked: tucked, in: s)
                         target = edge
                     }
@@ -3376,17 +3417,17 @@ struct EdgeDock: View {
                 guard let p = live(in: s) else { return }
                 // Pull the handle away from the edge and the island comes out with your finger.
                 if tucked && overshoot(p, edge, in: s) < -12 {
-                    withAnimation(snap) { tucked = false }
+                    withAnimation(morph) { tucked = false }
                     Haptics.tick()
                 }
                 let t = nearest(p, in: s)
                 if t != target {
-                    target = t
+                    withAnimation(morph) { target = t }
                     Haptics.tick()
                 }
-                let wt = !tucked && overshoot(p, t, in: s) > 26
+                let wt = !tucked && t != .top && overshoot(p, t, in: s) > 26
                 if wt != willTuck {
-                    willTuck = wt
+                    withAnimation(lift) { willTuck = wt }
                     Haptics.tick()
                 }
             }
@@ -3400,8 +3441,16 @@ struct EdgeDock: View {
                 aim.y = min(max(aim.y, 0), s.height)
                 let e = nearest(aim, in: s)
                 let a = Double(e == .top ? aim.x / max(s.width, 1) : aim.y / max(s.height, 1))
-                let tuck = tucked || willTuck || (overshoot(p, e, in: s) > -50 && overshoot(flung, e, in: s) > 140)
-                withAnimation(snap) {
+                let side = e != .top
+                let tuck = side && (tucked || willTuck || (overshoot(p, e, in: s) > -50 && overshoot(flung, e, in: s) > 140))
+                // Hand the finger's speed to the spring, so the island carries on smoothly instead of jolting.
+                let end = rest(e, min(max(a, 0), 1), tucked: tuck, in: s)
+                let from = live(in: s) ?? p
+                let dx = end.x - from.x, dy = end.y - from.y
+                let dist = max(sqrt(dx * dx + dy * dy), 1)
+                let toward = (v.velocity.width * dx + v.velocity.height * dy) / dist
+                let rel = Double(min(max(toward / dist, 0), 6))
+                withAnimation(release(rel)) {
                     edge = e
                     along = min(max(a, 0), 1)
                     tucked = tuck
@@ -3445,18 +3494,18 @@ struct EdgeDock: View {
                     .frame(minWidth: 20, minHeight: 20)
                     .padding(.horizontal, 2)
                     .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(ink, lineWidth: 1.6))
-                    .animation(snap, value: tabCount)
+                    .animation(settle, value: tabCount)
             }
             .contextMenu {
-                Button { withAnimation(snap) { tabs.newTab(slot: 0) } } label: {
+                Button { withAnimation(settle) { tabs.newTab(slot: 0) } } label: {
                     Label("New Tab", systemImage: "plus.square.on.square")
                 }
-                Button { withAnimation(snap) { tabs.newTab(slot: 0, isPrivate: true) } } label: {
+                Button { withAnimation(settle) { tabs.newTab(slot: 0, isPrivate: true) } } label: {
                     Label("New Private Tab", systemImage: "eye.slash")
                 }
                 Button(action: openTabs) { Label("Show All Tabs", systemImage: "square.grid.2x2") }
             }
-            button("Switch to last tab", { swapTick += 1; withAnimation(snap) { tabs.swap() } }) {
+            button("Switch to last tab", { swapTick += 1; withAnimation(settle) { tabs.swap() } }) {
                 Image(systemName: "arrow.left.arrow.right")
                     .rotationEffect(.degrees(vertical ? 0 : 90))
                     .symbolEffect(.bounce, value: swapTick)
@@ -3464,17 +3513,19 @@ struct EdgeDock: View {
             .disabled(!tabs.canSwap)
             .opacity(tabs.canSwap ? 1 : 0.4)
             if splitEnabled {
-                button(tabs.split ? "Close split view" : "Split view", { withAnimation(snap) { tabs.toggleSplit() } }) {
+                button(tabs.split ? "Close split view" : "Split view", { withAnimation(settle) { tabs.toggleSplit() } }) {
                     Image(systemName: tabs.split ? "rectangle.split.1x2.fill" : "rectangle.split.1x2")
                         .symbolEffect(.bounce, value: tabs.split)
                 }
             }
-            button("Tuck away", { setTucked(true) }) {
-                Image(systemName: shownEdge == .top ? "chevron.compact.up"
-                      : (shownEdge == .left ? "chevron.compact.left" : "chevron.compact.right"))
-                    .font(.system(size: 14, weight: .bold))
+            if shownEdge != .top {
+                button("Tuck away", { setTucked(true) }) {
+                    Image(systemName: shownEdge == .left ? "chevron.compact.left" : "chevron.compact.right")
+                        .font(.system(size: 14, weight: .bold))
+                }
+                .opacity(0.6)
+                .transition(.opacity.combined(with: .scale(scale: 0.6)))
             }
-            .opacity(0.6)
         }
         .symbolEffectsRemoved(saver)
         .padding(4)
@@ -3489,8 +3540,8 @@ struct EdgeDock: View {
         Capsule()
             .fill(privateMode ? Color.white.opacity(0.75) : Color.primary.opacity(0.45))
             .background(Capsule().stroke(Color(uiColor: .systemBackground).opacity(0.6), lineWidth: 1.5))
-            .frame(width: vertical ? 5 : 52, height: vertical ? 52 : 5)
-            .frame(width: vertical ? 28 : 96, height: vertical ? 96 : 28)
+            .frame(width: 5, height: 52)
+            .frame(width: 28, height: 96)
             .contentShape(Rectangle())
             .onTapGesture { setTucked(false) }
             .accessibilityLabel("Show tab controls")
@@ -3514,7 +3565,7 @@ struct EdgeDock: View {
         if e == .right { at = CGPoint(x: s.width - safe.right - 3, y: p.y) }
         return Capsule()
             .fill(theme.accent.opacity(willTuck ? 0.95 : 0.55))
-            .frame(width: side ? 4 : (willTuck ? 150 : 110), height: side ? (willTuck ? 150 : 110) : 4)
+            .frame(width: side ? 4 : 110, height: side ? (willTuck ? 150 : 110) : 4)
             .shadow(color: theme.accent.opacity(0.6), radius: 6)
             .position(at)
             .allowsHitTesting(false)
@@ -3525,21 +3576,23 @@ struct EdgeDock: View {
         GeometryReader { g in
             let s = g.size
             let lifted = start != nil
-            let p = live(in: s) ?? rest(edge, along, tucked: tucked, in: s)
+            let base = start ?? rest(edge, along, tucked: tucked, in: s)
+            let p = live(in: s) ?? base
             ZStack {
                 if lifted && !saver { glow(p, in: s) }
                 Group {
                     if tucked { handle } else { panel }
                 }
-                .transition(.scale(scale: 0.3, anchor: anchor).combined(with: .opacity))
+                .transition(.asymmetric(insertion: .opacity.combined(with: .scale(scale: 0.6, anchor: anchor)),
+                                        removal: .opacity.combined(with: .scale(scale: 0.4, anchor: anchor))))
                 .animation(morph, value: vertical)
-                .scaleEffect(lifted ? (willTuck ? 0.84 : 1.07) : 1)
-                .opacity(willTuck ? 0.75 : 1)
-                .shadow(color: .black.opacity(lifted && !saver ? 0.28 : 0), radius: 18, y: 10)
-                .animation(quick, value: lifted)
-                .animation(quick, value: willTuck)
+                .scaleEffect(lifted ? (willTuck ? 0.86 : 1.05) : 1)
+                .opacity(willTuck ? 0.8 : 1)
+                .shadow(color: .black.opacity(lifted && !saver ? 0.25 : 0), radius: 16, y: 8)
                 .gesture(dragGesture(in: s))
-                .position(p)
+                // Positioned at its resting point; the drag only offsets it, so moving it never re-runs layout.
+                .position(base)
+                .offset(x: p.x - base.x, y: p.y - base.y)
             }
         }
         .coordinateSpace(.named("dock"))
@@ -4085,13 +4138,13 @@ struct SettingsView: View {
     @AppStorage("saver") private var saver = false
     @AppStorage("homeMode") private var homeMode = 0
     @AppStorage("autoFillPrompt") private var autoPrompt = true
-    @AppStorage("barStyle") private var barStyle = 0
+    @AppStorage("barStyle") private var barStyle = 1
     @AppStorage("barColor") private var barColor = "System"
     @AppStorage("adaptiveText") private var adaptiveText = true
     @AppStorage("textColor") private var textColor = "System"
     @AppStorage("lockPrivate") private var lockPrivate = true
     @AppStorage("autoSavePasswords") private var autoSave = false
-    @AppStorage("showIsland") private var showIsland = true
+    @AppStorage("showIsland") private var showIsland = false
     @AppStorage("splitEnabled") private var splitEnabled = true
     @AppStorage("minimalBar") private var minimalBar = true
     @AppStorage("barLayout") private var barLayout = "twoTone"
@@ -4229,9 +4282,9 @@ struct SettingsView: View {
                     Text("Private tabs are hidden behind Face ID when you leave the app, and covered in the app switcher. VPN connects only to a provider you set up yourself: SplitDeck doesn't host VPN servers, as we don't yet have the resources to run them securely.")
                 }
                 Section {
-                    Toggle("Extreme Battery Saver", isOn: $saver)
+                    Toggle("Battery Saver", isOn: $saver)
                 } footer: {
-                    Text("Switches the app to dark mode, turns off every animation, caps page animations at 30 fps and keeps only 2 tabs awake.")
+                    Text("Switches the app to dark mode, turns off every animation, keeps the address bar full size, caps page animations at 30 fps and keeps only 2 tabs awake.")
                 }
                 Section {
                     Button("Passwords and Cards") { openVault() }
@@ -4314,10 +4367,40 @@ enum PasswordTools {
 
 // MARK: Vault screen
 
+// Something about to be deleted from the vault, waiting for "are you sure" and then Face ID.
+enum VaultDeletion: Identifiable {
+    case login(Login), card(Card)
+    var id: UUID {
+        switch self {
+        case .login(let l): return l.id
+        case .card(let c): return c.id
+        }
+    }
+    var title: String {
+        switch self {
+        case .login(let l): return "the login for \(Sites.clean(l.site).isEmpty ? l.site : Sites.clean(l.site))"
+        case .card(let c): return "the card ending \(String(c.number.suffix(4)))"
+        }
+    }
+}
+
 struct VaultView: View {
     @ObservedObject var vault: Vault
     var fill: (Login?, Card?) -> Void
     @AppStorage("appIconName") private var iconName = ""
+    @State private var deleting: VaultDeletion?
+
+    private func confirmDelete(_ d: VaultDeletion) {
+        Task {
+            guard await Vault.confirm("Delete \(d.title)") else { return }
+            withAnimation {
+                switch d {
+                case .login(let l): vault.deleteLogin(l.id)
+                case .card(let c): vault.deleteCard(c.id)
+                }
+            }
+        }
+    }
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var phase
     @State private var query = ""
@@ -4378,6 +4461,14 @@ struct VaultView: View {
                 }
             }
             .sheet(isPresented: $addingCard) { CardEditor { vault.cards.append($0); vault.save() } }
+            .alert("Delete permanently?",
+                   isPresented: Binding(get: { deleting != nil }, set: { if !$0 { deleting = nil } }),
+                   presenting: deleting) { d in
+                Button("Delete", role: .destructive) { confirmDelete(d) }
+                Button("Cancel", role: .cancel) {}
+            } message: { d in
+                Text("This removes \(d.title) from this iPhone. It can't be undone. You'll confirm with Face ID next.")
+            }
             .fileImporter(isPresented: $importing, allowedContentTypes: [.commaSeparatedText, .plainText]) { r in
                 if case .success(let url) = r, url.startAccessingSecurityScopedResource() {
                     defer { url.stopAccessingSecurityScopedResource() }
@@ -4613,12 +4704,7 @@ struct VaultView: View {
             Button { editing = l } label: { Label("Edit", systemImage: "pencil") }
             Button { PasswordTools.copy(l.user) } label: { Label("Copy Username", systemImage: "person") }
             Button { PasswordTools.copy(l.pass) } label: { Label("Copy Password", systemImage: "key") }
-            Button(role: .destructive) {
-                Task {
-                    guard await Vault.confirm("Delete the login for \(Sites.clean(l.site))") else { return }
-                    withAnimation { vault.deleteLogin(l.id) }
-                }
-            } label: { Label("Delete…", systemImage: "trash") }
+            Button(role: .destructive) { deleting = .login(l) } label: { Label("Delete…", systemImage: "trash") }
         }
     }
 
@@ -4657,12 +4743,7 @@ struct VaultView: View {
         .contentShape(Rectangle())
         .contextMenu {
             Button { PasswordTools.copy(c.number) } label: { Label("Copy Card Number", systemImage: "creditcard") }
-            Button(role: .destructive) {
-                Task {
-                    guard await Vault.confirm("Delete this card") else { return }
-                    withAnimation { vault.deleteCard(c.id) }
-                }
-            } label: { Label("Delete…", systemImage: "trash") }
+            Button(role: .destructive) { deleting = .card(c) } label: { Label("Delete…", systemImage: "trash") }
         }
     }
 }
@@ -4676,6 +4757,7 @@ struct LoginEditor: View {
     @Environment(\.dismiss) private var dismiss
     @State private var show = false
     @State private var checking = false
+    @State private var askDelete = false
 
     init(login: Login, isNew: Bool, save: @escaping (Login) -> Void, delete: @escaping (UUID) -> Void) {
         _login = State(initialValue: login)
@@ -4741,13 +4823,7 @@ struct LoginEditor: View {
                 }
                 if !isNew {
                     Section {
-                        Button(role: .destructive) {
-                            Task {
-                                guard await Vault.confirm("Delete the login for \(Sites.clean(original.site))") else { return }
-                                delete(login.id)
-                                dismiss()
-                            }
-                        } label: {
+                        Button(role: .destructive) { askDelete = true } label: {
                             Label("Delete Login", systemImage: "trash")
                         }
                     } footer: {
@@ -4755,6 +4831,18 @@ struct LoginEditor: View {
                             .font(.footnote)
                     }
                 }
+            }
+            .alert("Delete permanently?", isPresented: $askDelete) {
+                Button("Delete", role: .destructive) {
+                    Task {
+                        guard await Vault.confirm("Delete the login for \(Sites.clean(original.site))") else { return }
+                        delete(login.id)
+                        dismiss()
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("This login will be removed from this iPhone. It can't be undone. You'll confirm with Face ID next.")
             }
             .navigationTitle(isNew ? "New Login" : "Edit Login")
             .navigationBarTitleDisplayMode(.inline)
@@ -4849,9 +4937,10 @@ struct ContentView: View {
     @State private var chooseList: [Login] = []
     @AppStorage("autoFillPrompt") private var autoPrompt = true
     @AppStorage("autoSavePasswords") private var autoSave = false
-    @AppStorage("showIsland") private var showIsland = true
+    @AppStorage("showIsland") private var showIsland = false
     @AppStorage("splitEnabled") private var splitEnabled = true
     @AppStorage("barPosition") private var barPosition = "bottom"
+    @AppStorage("minimalBar") private var minimalBar = true
     @AppStorage("appIconName") private var appIconName = ""
     @Environment(\.colorScheme) private var envScheme
     @State private var toast: String?
@@ -4952,6 +5041,7 @@ struct ContentView: View {
         .onChange(of: shields.version) { _, _ in applyShields() }
         .onChange(of: blockOn) { _, _ in shields.masterChanged() }
         .onChange(of: saver) { _, _ in applySaver() }
+        .onChange(of: minimalBar) { _, _ in applySaver() }
         .onChange(of: splitEnabled) { _, on in
             if !on && tabs.split { withAnimation(anim(.snappy)) { tabs.closeSplit(keep: 0) } }
         }
@@ -5185,6 +5275,8 @@ struct ContentView: View {
 
     private func applySaver() {
         UIView.setAnimationsEnabled(!saver)   // also stops UIKit animations: sheets, menus, scrolling bounces
+        Pane.minimizeBars = !saver && UserDefaults.standard.object(forKey: "minimalBar") as? Bool ?? true
+        if !Pane.minimizeBars { tabs.allLive.forEach { if $0.collapsed { $0.collapsed = false } } }
         Pane.fps = saver ? 30 : 0
         tabs.maxLive = saver ? 2 : 4
         tabs.allLive.forEach { $0.applyFPS() }
