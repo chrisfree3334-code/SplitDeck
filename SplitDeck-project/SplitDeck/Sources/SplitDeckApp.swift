@@ -16,13 +16,16 @@ import PhotosUI
 @main
 struct SplitDeckApp: App {
     init() {
-        // 1.2 ships with a solid address bar and the split view button in the bar (island off).
-        // Applied once on upgrade; your own changes after that are kept.
+        // Defaults applied once on upgrade; your own changes after that are kept.
+        // 1.2: split view button in the bar (island off). 1.3: transparent (glass) bars.
         let d = UserDefaults.standard
         if !d.bool(forKey: "defaults-1.2") {
             d.set(false, forKey: "showIsland")
-            d.set(1, forKey: "barStyle")
             d.set(true, forKey: "defaults-1.2")
+        }
+        if !d.bool(forKey: "defaults-1.3") {
+            d.set(0, forKey: "barStyle")
+            d.set(true, forKey: "defaults-1.3")
         }
     }
     var body: some Scene { WindowGroup { ContentView() } }
@@ -109,7 +112,7 @@ struct BarCoverKey: PreferenceKey {
     }
 }
 
-// Bar surface: a solid colour (default) or Liquid Glass. Split view bars are always solid.
+// Bar surface: Liquid Glass (default) or a solid colour.
 // `rim` draws a thin outline in the theme's accent so the bar reads as one piece.
 struct SDSurface: ViewModifier {
     let shape: AnyShape
@@ -117,7 +120,7 @@ struct SDSurface: ViewModifier {
     var clear = false
     var solid = false
     var rim = false
-    @AppStorage("barStyle") private var style = 1
+    @AppStorage("barStyle") private var style = 0
     @AppStorage("barColor") private var colorName = "System"
     @Environment(\.colorScheme) private var scheme
     @Environment(\.sdTheme) private var theme
@@ -829,6 +832,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     let webView: WKWebView
     @Published var address = ""
     @Published var collapsed = false
+    @Published var tucked = false      // split view bar swiped into a thin pill
     @Published var canBack = false
     @Published var canForward = false
     @Published var host = ""
@@ -2904,9 +2908,6 @@ struct PaneView: View {
     @Environment(\.sdTheme) private var theme
     @Environment(\.scenePhase) private var phase
 
-
-    private func stripBackground(top: Bool) -> some View { stripColor }
-
     @State private var desktop = false
     @State private var cover = BarCover()
     @StateObject private var live = LiveSuggest()
@@ -2918,21 +2919,17 @@ struct PaneView: View {
     }
     // Never in Battery Saver, and only with the minimal bar switched on.
     private var mini: Bool { minimalBar && !saver && pane.collapsed && !focused && !pane.isHome }
+    // Split view: the bar swiped away into a thin pill. Stays that way until you touch it.
+    private var thin: Bool { compact && pane.tucked && !focused && !pane.isHome && !pane.hiding }
     private var showEnds: Bool { !mini && !focused }
-    private var pillH: CGFloat { compact ? 26 : 38 }
-    // Full screen: the bar floats over the page instead of sitting in a strip beside it.
-    private var floating: Bool { !compact }
+    private var pillH: CGFloat { compact ? 26 : 40 }
+    // The bar floats over the page instead of sitting in a strip beside it (full screen and split view).
+    private var floating: Bool { true }
     // Full-screen layout choice; split view always uses the slim two-tone bar.
     private var layoutStyle: String { compact ? "twoTone" : barLayout }
     private var tinted: Bool { layoutStyle == "twoTone" }
     private var toolbarLayout: Bool { layoutStyle == "toolbar" }
     private var showToolbar: Bool { toolbarLayout && !mini && !focused && !pane.hiding }
-    // The bottom strip takes the page's own colour so it blends in; the top strip matches the status bar.
-    private var stripColor: Color {
-        if pane.isPrivate { return Color(red: 0.14, green: 0.10, blue: 0.23) }
-        if searching { return atTop ? theme.top : theme.bottom }   // blends into the search screen's gradient
-        return pane.isHome || atTop ? theme.strip : (pane.bottomColor ?? theme.strip)
-    }
     // The full-screen search screen is up: the bar follows the theme, not the page behind it.
     private var searching: Bool { focused && !compact }
     // Whether the bar surface is dark. Adaptive: follows the page so text stays readable.
@@ -2940,7 +2937,7 @@ struct PaneView: View {
     private var dark: Bool {
         if pane.isPrivate { return true }
         if !adaptiveText { return TextColors.isLight(textColor) ?? (sys == .dark) }
-        if pane.isHome || searching || (atTop && compact) { return sys == .dark }
+        if pane.isHome || searching { return sys == .dark }
         if atTop { return pane.topDark ?? pane.pageDark ?? (sys == .dark) }
         return pane.pageDark ?? (sys == .dark)
     }
@@ -2949,7 +2946,7 @@ struct PaneView: View {
     // The bar folding into its pill: no bounce, a soft finish, like Safari.
     private var shrink: Animation? { saver ? nil : .spring(response: 0.42, dampingFraction: 0.9) }
     @Namespace private var ns
-    private var barH: CGFloat { compact ? 36 : 54 }
+    private var barH: CGFloat { compact ? 36 : 60 }
 
     // Tinted ends of the two-tone bar: the buttons sit on tinted glass, the address on clear glass.
     private var endTint: Color {
@@ -2962,7 +2959,7 @@ struct PaneView: View {
     // ⋯ menu or share sheet (it checks again a little later instead).
     private static let idle: Double = 8
     private func scheduleCollapse(after delay: Double) {
-        guard minimalBar, !saver, !(atTop && compact), !pane.isHome else { return }
+        guard minimalBar, !saver, !pane.isHome else { return }
         let token = UUID()
         collapseToken = token
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
@@ -2981,7 +2978,18 @@ struct PaneView: View {
         pane.expandBar()
         touched()
     }
-    private var iconW: CGFloat { compact ? 32 : 44 }
+    private func tuck() {
+        guard compact, !focused, !pane.isHome, !pane.tucked else { return }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        pane.tucked = true
+    }
+    private func untuck() {
+        guard pane.tucked else { return }
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        pane.tucked = false
+        expand()
+    }
+    private var iconW: CGFloat { compact ? 32 : 46 }
 
     // Shows just the site name until you tap in, then the full address.
     private var addressText: Binding<String> {
@@ -3037,67 +3045,56 @@ struct PaneView: View {
         .transition(.opacity.combined(with: .move(edge: atTop ? .top : .bottom)))
     }
 
-    private var bottomPad: CGFloat {
-        if focused { return 8 }
-        if mini { return max(bottomInset - 14, 6) }
-        return max(bottomInset - (compact ? 10 : 4), compact ? 8 : 10)
-    }
-
-    // Full screen: the page runs underneath the floating bar, scrolling clear of it.
-    // Split view: each page sits between slim strips.
+    // The page runs underneath the floating bar, scrolling clear of it.
     private var stack: some View {
-        VStack(spacing: 0) {
-            if atTop && !floating { topRow }
-            ZStack {
-                WebHost(webView: pane.webView)
-                    .opacity(pane.isHome ? 0 : 1)
-                if pane.isHome {
-                    Group {
-                        if pane.isPrivate {
-                            PrivateStartPage(leave: actions.exitPrivate)
-                        } else {
-                            StartPage(sites: sites, blocked: actions.totalBlocked) { pane.load($0) }
-                        }
+        ZStack {
+            WebHost(webView: pane.webView)
+                .opacity(pane.isHome ? 0 : 1)
+            if pane.isHome {
+                Group {
+                    if pane.isPrivate {
+                        PrivateStartPage(leave: actions.exitPrivate)
+                    } else {
+                        StartPage(sites: sites, blocked: actions.totalBlocked) { pane.load($0) }
                     }
-                    .safeAreaPadding(.top, cover.top)
-                    .safeAreaPadding(.bottom, cover.bottom)
                 }
-                if focused && !compact {
-                    FocusSplash(sites: sites, history: history,
-                                query: pane.address == pane.webView.url?.absoluteString ? "" : pane.address,
-                                isPrivate: pane.isPrivate) { value in
-                        focused = false
-                        pane.load(value)
-                    }
-                    .safeAreaPadding(.top, cover.top)
-                    .safeAreaPadding(.bottom, cover.bottom)
-                    .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: atTop ? .top : .bottom)))
-                } else if focused {
-                    Color.black.opacity(0.001)
-                        .contentShape(Rectangle())
-                        .onTapGesture { focused = false }
-                        .gesture(DragGesture(minimumDistance: 8).onEnded { v in
-                            if v.translation.height > 16 { focused = false }
-                        })
+                .safeAreaPadding(.top, cover.top)
+                .safeAreaPadding(.bottom, cover.bottom)
+            }
+            if focused && !compact {
+                FocusSplash(sites: sites, history: history,
+                            query: pane.address == pane.webView.url?.absoluteString ? "" : pane.address,
+                            isPrivate: pane.isPrivate) { value in
+                    focused = false
+                    pane.load(value)
                 }
+                .safeAreaPadding(.top, cover.top)
+                .safeAreaPadding(.bottom, cover.bottom)
+                .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: atTop ? .top : .bottom)))
+            } else if focused {
+                Color.black.opacity(0.001)
+                    .contentShape(Rectangle())
+                    .onTapGesture { focused = false }
+                    .gesture(DragGesture(minimumDistance: 8).onEnded { v in
+                        if v.translation.height > 16 { focused = false }
+                    })
             }
-            .clipped()
-            .overlay(alignment: atTop ? .top : .bottom) {
-                if floating { AnyView(floatingBar) }
+        }
+        .clipped()
+        .overlay(alignment: atTop ? .top : .bottom) {
+            if floating { AnyView(floatingBar) }
+        }
+        // Split view: suggestions sit over the page, just above (or below) the bar; the page keeps its size.
+        .overlay(alignment: atTop ? .top : .bottom) {
+            if compact && !suggestions.isEmpty {
+                AnyView(suggestionList
+                    .environment(\.colorScheme, dark ? .dark : .light)
+                    .padding(.horizontal, 12)
+                    .padding(atTop ? .top : .bottom, (atTop ? cover.top : cover.bottom) + 4))
             }
-            // Split view: suggestions sit over the page, just above (or below) the bar; the page keeps its size.
-            .overlay(alignment: atTop ? .top : .bottom) {
-                if compact && !suggestions.isEmpty {
-                    AnyView(suggestionList
-                        .environment(\.colorScheme, dark ? .dark : .light)
-                        .padding(.horizontal, 12)
-                        .padding(atTop ? .top : .bottom, 8))
-                }
-            }
-            .overlay(alignment: .bottom) {
-                if floating && atTop && showToolbar { floatingToolbar }
-            }
-            if !atTop && !floating { bottomRow }
+        }
+        .overlay(alignment: .bottom) {
+            if floating && atTop && showToolbar { floatingToolbar }
         }
     }
 
@@ -3116,6 +3113,7 @@ struct PaneView: View {
             }
         }
         .animation(shrink, value: mini)
+        .animation(shrink, value: thin)
         .animation(spring, value: focused)
         .animation(spring, value: pane.hiding)
         .animation(spring, value: suggestions.count)
@@ -3134,38 +3132,6 @@ struct PaneView: View {
                 }
             }
         }
-    }
-
-    private var topRow: some View {
-        VStack(spacing: 6) {
-            bar.frame(height: barH)
-        }
-        .environment(\.colorScheme, dark ? .dark : .light)
-        .padding(.leading, 12)
-        .padding(.trailing, 12)
-        .padding(.top, safeTop + 4)
-        .padding(.bottom, 4)
-        .frame(maxWidth: .infinity)
-        .background(stripBackground(top: true))
-    }
-
-    private var bottomRow: some View {
-        VStack(spacing: 8) {
-            bar
-            if showToolbar {
-                toolbar.transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-        }
-        .environment(\.colorScheme, dark ? .dark : .light)
-        .padding(.horizontal, 12)
-        .padding(.top, mini ? 4 : (compact ? 6 : 8))
-        .padding(.bottom, bottomPad)
-        .frame(maxWidth: .infinity)
-        .background(stripBackground(top: false))
-        .simultaneousGesture(DragGesture(minimumDistance: 12).onEnded { v in
-            if focused && v.translation.height > 20 { focused = false }
-        })
-        .animation(saver ? nil : .easeInOut(duration: 0.25), value: dark)
     }
 
     // Split view toggle, shown in the bar when the edge island is switched off.
@@ -3265,8 +3231,9 @@ struct PaneView: View {
 
     private var floatPad: CGFloat {
         if focused { return 8 }
+        if thin { return max(bottomInset - 6, 4) }
         if mini { return max(bottomInset - 12, 6) }
-        return max(bottomInset - 8, 10)
+        return max(bottomInset - 8, compact ? 8 : 10)
     }
 
     // Full screen: the bar (and toolbar) float over the page with the page showing around them.
@@ -3278,15 +3245,21 @@ struct PaneView: View {
             }
         }
         .environment(\.colorScheme, dark ? .dark : .light)
-        .padding(.horizontal, 12)
-        .padding(.top, atTop ? 6 : 0)
+        .padding(.horizontal, compact ? 8 : 12)
+        .padding(.top, atTop ? (compact ? (thin ? 2 : 6) : 6) : 0)
         .padding(.bottom, atTop ? 0 : floatPad)
         .background(GeometryReader { g in
-            Color.clear.preference(key: BarCoverKey.self,
-                                   value: atTop ? BarCover(top: g.size.height + 4) : BarCover(bottom: g.size.height + 4))
+            // A thin pill barely covers the page, so the page gets almost all of its space back.
+            let h = thin ? 8 : g.size.height + 4
+            Color.clear.preference(key: BarCoverKey.self, value: atTop ? BarCover(top: h) : BarCover(bottom: h))
         })
         .simultaneousGesture(DragGesture(minimumDistance: 12).onEnded { v in
-            if focused && v.translation.height > 20 { focused = false }
+            let dy = v.translation.height
+            if focused { if dy > 20 { focused = false }; return }
+            // Split view: swipe the bar towards its edge to tuck it into a thin pill, swipe back to bring it out.
+            guard compact, abs(dy) > abs(v.translation.width), abs(dy) > 14 else { return }
+            let away = atTop ? dy < 0 : dy > 0
+            if away { tuck() } else { untuck() }
         })
         .animation(saver ? nil : .easeInOut(duration: 0.25), value: dark)
     }
@@ -3318,7 +3291,25 @@ struct PaneView: View {
     }
 
     @ViewBuilder private var bar: some View {
-        if pane.hiding { hidingBar } else { mainBar }
+        if pane.hiding { hidingBar } else if thin { thinPill } else { mainBar }
+    }
+
+    // Split view: the bar tucked away into a thin pill. A tap, or a swipe back out, brings it back.
+    // The touch area is much bigger than the pill so it's easy to hit.
+    private var thinPill: some View {
+        Capsule()
+            .fill(dark ? Color.white.opacity(0.9) : Color.black.opacity(0.72))
+            .overlay(Capsule().stroke(theme.accent.muted().opacity(0.6), lineWidth: 1))
+            .frame(width: 48, height: 6)
+            .shadow(color: .black.opacity(0.22), radius: 3, y: 1)
+            .matchedGeometryEffect(id: "bar", in: ns)
+            .frame(width: 150, height: 26)
+            .contentShape(Rectangle())
+            .onTapGesture { untuck() }
+            .accessibilityElement()
+            .accessibilityLabel("Show address bar")
+            .accessibilityAddTraits(.isButton)
+            .transition(.opacity)
     }
 
     private var hidingBar: some View {
@@ -3340,7 +3331,7 @@ struct PaneView: View {
             .padding(.trailing, 6)
         }
         .frame(height: barH)
-        .sdGlass(Capsule(), dark: dark, solid: compact, rim: true)
+        .sdGlass(Capsule(), dark: dark, rim: true)
         .matchedGeometryEffect(id: "bar", in: ns)
         .transition(.opacity)
     }
@@ -3461,7 +3452,7 @@ struct PaneView: View {
         .padding(.horizontal, mini ? (compact ? 12 : 18) : 0)
         .frame(height: mini ? pillH : barH)
         .frame(maxWidth: mini ? nil : .infinity)
-        .sdGlass(Capsule(), dark: dark, clear: tinted || floating, solid: compact, rim: true)
+        .sdGlass(Capsule(), dark: dark, clear: tinted || floating, rim: true)
         .contentShape(Capsule())
         .gesture(TapGesture().onEnded { expand() }, including: mini ? .all : .subviews)
         .accessibilityAddTraits(mini ? .isButton : [])
@@ -4947,7 +4938,7 @@ struct SettingsView: View {
     @AppStorage("liveSuggest") private var liveSuggest = true
     @AppStorage("saver") private var saver = false
     @AppStorage("homeMode") private var homeMode = 0
-    @AppStorage("barStyle") private var barStyle = 1
+    @AppStorage("barStyle") private var barStyle = 0
     @AppStorage("barColor") private var barColor = "System"
     @AppStorage("adaptiveText") private var adaptiveText = true
     @AppStorage("textColor") private var textColor = "System"
@@ -7088,11 +7079,8 @@ struct ContentView: View {
         GeometryReader { root in
             let safe = insets
             let portrait = root.size.height >= root.size.width
-            let topOwnStrip = tabs.split && portrait   // the top pane draws its own strip under the status bar
             VStack(spacing: 0) {
-                if !topOwnStrip {
-                    TopStrip(pane: tabs.pane(tabs.left), safeTop: safe.top)
-                }
+                TopStrip(pane: tabs.pane(tabs.left), safeTop: safe.top)
                 deck(portrait: portrait, safe: safe)
             }
             .onChange(of: root.size) { _, _ in refreshInsets() }
@@ -7177,9 +7165,9 @@ struct ContentView: View {
                 if tabs.split {
                     let layout = horizontal ? AnyLayout(HStackLayout(spacing: gap)) : AnyLayout(VStackLayout(spacing: gap))
                     layout {
-                        // Portrait: top pane's bar sits in a strip at the top beside the tab pill, bottom pane's at the bottom.
-                        // Landscape: both slim bars sit at the bottom of their side.
-                        paneView(tabs.left, slot: 0, compact: true, atTop: portrait, safeTop: safe.top,
+                        // Portrait: the top pane's bar floats at its top, the bottom pane's at the bottom.
+                        // Landscape: both slim bars float at the bottom of their side.
+                        paneView(tabs.left, slot: 0, compact: true, atTop: portrait,
                                  bottomInset: horizontal ? safe.bottom : 0)
                             .frame(width: horizontal ? firstSize : nil, height: horizontal ? nil : firstSize)
                         paneView(tabs.right, slot: 1, compact: true, bottomInset: safe.bottom)
