@@ -241,9 +241,8 @@ enum Rules {
              "action": ["type": "block"]]
         }
         // YouTube serves ads from its own domain, so these are matched by path instead of by host.
-        for path in ["youtube\\.com/api/stats/ads", "youtube\\.com/pagead/", "youtube\\.com/ptracking",
-                     "youtube\\.com/get_midroll_", "youtube\\.com/api/stats/qoe\\?.*adformat",
-                     "youtube\\.com/youtubei/v1/log_event"] {
+        for path in ["youtube\\.com/api/stats/ads", "youtube\\.com/pagead/",
+                     "youtube\\.com/get_midroll_", "youtube\\.com/api/stats/qoe\\?.*adformat"] {
             rules.append(["trigger": ["url-filter": path], "action": ["type": "block"]])
         }
         rules.append(["trigger": ["url-filter": ".*"],
@@ -255,7 +254,7 @@ enum Rules {
         return try? await store.compileContentRuleList(forIdentifier: "sd2", encodedContentRuleList: s)
     }
 
-    static let decline = "(function(){var s=['#onetrust-reject-all-handler','#CybotCookiebotDialogBodyButtonDecline','#didomi-notice-disagree-button','.fc-cta-do-not-consent','button.cc-deny','[data-testid=reject-all]','[aria-label=\"Reject all\"]','.js-reject-cookies'];var n=0;var t=setInterval(function(){s.forEach(function(x){var b=document.querySelector(x);if(b)b.click()});if(++n>20)clearInterval(t)},500)})();"
+    static let decline = "(function(){if(/(^|\\.)(accounts|consent)\\.(google|youtube)\\.[a-z.]+$/.test(location.hostname))return;var s=['#onetrust-reject-all-handler','#CybotCookiebotDialogBodyButtonDecline','#didomi-notice-disagree-button','.fc-cta-do-not-consent','button.cc-deny','[data-testid=reject-all]','[aria-label=\"Reject all\"]','.js-reject-cookies'];var n=0;var t=setInterval(function(){s.forEach(function(x){var b=document.querySelector(x);if(b)b.click()});if(++n>20)clearInterval(t)},500)})();"
 
     static let capture = "document.addEventListener('submit',function(e){var f=e.target;var p=f.querySelector('input[type=password]');if(!p||!p.value)return;var u=f.querySelector('input[type=email],input[type=text],input[autocomplete=username]');window.webkit.messageHandlers.cred.postMessage({site:location.origin,user:u?u.value:'',pass:p.value})},true);"
 
@@ -724,7 +723,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         config.allowsPictureInPictureMediaPlayback = true
         config.upgradeKnownHostsToHTTPS = true
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
-        config.applicationNameForUserAgent = "Version/18.0 Mobile/15E148 Safari/604.1"
+        config.applicationNameForUserAgent = "Version/\(ProcessInfo.processInfo.operatingSystemVersion.majorVersion).0 Mobile/15E148 Safari/604.1"
         Pane.installScripts(config.userContentController, youtube: false)
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.allowsBackForwardNavigationGestures = true
@@ -2241,7 +2240,6 @@ struct PaneView: View {
     @Environment(\.sdTheme) private var theme
     @Environment(\.scenePhase) private var phase
 
-    private var ambientActive: Bool { ambientMode && !saver && !pane.isPrivate && !pane.isHome }
 
     private var ambientActive: Bool { ambientMode && !saver && !pane.isPrivate && !pane.isHome }
 
@@ -2273,25 +2271,6 @@ struct PaneView: View {
         }
     }
 
-    // Ambient: the strip shows a blurred, saturated slice of the page edge it touches, so light seems to spill out.
-    @ViewBuilder private func stripBackground(top: Bool) -> some View {
-        if ambientActive, let img = pane.ambient {
-            GeometryReader { g in
-                Image(uiImage: img)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: g.size.width, height: max(g.size.height * 3, 140), alignment: top ? .top : .bottom)
-                    .frame(width: g.size.width, height: g.size.height, alignment: top ? .top : .bottom)
-                    .blur(radius: 22, opaque: true)
-                    .saturation(1.5)
-                    .clipped()
-            }
-            .overlay(stripColor.opacity(0.2))
-            .animation(.easeInOut(duration: 0.5), value: img)
-        } else {
-            stripColor
-        }
-    }
     @State private var desktop = false
     @FocusState private var focused: Bool
 
