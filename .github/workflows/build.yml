@@ -21,6 +21,8 @@ jobs:
         run: |
           swiftc -swift-version 5 -O ../../tools/validate_blocklists.swift -o validate_blocklists
           ls Sources/Blocklists/sd-*.json >/dev/null 2>&1 && ./validate_blocklists Sources/Blocklists/sd-*.json || echo "No lists to check"
+      - name: Compress lists
+        run: python3 ../../tools/compress_blocklists.py Sources/Blocklists
       - name: Generate Xcode project
         run: xcodegen generate
       - name: Build (unsigned)
@@ -33,7 +35,10 @@ jobs:
           mkdir Payload
           cp -R build/Build/Products/Release-iphoneos/SplitDeck.app Payload/
           codesign -f -s - --entitlements Sources/SplitDeck.entitlements Payload/SplitDeck.app
-          zip -r SplitDeck.ipa Payload
+          zip -qr SplitDeck.ipa Payload
+          # Size report, shown as notes on the run.
+          echo "::notice title=App size::$(du -sk Payload/SplitDeck.app | cut -f1) KB installed, $(du -sk SplitDeck.ipa | cut -f1) KB download"
+          find Payload/SplitDeck.app -type f -size +200k -exec du -k {} + | sort -rn | head -8 | while read k f; do echo "::notice title=Large file::${k} KB ${f#Payload/SplitDeck.app/}"; done
       - uses: actions/upload-artifact@v4
         with:
           name: SplitDeck-ipa

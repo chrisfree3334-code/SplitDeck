@@ -359,17 +359,6 @@ final class Vault: ObservableObject {
         return ok
     }
 
-    // Same site and username: update the password; otherwise add a new login.
-    func upsert(_ l: Login) {
-        let h = Sites.clean(l.site)
-        if let i = logins.firstIndex(where: { Sites.clean($0.site) == h && $0.user == l.user }) {
-            logins[i].pass = l.pass
-        } else {
-            logins.append(l)
-        }
-        save()
-    }
-
     func update(_ l: Login) {
         if let i = logins.firstIndex(where: { $0.id == l.id }) { logins[i] = l } else { logins.append(l) }
         save()
@@ -384,14 +373,6 @@ final class Vault: ObservableObject {
         return Set(counts.filter { $0.value > 1 }.keys)
     }
 
-    func match(host: String) -> [Login] {
-        let h = host.replacingOccurrences(of: "www.", with: "")
-        return logins.filter { l in
-            let s = l.site.contains("://") ? l.site : "https://" + l.site
-            let lh = (URL(string: s)?.host ?? "").replacingOccurrences(of: "www.", with: "")
-            return !lh.isEmpty && (lh == h || h.hasSuffix("." + lh))
-        }
-    }
 
     func parseCSV(_ s: String) -> [[String]] {
         var rows: [[String]] = [], row: [String] = [], f = "", quoted = false
@@ -458,7 +439,6 @@ enum Rules {
 
     static let decline = "(function(){if(/(^|\\.)(accounts|consent)\\.(google|youtube)\\.[a-z.]+$/.test(location.hostname))return;var s=['#onetrust-reject-all-handler','#CybotCookiebotDialogBodyButtonDecline','#didomi-notice-disagree-button','.fc-cta-do-not-consent','button.cc-deny','[data-testid=reject-all]','[aria-label=\"Reject all\"]','.js-reject-cookies'];var n=0;var t=setInterval(function(){s.forEach(function(x){var b=document.querySelector(x);if(b)b.click()});if(++n>20)clearInterval(t)},500)})();"
 
-    static let capture = "document.addEventListener('submit',function(e){var f=e.target;var p=f.querySelector('input[type=password]');if(!p||!p.value)return;var u=f.querySelector('input[type=email],input[type=text],input[autocomplete=username]');window.webkit.messageHandlers.cred.postMessage({site:location.origin,user:u?u.value:'',pass:p.value})},true);"
 
     // Runs before YouTube's own code: strips ad data from the player's settings, hides ad slots,
     // and as a last resort mutes and skips any ad that still starts.
@@ -838,8 +818,6 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     let webView: WKWebView
     @Published var address = ""
     @Published var collapsed = false
-    @Published var hasLogin = false
-    @Published var hasCard = false
     @Published var canBack = false
     @Published var canForward = false
     @Published var host = ""
@@ -865,12 +843,9 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     @Published var canUndoHide = false
     private var lastHidden: String?
     private var hiddenSels: [String] = []
-    @Published var offerFill = false
-    var onLoginField: (() -> Void)?
     var onPageLoaded: ((URL, String) -> Void)?
     var onSearch: ((String) -> Void)?
     var editing = false
-    var onCredential: ((Login) -> Void)?
     var onVisit: ((String) -> Void)?
     var onChange: (() -> Void)?
     static var fps = 0
@@ -897,7 +872,6 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     private var tintPending = false
     // Off in Battery Saver, or with the minimal bar switched off: the bar never shrinks.
     static var minimizeBars = true
-    static let setJS = "function S(e,v){Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,v);e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}))}"
     // Safari-style "Hide Distracting Items": tap an element to fade it out and remember it for this site.
     static let hideStartJS = "(function(){if(window.__sdHiding)return;window.__sdHiding=true;var cur=null;function sel(e){var p=[];while(e&&e.nodeType===1&&e!==document.body&&e!==document.documentElement){if(e.id&&!/\\d{3,}/.test(e.id)){p.unshift('#'+CSS.escape(e.id));return p.join('>')}var i=1,x=e;while((x=x.previousElementSibling))if(x.tagName===e.tagName)i++;p.unshift(e.tagName.toLowerCase()+':nth-of-type('+i+')');e=e.parentElement}return 'body>'+p.join('>')}function pick(e){var r;while(e&&e!==document.body){r=e.getBoundingClientRect();if(r.width*r.height>2500)break;e=e.parentElement}if(!e||e===document.body||e===document.documentElement)return null;r=e.getBoundingClientRect();if(r.width>=innerWidth*0.98&&r.height>=innerHeight*0.9)return null;return e}function mark(e){if(cur){cur.style.outline=cur.__sdO||'';cur.style.outlineOffset=''}cur=e;if(e){e.__sdO=e.style.outline;e.style.outline='3px solid rgba(10,132,255,.9)';e.style.outlineOffset='-3px'}}window.__sdMark=mark;window.__sdDown=function(ev){mark(pick(ev.target))};window.__sdClick=function(ev){ev.preventDefault();ev.stopPropagation();ev.stopImmediatePropagation();var e=pick(ev.target);mark(null);if(!e)return;var s=sel(e);e.style.transition='opacity .25s ease,transform .25s ease';e.style.opacity='0';e.style.transform='scale(.94)';setTimeout(function(){e.style.setProperty('display','none','important')},260);window.webkit.messageHandlers.hide.postMessage(s)};document.addEventListener('pointerdown',window.__sdDown,true);document.addEventListener('click',window.__sdClick,true)})()"
     static let hideStopJS = "(function(){window.__sdHiding=false;if(window.__sdMark)window.__sdMark(null);document.removeEventListener('pointerdown',window.__sdDown,true);document.removeEventListener('click',window.__sdClick,true)})()"
@@ -927,7 +901,6 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         super.init()
         wv.navigationDelegate = self
         wv.uiDelegate = self
-        config.userContentController.add(WeakHandler(self), name: "cred")
         config.userContentController.add(WeakHandler(self), name: "hide")
         obs = wv.scrollView.observe(\.contentOffset, options: [.new]) { [weak self] sv, _ in
             guard let self else { return }
@@ -989,15 +962,12 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
 
     func goHome() {
         if hiding { stopHiding() }
-        offerFill = false
         webView.evaluateJavaScript("document.querySelectorAll('video,audio').forEach(function(m){m.pause()})")
         isHome = true
         collapsed = false
         if !editing { address = "" }
         title = ""
         host = ""
-        hasLogin = false
-        hasCard = false
         onChange?()
     }
 
@@ -1030,14 +1000,6 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         webView.stopLoading()
         webView.configuration.userContentController.removeAllScriptMessageHandlers()
         webView.removeFromSuperview()
-    }
-
-    func fill(login l: Login) {
-        webView.evaluateJavaScript("(function(u,p){\(Pane.setJS)var w=document.querySelector('input[type=password]');if(!w)return;var f=w.form||document;var e=f.querySelector('input[type=email],input[type=text],input[autocomplete=username]');if(e)S(e,u);S(w,p)})(\(q(l.user)),\(q(l.pass)))")
-    }
-
-    func fill(card c: Card) {
-        webView.evaluateJavaScript("(function(c){\(Pane.setJS)[['cc-number',c[0]],['cc-name',c[1]],['cc-exp',c[2]],['cc-csc',c[3]]].forEach(function(x){var e=document.querySelector('[autocomplete='+x[0]+']');if(e)S(e,x[1])})})([\(q(c.number)),\(q(c.name)),\(q(c.exp)),\(q(c.cvc))])")
     }
 
     func startHiding() {
@@ -1197,10 +1159,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             hiddenCount = hiddenSels.count
             lastHidden = sel
             canUndoHide = true
-            return
         }
-        guard !isPrivate, let d = m.body as? [String: String], let p = d["pass"], !p.isEmpty else { return }
-        onCredential?(Login(site: d["site"] ?? "", user: d["user"] ?? "", pass: p))
     }
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
@@ -1251,7 +1210,6 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         hiddenSels = []
         hiddenCount = 0
         lastHidden = nil
-        offerFill = false
         refreshMeta()
     }
 
@@ -1263,7 +1221,9 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             if let u = webView.url { onPageLoaded?(u, webView.title ?? "") }
         }
         onChange?()
-        if Translate.offer { detectLanguage() }
+        if Translate.offer {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.detectLanguage() }
+        }
         // Logins and cards on pages are filled by iOS AutoFill (Passwords app), not by SplitDeck.
     }
 
@@ -1469,18 +1429,22 @@ final class Tabs: ObservableObject {
         guard !p.isHome, p.webView.window != nil, p.webView.bounds.width > 0 else { return }
         let cfg = WKSnapshotConfiguration()
         cfg.snapshotWidth = 220
+        let id = p.id, priv = p.isPrivate
         p.webView.takeSnapshot(with: cfg) { [weak self] img, _ in
-            guard let self, let img else { return }
-            let w: CGFloat = 220
-            let h = min(img.size.height * w / img.size.width, w * 2)
-            let fmt = UIGraphicsImageRendererFormat()
-            fmt.scale = 2
-            let small = UIGraphicsImageRenderer(size: CGSize(width: w, height: h), format: fmt).image { _ in
-                img.draw(in: CGRect(x: 0, y: 0, width: w, height: img.size.height * w / img.size.width))
+            guard let img else { return }
+            DispatchQueue.global(qos: .utility).async {
+                let w: CGFloat = 220
+                let h = min(img.size.height * w / img.size.width, w * 2)
+                let fmt = UIGraphicsImageRendererFormat()
+                fmt.scale = 2
+                fmt.opaque = true
+                let small = UIGraphicsImageRenderer(size: CGSize(width: w, height: h), format: fmt).image { _ in
+                    img.draw(in: CGRect(x: 0, y: 0, width: w, height: img.size.height * w / img.size.width))
+                }
+                let data = priv ? nil : small.jpegData(compressionQuality: 0.7)   // private previews stay in memory only
+                DispatchQueue.main.async { self?.thumbs[id] = small }
+                if let data { try? data.write(to: Tabs.thumbURL(id)) }
             }
-            self.thumbs[p.id] = small
-            guard !p.isPrivate else { return }   // private previews stay in memory only
-            if let d = small.jpegData(compressionQuality: 0.7) { try? d.write(to: Tabs.thumbURL(p.id)) }
         }
     }
 
@@ -1509,6 +1473,12 @@ final class Tabs: ObservableObject {
         list = saved
         left = first
         right = first
+        // Remove previews of tabs that no longer exist.
+        let keep = Set(saved.map { $0.id.uuidString + ".jpg" })
+        DispatchQueue.global(qos: .background).async {
+            let files = (try? FileManager.default.contentsOfDirectory(atPath: Tabs.thumbDir.path)) ?? []
+            for f in files where !keep.contains(f) { try? FileManager.default.removeItem(at: Tabs.thumbDir.appendingPathComponent(f)) }
+        }
     }
 
     var visible: [UUID] { split ? [left, right] : [left] }
@@ -1703,6 +1673,15 @@ struct HistoryItem: Identifiable, Codable, Equatable {
 final class HistoryStore: ObservableObject {
     @Published private(set) var items: [HistoryItem] = []   // newest first
     private var saveWork: DispatchWorkItem?
+    private var indexCache: [(host: String, title: String, item: HistoryItem)]?
+
+    // Lower-cased host and title of recent visits, built once per change for fast suggestions.
+    var searchIndex: [(host: String, title: String, item: HistoryItem)] {
+        if let i = indexCache { return i }
+        let built = items.lazy.filter { !$0.isSearch }.prefix(1500).map { ($0.host.lowercased(), $0.title.lowercased(), $0) }
+        indexCache = Array(built)
+        return indexCache ?? []
+    }
     static let cap = 5000
 
     static let fileURL: URL = {
@@ -1780,6 +1759,7 @@ final class HistoryStore: ObservableObject {
     }
 
     private func trimAndSave() {
+        indexCache = nil
         if items.count > HistoryStore.cap { items.removeLast(items.count - HistoryStore.cap) }
         saveWork?.cancel()
         let snapshot = items
@@ -1830,12 +1810,10 @@ enum Suggest {
             if marks >= 3 { break }
         }
         // Sites: address starting with what you typed first, then title or address containing it.
-        let visits = history.items.lazy.filter { !$0.isSearch }
         var starts: [HistoryItem] = [], contains: [HistoryItem] = []
-        for v in visits.prefix(1500) {
-            let host = v.host.lowercased()
-            if host.hasPrefix(q) { starts.append(v) }
-            else if host.contains(q) || v.title.lowercased().contains(q) { contains.append(v) }
+        for v in history.searchIndex {
+            if v.host.hasPrefix(q) { starts.append(v.item) }
+            else if v.host.contains(q) || v.title.contains(q) { contains.append(v.item) }
             if starts.count >= 6 && contains.count >= 6 { break }
         }
         for v in starts + contains {
@@ -2274,13 +2252,72 @@ final class Sites: ObservableObject {
     func save() { UserDefaults.standard.set(custom, forKey: "mySites") }
 }
 
+// Site icons: fetched once, kept small, cached in memory and on disk, shared by every view showing them.
+final class FaviconCache {
+    static let shared = FaviconCache()
+    private let mem = NSCache<NSString, UIImage>()
+    private var waiting: [String: [(UIImage?) -> Void]] = [:]
+    private var failed = Set<String>()
+    static let dir: URL = {
+        let d = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("favicons")
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }()
+
+    init() { mem.countLimit = 300 }
+
+    func cached(_ host: String) -> UIImage? { mem.object(forKey: host as NSString) }
+
+    func load(_ host: String, done: @escaping (UIImage?) -> Void) {
+        if let i = cached(host) { done(i); return }
+        guard !host.isEmpty, !failed.contains(host) else { done(nil); return }
+        if waiting[host] != nil { waiting[host]?.append(done); return }
+        waiting[host] = [done]
+        let file = FaviconCache.dir.appendingPathComponent(host.replacingOccurrences(of: "/", with: "_") + ".png")
+        DispatchQueue.global(qos: .utility).async {
+            // Disk copies are refreshed after two weeks.
+            if let attrs = try? FileManager.default.attributesOfItem(atPath: file.path),
+               let date = attrs[.modificationDate] as? Date, Date().timeIntervalSince(date) < 14 * 86400,
+               let d = try? Data(contentsOf: file), let img = UIImage(data: d) {
+                self.finish(host, img)
+                return
+            }
+            guard let url = URL(string: "https://icons.duckduckgo.com/ip3/\(host).ico") else { self.finish(host, nil); return }
+            URLSession.shared.dataTask(with: url) { d, r, _ in
+                var img: UIImage?
+                if let d, (r as? HTTPURLResponse)?.statusCode == 200, let i = UIImage(data: d) {
+                    img = i.preparingThumbnail(of: CGSize(width: 64, height: 64)) ?? i
+                    if let png = img?.pngData() { try? png.write(to: file, options: .atomic) }
+                }
+                self.finish(host, img)
+            }.resume()
+        }
+    }
+
+    private func finish(_ host: String, _ img: UIImage?) {
+        DispatchQueue.main.async {
+            if let img { self.mem.setObject(img, forKey: host as NSString) } else { self.failed.insert(host) }
+            (self.waiting.removeValue(forKey: host) ?? []).forEach { $0(img) }
+        }
+    }
+
+    func clear() {
+        mem.removeAllObjects()
+        failed.removeAll()
+        try? FileManager.default.removeItem(at: FaviconCache.dir)
+        try? FileManager.default.createDirectory(at: FaviconCache.dir, withIntermediateDirectories: true)
+    }
+}
+
 struct SiteIcon: View {
     let host: String
     var size: CGFloat = 56
+    @State private var img: UIImage?
+
     var body: some View {
-        AsyncImage(url: URL(string: "https://icons.duckduckgo.com/ip3/\(host).ico")) { phase in
-            if let img = phase.image {
-                img.resizable().scaledToFit().frame(width: size * 0.5, height: size * 0.5)
+        Group {
+            if let i = img ?? FaviconCache.shared.cached(host) {
+                Image(uiImage: i).resizable().interpolation(.high).scaledToFit().frame(width: size * 0.5, height: size * 0.5)
             } else {
                 Text(String(host.prefix(1)).uppercased())
                     .font(.system(size: size * 0.4, weight: .semibold))
@@ -2289,6 +2326,10 @@ struct SiteIcon: View {
         }
         .frame(width: size, height: size)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: size * 0.28, style: .continuous))
+        .task(id: host) {
+            guard img == nil, FaviconCache.shared.cached(host) == nil else { return }
+            FaviconCache.shared.load(host) { img = $0 }
+        }
     }
 }
 
@@ -2523,14 +2564,15 @@ final class Shields: ObservableObject {
             .flatMap { try? String(contentsOf: $0, encoding: .utf8) }?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? "0"
         for l in Shields.lists where isEnabled(l.id) && compiled[l.id] == nil {
-            guard let url = Bundle.main.url(forResource: "sd-" + l.id, withExtension: "json") else { continue }
+            guard Shields.hasList(l.id) else { continue }
             let ident = "sd-\(l.id)-\(ver)"
             if let found = await Shields.lookUp(store, ident) {
                 compiled[l.id] = found
                 version += 1
                 continue
             }
-            let json = await Task.detached(priority: .utility) { try? String(contentsOf: url, encoding: .utf8) }.value
+            let id = l.id
+            let json = await Task.detached(priority: .utility) { Shields.listJSON(id) }.value
             guard let json, json.count > 2 else { continue }
             if let list = try? await store.compileContentRuleList(forIdentifier: ident, encodedContentRuleList: json) {
                 compiled[l.id] = list
@@ -2542,6 +2584,24 @@ final class Shields: ObservableObject {
                 store.removeContentRuleList(forIdentifier: id) { _ in }
             }
         }
+    }
+
+    // Lists ship deflate-compressed (.zz, about a fifth of the size); plain .json still works.
+    static func hasList(_ id: String) -> Bool {
+        Bundle.main.url(forResource: "sd-" + id, withExtension: "zz") != nil
+            || Bundle.main.url(forResource: "sd-" + id, withExtension: "json") != nil
+    }
+
+    static func listJSON(_ id: String) -> String? {
+        if let url = Bundle.main.url(forResource: "sd-" + id, withExtension: "zz"),
+           let d = try? Data(contentsOf: url),
+           let raw = try? (d as NSData).decompressed(using: .zlib) {
+            return String(data: raw as Data, encoding: .utf8)
+        }
+        if let url = Bundle.main.url(forResource: "sd-" + id, withExtension: "json") {
+            return try? String(contentsOf: url, encoding: .utf8)
+        }
+        return nil
     }
 
     private static func lookUp(_ store: WKContentRuleListStore, _ id: String) async -> WKContentRuleList? {
@@ -2677,7 +2737,6 @@ struct ShieldsSettings: View {
 // MARK: Pane view
 
 struct PaneActions {
-    var autofill: () -> Void
     var calendar: () -> Void
     var settings: () -> Void
     var vpn: () -> Void
@@ -4701,13 +4760,11 @@ struct SettingsView: View {
     @AppStorage("engine") private var engine = "DuckDuckGo"
     @AppStorage("saver") private var saver = false
     @AppStorage("homeMode") private var homeMode = 0
-    @AppStorage("autoFillPrompt") private var autoPrompt = true
     @AppStorage("barStyle") private var barStyle = 1
     @AppStorage("barColor") private var barColor = "System"
     @AppStorage("adaptiveText") private var adaptiveText = true
     @AppStorage("textColor") private var textColor = "System"
     @AppStorage("lockPrivate") private var lockPrivate = true
-    @AppStorage("autoSavePasswords") private var autoSave = false
     @AppStorage("showIsland") private var showIsland = false
     @AppStorage("splitEnabled") private var splitEnabled = true
     @AppStorage("minimalBar") private var minimalBar = true
@@ -4895,6 +4952,13 @@ struct SettingsView: View {
                     NavigationLink("Import from Safari or Chrome") {
                         ImportContent(history: history, vault: vault).navigationTitle("Import Browsing Data")
                     }
+                    Button("Clear Cached Files") {
+                        WKWebsiteDataStore.default().removeData(
+                            ofTypes: [WKWebsiteDataTypeDiskCache, WKWebsiteDataTypeMemoryCache, WKWebsiteDataTypeFetchCache],
+                            modifiedSince: .distantPast) {}
+                        FaviconCache.shared.clear()
+                        URLCache.shared.removeAllCachedResponses()
+                    }
                     Button("Default Browser") {
                         if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
                     }
@@ -5008,7 +5072,6 @@ enum VaultDeletion: Identifiable {
 
 struct VaultView: View {
     @ObservedObject var vault: Vault
-    var fill: (Login?, Card?) -> Void
     @AppStorage("appIconName") private var iconName = ""
     @State private var deleting: VaultDeletion?
 
@@ -5816,13 +5879,8 @@ struct ContentView: View {
     @State private var lastTap = Date.distantPast
     @State private var shieldsPane: Pane?
     @State private var sheet: Sheet?
-    @State private var pending: Login?
     @State private var calTitle = ""
     @State private var calURL = ""
-    @State private var choosePane: Pane?
-    @State private var chooseList: [Login] = []
-    @AppStorage("autoFillPrompt") private var autoPrompt = true
-    @AppStorage("autoSavePasswords") private var autoSave = false
     @AppStorage("showIsland") private var showIsland = false
     @AppStorage("splitEnabled") private var splitEnabled = true
     @AppStorage("barPosition") private var barPosition = "bottom"
@@ -5928,21 +5986,6 @@ struct ContentView: View {
                 .presentationDetents([.medium, .large])
                 .preferredColorScheme(appScheme)
                 .tint(activeTheme.accent)
-        }
-        .alert("Save password?", isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } })) {
-            Button("Save") { if let p = pending { vault.logins.append(p); vault.save() }; pending = nil }
-            Button("Not now", role: .cancel) { pending = nil }
-        } message: { Text(pending?.site ?? "") }
-        .confirmationDialog("Choose a saved login",
-                            isPresented: Binding(get: { choosePane != nil }, set: { if !$0 { choosePane = nil } }),
-                            titleVisibility: .visible) {
-            ForEach(chooseList) { l in
-                Button(l.user.isEmpty ? l.site : l.user) {
-                    choosePane?.fill(login: l)
-                    choosePane = nil
-                }
-            }
-            Button("Cancel", role: .cancel) { choosePane = nil }
         }
         .task {
             Pane.ruleProvider = { host in shields.rules(for: host) }
@@ -6144,7 +6187,6 @@ struct ContentView: View {
             sites: sites,
             history: history,
             actions: PaneActions(
-                autofill: { autofill(p) },
                 calendar: { calTitle = p.title.isEmpty ? p.host : p.title; calURL = p.address; sheet = .calendar },
                 settings: { sheet = .settings },
                 vpn: { sheet = .vpn },
@@ -6180,7 +6222,7 @@ struct ContentView: View {
 
     @ViewBuilder private func sheetView(_ s: Sheet) -> some View {
         switch s {
-        case .vault: VaultView(vault: vault, fill: fill)
+        case .vault: VaultView(vault: vault)
         case .settings: SettingsView(sites: sites, shields: shields, themes: themes, history: history, vault: vault,
                                      openVault: { sheet = .vault }, openVPN: { sheet = .vpn })
         case .calendar: EventEditor(title: calTitle, url: calURL).ignoresSafeArea()
@@ -6209,20 +6251,6 @@ struct ContentView: View {
         p.applyFPS()
     }
 
-    private func autofill(_ p: Pane) {
-        Task {
-            if !vault.unlocked { await vault.unlock() }
-            guard vault.unlocked else { return }
-            if p.hasLogin {
-                let found = vault.match(host: p.host)
-                if found.count == 1 { p.fill(login: found[0]); return }
-                if found.count > 1 { chooseList = found; choosePane = p; return }
-            }
-            if p.hasCard, let c = vault.cards.first { p.fill(card: c); return }
-            sheet = .vault
-        }
-    }
-
     // Re-checks every open tab's block lists; reloads only when the change came from you.
     private func applyShields() {
         let reload = shields.pendingReload
@@ -6243,11 +6271,4 @@ struct ContentView: View {
         tabs.trim()
     }
 
-    private func fill(_ l: Login?, _ c: Card?) {
-        for id in tabs.visible {
-            let p = tabs.pane(id)
-            if let l { p.fill(login: l) }
-            if let c { p.fill(card: c) }
-        }
-    }
 }
