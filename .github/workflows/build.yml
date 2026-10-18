@@ -43,3 +43,25 @@ jobs:
         with:
           name: SplitDeck-ipa
           path: SplitDeck-project/SplitDeck/SplitDeck.ipa
+
+  launch-test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install XcodeGen
+        run: brew install xcodegen
+      - name: Build and compress lists
+        run: |
+          python3 ../../tools/build_blocklists.py Sources/Blocklists || true
+          python3 ../../tools/compress_blocklists.py Sources/Blocklists || true
+      - name: Generate Xcode project
+        run: xcodegen generate
+      - name: Build for the simulator (Release settings, symbols kept)
+        run: |
+          xcodebuild -project SplitDeck.xcodeproj -scheme SplitDeck \
+            -configuration Release -sdk iphonesimulator -derivedDataPath simbuild \
+            STRIP_INSTALLED_PRODUCT=NO DEPLOYMENT_POSTPROCESSING=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" | tail -5
+          codesign -f -s - simbuild/Build/Products/Release-iphonesimulator/SplitDeck.app
+      - name: Launch in the simulator
+        run: ../../tools/smoke_test.sh simbuild/Build/Products/Release-iphonesimulator/SplitDeck.app
