@@ -30,6 +30,7 @@ jobs:
           # Compile errors are reported as notes on the run, since the full log isn't always reachable.
           if ! xcodebuild -project SplitDeck.xcodeproj -scheme SplitDeck \
             -configuration Release -sdk iphoneos -derivedDataPath build \
+            CURRENT_PROJECT_VERSION=${{ github.run_number }} \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" > build.log 2>&1; then
             grep -E "error:" build.log | sort -u | head -20 | while IFS= read -r l; do echo "::error title=Compile error::${l##*/Sources/}"; done
             tail -30 build.log
@@ -47,7 +48,7 @@ jobs:
           find Payload/SplitDeck.app -type f -size +200k -exec du -k {} + | sort -rn | head -8 | while read k f; do echo "::notice title=Large file::${k} KB ${f#Payload/SplitDeck.app/}"; done
       - uses: actions/upload-artifact@v4
         with:
-          name: SplitDeck-ipa
+          name: SplitDeck-1.2-build-${{ github.run_number }}
           path: SplitDeck-project/SplitDeck/SplitDeck.ipa
 
   launch-test:
