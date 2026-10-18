@@ -14,6 +14,16 @@ import PhotosUI
 
 @main
 struct SplitDeckApp: App {
+    init() {
+        // 1.2 ships with a solid address bar and the split view button in the bar (island off).
+        // Applied once on upgrade; your own changes after that are kept.
+        let d = UserDefaults.standard
+        if !d.bool(forKey: "defaults-1.2") {
+            d.set(false, forKey: "showIsland")
+            d.set(1, forKey: "barStyle")
+            d.set(true, forKey: "defaults-1.2")
+        }
+    }
     var body: some Scene { WindowGroup { ContentView() } }
 }
 
@@ -6011,13 +6021,14 @@ struct ContentView: View {
             if p != .active { vault.lock() }
             if p == .background && lockPrivate && tabs.privateCount > 0 { privateLocked = true }
             if p == .background { leftAt = Date() }
-            if p == .active && appLock {
-                if let leftAt, Date().timeIntervalSince(leftAt) >= Double(appLockDelay) {
+            if p == .active && appLock, let left = leftAt {
+                leftAt = nil
+                if Date().timeIntervalSince(left) >= Double(appLockDelay) {
                     sheet = nil
                     shieldsPane = nil
+                    tabsOpen = false
                     appLocked = true
                 }
-                leftAt = nil
                 if appLocked { unlockApp() }
             }
         }
