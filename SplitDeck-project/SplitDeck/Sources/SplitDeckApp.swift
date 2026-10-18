@@ -5,10 +5,21 @@ import Security
 import UniformTypeIdentifiers
 import EventKit
 import EventKitUI
+import NetworkExtension
 
 @main
 struct SplitDeckApp: App {
     var body: some Scene { WindowGroup { ContentView() } }
+}
+
+extension View {
+    @ViewBuilder func sdGlass<S: Shape>(_ shape: S) -> some View {
+        if #available(iOS 26.0, *) {
+            self.glassEffect(.regular.interactive(), in: shape)
+        } else {
+            self.background(.ultraThinMaterial, in: shape)
+        }
+    }
 }
 
 func q(_ s: String) -> String {
@@ -20,6 +31,12 @@ enum Engines {
     static let urls = ["DuckDuckGo": "https://duckduckgo.com/?q=", "Google": "https://www.google.com/search?q=",
                        "Bing": "https://www.bing.com/search?q=", "Brave": "https://search.brave.com/search?q=",
                        "Ecosia": "https://www.ecosia.org/search?q="]
+    static let home = ["DuckDuckGo": "https://duckduckgo.com", "Google": "https://www.google.com",
+                       "Bing": "https://www.bing.com", "Brave": "https://search.brave.com",
+                       "Ecosia": "https://www.ecosia.org"]
+    static var currentHome: String {
+        home[UserDefaults.standard.string(forKey: "engine") ?? "DuckDuckGo"] ?? "https://duckduckgo.com"
+    }
 }
 
 // MARK: Vault (Keychain, device-only, Face ID gated)
@@ -134,6 +151,324 @@ enum Rules {
     static let popupKill = "(function(){document.querySelectorAll('*').forEach(function(e){var s=getComputedStyle(e);if((s.position==='fixed'||s.position==='sticky')&&(parseInt(s.zIndex)||0)>=100&&e.getBoundingClientRect().height>80){e.remove()}});document.documentElement.style.overflow='auto';if(document.body)document.body.style.overflow='auto'})();"
 }
 
+// MARK: - VPN Service (IKEv2 via NEVPNManager)
+
+struct VPNServer: Identifiable, Codable, Hashable {
+    var id: String { address }
+    var provider: String
+    var name: String
+    var address: String
+    var remoteID: String
+
+    func hash(into hasher: inout Hasher) { hasher.combine(address) }
+    static func == (lhs: VPNServer, rhs: VPNServer) -> Bool { lhs.address == rhs.address }
+}
+
+@MainActor
+final class VPNService: ObservableObject {
+    static let presets: [VPNServer] = [
+        // hide.me (Audited, verified no-log, native free IKEv2 servers)
+        VPNServer(provider: "hide.me", name: "hide.me – Netherlands (Free)", address: "free-nl.hide.me", remoteID: "hide.me"),
+        VPNServer(provider: "hide.me", name: "hide.me – United States (Free)", address: "free-us.hide.me", remoteID: "hide.me"),
+        VPNServer(provider: "hide.me", name: "hide.me – Germany (Free)", address: "free-de.hide.me", remoteID: "hide.me"),
+        VPNServer(provider: "hide.me", name: "hide.me – Canada (Free)", address: "free-ca.hide.me", remoteID: "hide.me"),
+
+        // Proton VPN (Swiss privacy, free endpoints)
+        VPNServer(provider: "Proton VPN", name: "Proton – Netherlands (Free)", address: "nl-free-01.protonvpn.net", remoteID: "nl-free-01.protonvpn.net"),
+        VPNServer(provider: "Proton VPN", name: "Proton – United States (Free)", address: "us-free-01.protonvpn.net", remoteID: "us-free-01.protonvpn.net"),
+        VPNServer(provider: "Proton VPN", name: "Proton – Japan (Free)", address: "jp-free-01.protonvpn.net", remoteID: "jp-free-01.protonvpn.net"),
+    ]
+
+    @Published var status: NEVPNStatus = .disconnected
+    @Published var errorMessage: String?
+    @Published var selectedServer: VPNServer = presets[0]
+    @Published var isConfigured: Bool = false
+
+    private let manager = NEVPNManager.shared()
+
+    init() {
+        if let savedAddr = UserDefaults.standard.string(forKey: "vpn_server_address"),
+           let match = Self.presets.first(where: { $0.address == savedAddr }) {
+            selectedServer = match
+        }
+
+        NotificationCenter.default.addObserver(
+            forName: .NEVPNStatusDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.status = self.manager.connection.status
+            }
+        }
+
+        Task { await reloadConfiguration() }
+    }
+
+    func reloadConfiguration() async {
+        do {
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+                manager.loadFromPreferences { err in
+                    if let err { c.resume(throwing: err) } else { c.resume() }
+                }
+            }
+            status = manager.connection.status
+            isConfigured = manager.protocolConfiguration != nil
+        } catch {
+            status = .invalid
+            isConfigured = false
+        }
+    }
+
+    var statusTitle: String {
+        switch status {
+        case .connected: return "Connected"
+        case .connecting: return "Connecting…"
+        case .disconnecting: return "Disconnecting…"
+        case .disconnected: return isConfigured ? "Disconnected" : "Not Configured"
+        case .reasserting: return "Reconnecting…"
+        case .invalid: return "Not Configured"
+        @unknown default: return "Unknown"
+        }
+    }
+
+    var statusColor: Color {
+        switch status {
+        case .connected: return .green
+        case .connecting, .reasserting, .disconnecting: return .orange
+        case .disconnected: return isConfigured ? .secondary : .gray
+        default: return .secondary
+        }
+    }
+
+    func configure(server: VPNServer, username: String, password: String) async {
+        do {
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+                manager.loadFromPreferences { err in
+                    if let err { c.resume(throwing: err) } else { c.resume() }
+                }
+            }
+
+            guard let passwordRef = keychainSave(password) else {
+                throw NSError(domain: "SplitDeckVPN", code: -1, userInfo: [NSLocalizedDescriptionKey: "Failed to securely store VPN password in Keychain."])
+            }
+
+            let proto = NEVPNProtocolIKEv2()
+            proto.serverAddress = server.address
+            proto.remoteIdentifier = server.remoteID
+            proto.authenticationMethod = .usernamePassword
+            proto.useExtendedAuthentication = true
+            proto.username = username
+            proto.passwordReference = passwordRef
+
+            // Standard cryptographic suites for maximum compatibility with hide.me, Proton & strongSwan
+            proto.ikeSecurityAssociationParameters.encryptionAlgorithm = .algorithmAES256GCM
+            proto.ikeSecurityAssociationParameters.integrityAlgorithm = .SHA256
+            proto.ikeSecurityAssociationParameters.diffieHellmanGroup = .group14
+            proto.ikeSecurityAssociationParameters.lifetimeMinutes = 1440
+
+            proto.childSecurityAssociationParameters.encryptionAlgorithm = .algorithmAES256GCM
+            proto.childSecurityAssociationParameters.integrityAlgorithm = .SHA256
+            proto.childSecurityAssociationParameters.diffieHellmanGroup = .group14
+            proto.childSecurityAssociationParameters.lifetimeMinutes = 1440
+
+            proto.disconnectOnSleep = false
+            proto.deadPeerDetectionRate = .medium
+
+            manager.protocolConfiguration = proto
+            manager.localizedDescription = "SplitDeck VPN (\(server.provider))"
+            manager.isEnabled = true
+            selectedServer = server
+
+            UserDefaults.standard.set(server.address, forKey: "vpn_server_address")
+            UserDefaults.standard.set(username, forKey: "vpn_saved_username")
+
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+                manager.saveToPreferences { err in
+                    if let err { c.resume(throwing: err) } else { c.resume() }
+                }
+            }
+
+            isConfigured = true
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func connect() async {
+        do {
+            try await withCheckedThrowingContinuation { (c: CheckedContinuation<Void, Error>) in
+                manager.loadFromPreferences { err in
+                    if let err { c.resume(throwing: err) } else { c.resume() }
+                }
+            }
+            try manager.connection.startVPNTunnel()
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    func disconnect() {
+        manager.connection.stopVPNTunnel()
+    }
+
+    private func keychainSave(_ password: String) -> Data? {
+        guard let data = password.data(using: .utf8) else { return nil }
+        let acct = "SplitDeck_VPN_Key"
+        let base: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrAccount as String: acct
+        ]
+        SecItemDelete(base as CFDictionary)
+
+        var add = base
+        add[kSecValueData as String] = data
+        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        add[kSecReturnPersistentRef as String] = true
+
+        var ref: AnyObject?
+        let status = SecItemAdd(add as CFDictionary, &ref)
+        if status == errSecSuccess, let persistentRef = ref as? Data {
+            return persistentRef
+        }
+        return nil
+    }
+}
+
+// MARK: - VPN View
+
+struct VPNView: View {
+    @ObservedObject var vpn: VPNService
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var username = UserDefaults.standard.string(forKey: "vpn_saved_username") ?? ""
+    @State private var password = ""
+    @State private var useCustom = false
+    @State private var customServer = ""
+    @State private var customRemoteID = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Connection Status") {
+                    HStack {
+                        Circle().fill(vpn.statusColor).frame(width: 12, height: 12)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(vpn.statusTitle).font(.headline)
+                            if vpn.status == .connected {
+                                Text("Routing traffic via \(vpn.selectedServer.name)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Spacer()
+                        if vpn.status == .connected {
+                            Button("Disconnect") { vpn.disconnect() }
+                                .buttonStyle(.borderedProminent)
+                                .tint(.red)
+                        } else if vpn.status == .connecting || vpn.status == .reasserting || vpn.status == .disconnecting {
+                            ProgressView()
+                        } else if vpn.isConfigured {
+                            Button("Connect") { Task { await vpn.connect() } }
+                                .buttonStyle(.borderedProminent)
+                        }
+                    }
+                }
+
+                Section("Free Trusted Provider") {
+                    Picker("Server", selection: $vpn.selectedServer) {
+                        Section("hide.me (Audited No-Logs, Free IKEv2)") {
+                            ForEach(VPNService.presets.filter { $0.provider == "hide.me" }) { s in
+                                Text(s.name).tag(s)
+                            }
+                        }
+                        Section("Proton VPN (Free Tier)") {
+                            ForEach(VPNService.presets.filter { $0.provider == "Proton VPN" }) { s in
+                                Text(s.name).tag(s)
+                            }
+                        }
+                    }
+                    .pickerStyle(.navigationLink)
+
+                    Toggle("Use custom IKEv2 server", isOn: $useCustom.animation())
+                    if useCustom {
+                        TextField("Server Hostname or IP", text: $customServer)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .keyboardType(.URL)
+                        TextField("Remote ID", text: $customRemoteID)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                    }
+                }
+
+                Section {
+                    TextField("VPN Username", text: $username)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .textContentType(.username)
+                    SecureField("VPN Password", text: $password)
+                        .textContentType(.password)
+                } header: {
+                    Text("Credentials")
+                } footer: {
+                    VStack(alignment: .leading, spacing: 6) {
+                        if vpn.selectedServer.provider == "hide.me" {
+                            Text("• **hide.me Free**: Sign up free at hide.me (no credit card required). Enter your hide.me account username and password above.")
+                        } else if vpn.selectedServer.provider == "Proton VPN" {
+                            Text("• **Proton VPN**: Sign up free at protonvpn.com. Go to Account → Settings → OpenVPN / IKEv2 credentials and copy your generated credentials.")
+                        } else {
+                            Text("• Enter standard credentials for your self-hosted strongSwan or private IKEv2 server.")
+                        }
+                    }
+                    .font(.caption)
+                }
+
+                Section {
+                    Button {
+                        let targetServer = useCustom
+                            ? VPNServer(provider: "Custom", name: "Custom (\(customServer))", address: customServer, remoteID: customRemoteID.isEmpty ? customServer : customRemoteID)
+                            : vpn.selectedServer
+
+                        Task {
+                            await vpn.configure(server: targetServer, username: username, password: password)
+                            if vpn.errorMessage == nil {
+                                await vpn.connect()
+                            }
+                        }
+                    } label: {
+                        HStack {
+                            Spacer()
+                            Label(vpn.status == .connected ? "Update Configuration" : "Save & Connect", systemImage: "lock.shield")
+                                .fontWeight(.semibold)
+                            Spacer()
+                        }
+                    }
+                    .disabled(username.isEmpty || password.isEmpty || (useCustom && customServer.isEmpty))
+                }
+
+                if let err = vpn.errorMessage {
+                    Section {
+                        Label(err, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.red)
+                            .font(.subheadline)
+                    }
+                }
+            }
+            .navigationTitle("VPN Shield")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
 // MARK: One browser pane
 
 final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
@@ -143,6 +478,8 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     @Published var collapsed = false
     @Published var hasLogin = false
     @Published var hasCard = false
+    @Published var canBack = false
+    @Published var canForward = false
     @Published var host = ""
     @Published var title = ""
     var onCredential: ((Login) -> Void)?
@@ -228,11 +565,15 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         webView.evaluateJavaScript("window.__sdFps=\(Pane.fps)")
+        canBack = webView.canGoBack
+        canForward = webView.canGoForward
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         if let u = webView.url { address = u.absoluteString; host = u.host ?? "" }
         title = webView.title ?? ""
+        canBack = webView.canGoBack
+        canForward = webView.canGoForward
         webView.evaluateJavaScript("((document.querySelector('input[type=password]')?1:0)+(document.querySelector('[autocomplete=cc-number]')?2:0))") { [weak self] r, _ in
             let v = (r as? Int) ?? 0
             self?.hasLogin = (v & 1) != 0
@@ -243,79 +584,126 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
 
 struct WebHost: UIViewRepresentable {
     let webView: WKWebView
-    func makeUIView(context: Context) -> WKWebView { webView }
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    func makeUIView(context: Context) -> UIView {
+        let v = UIView()
+        v.backgroundColor = .clear
+        attach(v)
+        return v
+    }
+    func updateUIView(_ v: UIView, context: Context) { attach(v) }
+    private func attach(_ v: UIView) {
+        guard webView.superview !== v else { return }
+        v.subviews.forEach { $0.removeFromSuperview() }
+        webView.frame = v.bounds
+        webView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        v.addSubview(webView)
+    }
 }
 
 struct PaneView: View {
     @ObservedObject var pane: Pane
+    var bottomGap: CGFloat
     var autofill: () -> Void
     var calendar: () -> Void
     var removePopups: () -> Void
+    var settings: () -> Void
+    var vpn: () -> Void
+    var vpnOn: Bool
     @State private var desktop = false
     @FocusState private var focused: Bool
+
+    private var mini: Bool { pane.collapsed && !focused }
 
     var body: some View {
         ZStack(alignment: .bottom) {
             WebHost(webView: pane.webView)
-            bar.padding(.horizontal, 8).padding(.bottom, 20)
+            bar
+                .padding(.horizontal, 12)
+                .padding(.bottom, focused ? 8 : (mini ? max(bottomGap - 22, 4) : bottomGap))
+                .animation(.spring(response: 0.35, dampingFraction: 0.82), value: mini)
+                .animation(.spring(response: 0.35, dampingFraction: 0.82), value: focused)
         }
         .clipped()
     }
 
-    private func navButton(_ icon: String, _ action: @escaping () -> Void) -> some View {
+    private func roundButton(_ icon: String, _ enabled: Bool, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
-                .font(.system(size: 17, weight: .semibold))
+                .font(.system(size: 18, weight: .semibold))
                 .foregroundStyle(.primary)
-                .frame(width: 44, height: 44)
+                .frame(width: 48, height: 48)
+                .contentShape(Circle())
+        }
+        .sdGlass(Circle())
+        .opacity(enabled ? 1 : 0.45)
+        .disabled(!enabled)
+    }
+
+    private func icon(_ name: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: name)
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.primary)
+                .frame(width: 40, height: 44)
                 .contentShape(Rectangle())
         }
     }
 
     @ViewBuilder private var bar: some View {
-        if pane.collapsed && !focused {
+        if mini {
             Button { pane.collapsed = false } label: {
-                Text(pane.host.isEmpty ? "Search" : pane.host)
-                    .font(.footnote.weight(.medium))
+                Text(pane.host.isEmpty ? "Search" : pane.host.replacingOccurrences(of: "www.", with: ""))
+                    .font(.caption.weight(.semibold))
                     .foregroundStyle(.primary)
                     .lineLimit(1)
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 9)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 7)
             }
-            .background(.ultraThinMaterial, in: Capsule())
+            .sdGlass(Capsule())
+            .transition(.scale(scale: 0.85).combined(with: .opacity))
         } else {
-            HStack(spacing: 0) {
-                navButton("chevron.left") { pane.webView.goBack() }
-                navButton("chevron.right") { pane.webView.goForward() }
-                TextField("Search or enter site", text: $pane.address)
-                    .textFieldStyle(.plain)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .keyboardType(.webSearch)
-                    .focused($focused)
-                    .onSubmit { pane.load(pane.address); focused = false }
-                    .padding(.horizontal, 6)
-                    .frame(height: 44)
-                if pane.hasLogin { navButton("key.fill") { autofill() } }
-                if pane.hasCard { navButton("creditcard.fill") { autofill() } }
-                Menu {
-                    Button { pane.webView.reload() } label: { Label("Reload", systemImage: "arrow.clockwise") }
-                    Button { desktop.toggle(); pane.setDesktop(desktop) } label: {
-                        Label(desktop ? "Mobile site" : "Desktop site", systemImage: desktop ? "iphone" : "desktopcomputer")
+            HStack(spacing: 8) {
+                if !focused { roundButton("chevron.left", pane.canBack) { pane.webView.goBack() } }
+                HStack(spacing: 0) {
+                    TextField("Search or enter site", text: $pane.address)
+                        .textFieldStyle(.plain)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .keyboardType(.webSearch)
+                        .submitLabel(.go)
+                        .focused($focused)
+                        .onSubmit { pane.load(pane.address); focused = false }
+                    if !focused {
+                        if pane.hasLogin { icon("key.fill") { autofill() } }
+                        if pane.hasCard { icon("creditcard.fill") { autofill() } }
+                        Menu {
+                            Button { pane.webView.reload() } label: { Label("Reload", systemImage: "arrow.clockwise") }
+                            Button { desktop.toggle(); pane.setDesktop(desktop) } label: {
+                                Label(desktop ? "Mobile site" : "Desktop site", systemImage: desktop ? "iphone" : "desktopcomputer")
+                            }
+                            Button { removePopups() } label: { Label("Remove popups", systemImage: "xmark.rectangle") }
+                            Button { calendar() } label: { Label("Add to Calendar", systemImage: "calendar.badge.plus") }
+                            Divider()
+                            Button { vpn() } label: { Label(vpnOn ? "VPN (on)" : "VPN", systemImage: vpnOn ? "lock.shield.fill" : "lock.shield") }
+                            Button { settings() } label: { Label("Settings", systemImage: "gearshape") }
+                        } label: {
+                            Image(systemName: "ellipsis")
+                                .font(.system(size: 16, weight: .semibold))
+                                .foregroundStyle(.primary)
+                                .frame(width: 40, height: 44)
+                                .contentShape(Rectangle())
+                        }
+                    } else {
+                        icon("xmark.circle.fill") { focused = false }
                     }
-                    Button { removePopups() } label: { Label("Remove popups", systemImage: "xmark.rectangle") }
-                    Button { calendar() } label: { Label("Add to Calendar", systemImage: "calendar.badge.plus") }
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundStyle(.primary)
-                        .frame(width: 44, height: 44)
-                        .contentShape(Rectangle())
                 }
+                .padding(.leading, 16)
+                .padding(.trailing, 4)
+                .frame(height: 48)
+                .sdGlass(Capsule())
+                if !focused { roundButton("chevron.right", pane.canForward) { pane.webView.goForward() } }
             }
-            .padding(.horizontal, 4)
-            .background(.ultraThinMaterial, in: Capsule())
+            .transition(.scale(scale: 0.95).combined(with: .opacity))
         }
     }
 }
@@ -473,23 +861,26 @@ struct VaultView: View {
 // MARK: Main screen
 
 enum Sheet: Identifiable {
-    case vault, settings, calendar
+    case vault, settings, calendar, vpn
     var id: Int {
         switch self {
         case .vault: return 0
         case .settings: return 1
         case .calendar: return 2
+        case .vpn: return 3
         }
     }
 }
 
 struct ContentView: View {
-    @StateObject private var first = Pane(start: "https://duckduckgo.com")
+    @StateObject private var first = Pane(start: Engines.currentHome)
     @StateObject private var second = Pane(start: "https://en.wikipedia.org")
     @StateObject private var vault = Vault()
+    @StateObject private var vpnService = VPNService()
     @Environment(\.scenePhase) private var phase
     @AppStorage("block") private var blockOn = true
     @AppStorage("battery") private var battery = 0
+    @AppStorage("engine") private var engine = "DuckDuckGo"
     @State private var split: CGFloat = 0.5
     @State private var splitOn = false
     @State private var showSecond = false
@@ -503,7 +894,7 @@ struct ContentView: View {
     var body: some View {
         ZStack(alignment: .top) {
             Color(.systemBackground).ignoresSafeArea()
-            deck.ignoresSafeArea()
+            deck.ignoresSafeArea(.container)
             topBar
         }
         .sheet(item: $sheet) { s in sheetView(s) }
@@ -520,38 +911,41 @@ struct ContentView: View {
         }
         .onChange(of: blockOn) { _, _ in apply() }
         .onChange(of: battery) { _, _ in applyFPS() }
+        .onChange(of: engine) { _, _ in loadHome() }
         .onChange(of: phase) { _, p in if p != .active { vault.lock() } }
         .onReceive(NotificationCenter.default.publisher(for: .NSProcessInfoPowerStateDidChange)) { _ in applyFPS() }
     }
 
     private var topBar: some View {
-        HStack(spacing: 10) {
+        HStack {
             Spacer()
-            if !splitOn {
-                Button { showSecond.toggle() } label: {
-                    Label(showSecond ? "Page 2" : "Page 1", systemImage: "arrow.left.arrow.right")
+            HStack(spacing: 0) {
+                if !splitOn {
+                    Button { withAnimation(.snappy) { showSecond.toggle() } } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "square.on.square")
+                            Text(showSecond ? "2" : "1").monospacedDigit()
+                        }
                         .font(.subheadline.weight(.semibold))
                         .foregroundStyle(.primary)
-                        .padding(.horizontal, 14).padding(.vertical, 9)
+                        .frame(height: 36)
+                        .padding(.horizontal, 10)
+                        .contentShape(Rectangle())
+                    }
                 }
-                .background(.ultraThinMaterial, in: Capsule())
+                Button { withAnimation(.snappy) { splitOn.toggle() } } label: {
+                    Image(systemName: splitOn ? "rectangle.split.2x1.fill" : "rectangle.split.2x1")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .frame(width: 40, height: 36)
+                        .contentShape(Rectangle())
+                }
             }
-            Button { splitOn.toggle() } label: {
-                Label(splitOn ? "Split" : "Single", systemImage: splitOn ? "rectangle.split.2x1.fill" : "rectangle")
-                    .font(.subheadline.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .padding(.horizontal, 14).padding(.vertical, 9)
-            }
-            .background(.ultraThinMaterial, in: Capsule())
-            Button { sheet = .settings } label: {
-                Image(systemName: "gearshape.fill")
-                    .foregroundStyle(.primary)
-                    .frame(width: 40, height: 38)
-            }
-            .background(.ultraThinMaterial, in: Capsule())
+            .padding(.horizontal, 4)
+            .sdGlass(Capsule())
         }
         .padding(.horizontal, 12)
-        .padding(.top, 4)
+        .padding(.top, 2)
     }
 
     private var deck: some View {
@@ -562,23 +956,28 @@ struct ContentView: View {
             let layout = horizontal ? AnyLayout(HStackLayout(spacing: 0)) : AnyLayout(VStackLayout(spacing: 0))
             if splitOn {
                 layout {
-                    pane(first)
+                    pane(first, gap: horizontal ? 30 : 12)
                         .frame(width: horizontal ? firstSize : nil, height: horizontal ? nil : firstSize)
                     divider(horizontal: horizontal, total: total)
-                    pane(second)
+                    pane(second, gap: 30)
                 }
                 .coordinateSpace(.named("deck"))
             } else {
-                pane(showSecond ? second : first)
+                pane(showSecond ? second : first, gap: 30)
             }
         }
     }
 
-    private func pane(_ p: Pane) -> PaneView {
+    private func pane(_ p: Pane, gap: CGFloat) -> some View {
         PaneView(pane: p,
+                 bottomGap: gap,
                  autofill: { autofill(p) },
                  calendar: { calTitle = p.title.isEmpty ? p.host : p.title; calURL = p.address; sheet = .calendar },
-                 removePopups: { p.webView.evaluateJavaScript(Rules.popupKill) })
+                 removePopups: { p.webView.evaluateJavaScript(Rules.popupKill) },
+                 settings: { sheet = .settings },
+                 vpn: { sheet = .vpn },
+                 vpnOn: vpnService.status == .connected)
+            .id(p.id)
     }
 
     @ViewBuilder private func sheetView(_ s: Sheet) -> some View {
@@ -586,6 +985,7 @@ struct ContentView: View {
         case .vault: VaultView(vault: vault, fill: fill)
         case .settings: SettingsView(openVault: { sheet = .vault })
         case .calendar: EventEditor(title: calTitle, url: calURL).ignoresSafeArea()
+        case .vpn: VPNView(vpn: vpnService)
         }
     }
 
@@ -608,6 +1008,12 @@ struct ContentView: View {
         }
     }
 
+    private func loadHome() {
+        let url = Engines.home[engine] ?? "https://duckduckgo.com"
+        first.load(url)
+        second.load(url)
+    }
+
     private func applyFPS() {
         let low = ProcessInfo.processInfo.isLowPowerModeEnabled
         if battery == 3 { Pane.fps = 30 }
@@ -627,8 +1033,8 @@ struct ContentView: View {
 
     private func divider(horizontal: Bool, total: CGFloat) -> some View {
         ZStack {
-            Color(.systemGray5)
-            Capsule().fill(Color.secondary)
+            Color(.systemBackground)
+            Capsule().fill(Color.secondary.opacity(0.6))
                 .frame(width: horizontal ? 4 : 40, height: horizontal ? 40 : 4)
         }
         .frame(width: horizontal ? handle : nil, height: horizontal ? nil : handle)
