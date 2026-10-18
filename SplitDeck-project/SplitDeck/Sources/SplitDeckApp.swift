@@ -1,5 +1,9 @@
 import SwiftUI
 import WebKit
+import NaturalLanguage
+#if canImport(Translation)
+import Translation
+#endif
 import LocalAuthentication
 import Security
 import UniformTypeIdentifiers
@@ -177,6 +181,135 @@ enum Engines {
                        "Ecosia": "https://www.ecosia.org"]
     static var currentHome: String {
         home[UserDefaults.standard.string(forKey: "engine") ?? "DuckDuckGo"] ?? "https://duckduckgo.com"
+    }
+}
+
+// MARK: Page zoom
+
+// Page zoom: one default for every site, plus the level you last chose on each site (if remembered).
+enum Zoom {
+    static let steps: [Double] = [0.5, 0.67, 0.75, 0.85, 1.0, 1.15, 1.25, 1.5, 1.75, 2.0, 2.5]
+    private static var d: UserDefaults { .standard }
+    static var defaultLevel: Double { d.object(forKey: "zoomDefault") as? Double ?? 1.0 }
+    static var remember: Bool { d.object(forKey: "zoomRemember") as? Bool ?? true }
+    static var sites: [String: Double] { d.dictionary(forKey: "zoomSites") as? [String: Double] ?? [:] }
+    static func key(_ host: String) -> String { host.hasPrefix("www.") ? String(host.dropFirst(4)) : host }
+
+    static func level(for host: String) -> Double {
+        guard remember, !host.isEmpty else { return defaultLevel }
+        return sites[key(host)] ?? defaultLevel
+    }
+
+    static func store(_ z: Double, for host: String) {
+        guard remember, !host.isEmpty else { return }
+        var s = sites
+        s[key(host)] = abs(z - defaultLevel) < 0.001 ? nil : z
+        d.set(s, forKey: "zoomSites")
+    }
+
+    static func step(from z: Double, up: Bool) -> Double {
+        up ? (steps.first { $0 > z + 0.001 } ?? steps.last!) : (steps.last { $0 < z - 0.001 } ?? steps.first!)
+    }
+
+    static func label(_ z: Double) -> String { "\(Int((z * 100).rounded()))%" }
+}
+
+// MARK: Bookmarks
+
+struct Bookmark: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var title: String
+    var url: String
+    var added = Date()
+    var host: String {
+        let h = URL(string: url)?.host ?? ""
+        return h.hasPrefix("www.") ? String(h.dropFirst(4)) : h
+    }
+}
+
+final class Bookmarks: ObservableObject {
+    static let shared = Bookmarks()
+    @Published private(set) var items: [Bookmark] = []
+
+    static let fileURL: URL = {
+        let d = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d.appendingPathComponent("bookmarks.json")
+    }()
+
+    init() {
+        if let d = try? Data(contentsOf: Bookmarks.fileURL),
+           let l = try? JSONDecoder().decode([Bookmark].self, from: d) { items = l }
+    }
+
+    func find(_ url: String) -> Bookmark? { items.first { $0.url == url } }
+
+    func toggle(url: String, title: String) {
+        if let b = find(url) { remove(b.id) } else { add(url: url, title: title) }
+    }
+
+    func add(url: String, title: String) {
+        guard !url.isEmpty, find(url) == nil else { return }
+        items.insert(Bookmark(title: title.isEmpty ? url : title, url: url), at: 0)
+        save()
+    }
+
+    func remove(_ id: UUID) { items.removeAll { $0.id == id }; save() }
+
+    func rename(_ id: UUID, to title: String) {
+        guard let i = items.firstIndex(where: { $0.id == id }) else { return }
+        items[i].title = title
+        save()
+    }
+
+    // Adds any it doesn't already have. Returns how many were new.
+    func merge(_ new: [Bookmark]) -> Int {
+        var seen = Set(items.map(\.url))
+        let fresh = new.filter { seen.insert($0.url).inserted }
+        items.append(contentsOf: fresh)
+        save()
+        return fresh.count
+    }
+
+    private func save() {
+        let snapshot = items
+        DispatchQueue.global(qos: .utility).async {
+            if let d = try? JSONEncoder().encode(snapshot) { try? d.write(to: Bookmarks.fileURL, options: .atomic) }
+        }
+    }
+}
+
+// MARK: Translation settings
+
+enum Translate {
+    static let languages: [(code: String, name: String)] = [
+        ("en", "English"), ("es", "Spanish"), ("fr", "French"), ("de", "German"), ("it", "Italian"),
+        ("pt", "Portuguese"), ("nl", "Dutch"), ("pl", "Polish"), ("tr", "Turkish"), ("ru", "Russian"),
+        ("uk", "Ukrainian"), ("ar", "Arabic"), ("hi", "Hindi"), ("id", "Indonesian"), ("th", "Thai"),
+        ("vi", "Vietnamese"), ("ja", "Japanese"), ("ko", "Korean"), ("zh", "Chinese"),
+    ]
+    static var target: String {
+        UserDefaults.standard.string(forKey: "translateTo") ?? (Locale.current.language.languageCode?.identifier ?? "en")
+    }
+    static var offer: Bool { UserDefaults.standard.object(forKey: "offerTranslate") as? Bool ?? true }
+    static func name(_ code: String) -> String { Locale.current.localizedString(forLanguageCode: code) ?? code }
+}
+
+// Links into the app: splitdeck://open?url=… or splitdeck://example.com/page (handy from Shortcuts).
+enum DeepLink {
+    static func target(_ url: URL) -> String? {
+        switch url.scheme?.lowercased() {
+        case "http", "https":
+            return url.absoluteString
+        case "splitdeck":
+            if url.host == "open" {
+                return URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "url" }?.value
+            }
+            let rest = url.absoluteString.dropFirst("splitdeck://".count)
+            return rest.isEmpty ? nil : String(rest)
+        default:
+            return nil
+        }
     }
 }
 
@@ -715,7 +848,16 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     @Published var pageDark: Bool? = nil
     @Published var topDark: Bool? = nil
     @Published var bottomColor: Color? = nil
-    @Published var blockedCount = 0
+    // Counted on every blocked request, but only published about once a second.
+    private(set) var blockedCount = 0
+    @Published private(set) var blockedShown = 0
+    private var blockedFlush = false
+    @Published var zoom: Double = 1
+    @Published var foreignLanguage: String?
+    @Published var translated = false
+    @Published var translating = false
+    @Published var translateRequest = 0
+    @Published var notice: String?
     private var bottomRGB: [Int] = []
     private var appliedRules: [String]?
     @Published var hiding = false
@@ -1034,10 +1176,18 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
               (o.value(forKey: "blockedLoad") as? Bool) == true else { return }
         blockedCount += 1
         Pane.onBlocked?()
+        guard !blockedFlush else { return }
+        blockedFlush = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
+            guard let self else { return }
+            self.blockedFlush = false
+            if self.blockedShown != self.blockedCount { self.blockedShown = self.blockedCount }
+        }
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         blockedCount = 0
+        if blockedShown != 0 { blockedShown = 0 }
     }
 
     func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
@@ -1093,6 +1243,10 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         webView.evaluateJavaScript("window.__sdFps=\(Pane.fps)")
+        if translated || foreignLanguage != nil || translating { translated = false; foreignLanguage = nil; translating = false }
+        let z = Zoom.level(for: webView.url?.host ?? "")
+        if abs(webView.pageZoom - z) > 0.001 { webView.pageZoom = z }
+        if zoom != z { zoom = z }
         if hiding { hiding = false; canUndoHide = false }
         hiddenSels = []
         hiddenCount = 0
@@ -1109,8 +1263,113 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             if let u = webView.url { onPageLoaded?(u, webView.title ?? "") }
         }
         onChange?()
+        if Translate.offer { detectLanguage() }
         // Logins and cards on pages are filled by iOS AutoFill (Passwords app), not by SplitDeck.
     }
+
+    // MARK: Zoom
+
+    func setZoom(_ z: Double) {
+        let v = min(max(z, Zoom.steps.first!), Zoom.steps.last!)
+        webView.pageZoom = v
+        zoom = v
+        if !isPrivate { Zoom.store(v, for: host) }
+        flash(Zoom.label(v))
+    }
+    func zoomIn() { setZoom(Zoom.step(from: zoom, up: true)) }
+    func zoomOut() { setZoom(Zoom.step(from: zoom, up: false)) }
+
+    // A short message over the address bar.
+    func flash(_ text: String) {
+        notice = text
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { [weak self] in
+            if self?.notice == text { self?.notice = nil }
+        }
+    }
+
+    // MARK: Translation
+
+    // Reads a sample of the page; if most of it is in another language, the address bar offers to translate.
+    func detectLanguage() {
+        guard !isHome else { return }
+        webView.evaluateJavaScript("(document.body&&document.body.innerText||'').slice(0,4000)") { [weak self] r, _ in
+            guard let self, let text = r as? String, text.count > 200 else { return }
+            let mine = Translate.target
+            DispatchQueue.global(qos: .utility).async {
+                let rec = NLLanguageRecognizer()
+                rec.processString(text)
+                guard let top = rec.languageHypotheses(withMaximum: 1).max(by: { $0.value < $1.value }), top.value > 0.8 else { return }
+                let code = String(top.key.rawValue.split(separator: "-").first ?? Substring(top.key.rawValue))
+                DispatchQueue.main.async {
+                    let foreign: String? = code == mine ? nil : code
+                    if self.foreignLanguage != foreign { self.foreignLanguage = foreign }
+                }
+            }
+        }
+    }
+
+    func requestTranslation() {
+        if translated { showOriginal(); return }
+        guard !translating else { return }
+        translateRequest += 1
+    }
+
+    func showOriginal() {
+        webView.evaluateJavaScript("if(window.__sdTr){window.__sdTr.nodes.forEach(function(n,i){n.nodeValue=window.__sdTr.orig[i]})}")
+        translated = false
+    }
+
+    static let collectTextJS = """
+    const skip = new Set(['SCRIPT','STYLE','NOSCRIPT','TEXTAREA','INPUT','CODE','PRE','SVG','svg','MATH']);
+    const nodes = [], out = [];
+    const w = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, { acceptNode(n) {
+      const p = n.parentElement;
+      if (!p || skip.has(p.tagName) || p.isContentEditable || p.closest('[translate=no],.notranslate')) return NodeFilter.FILTER_REJECT;
+      const t = n.nodeValue;
+      if (!t || t.trim().length < 2 || !/\\p{L}/u.test(t)) return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    }});
+    let n;
+    while ((n = w.nextNode()) && nodes.length < 4000) { nodes.push(n); out.push(n.nodeValue); }
+    window.__sdTr = { nodes: nodes, orig: out.slice() };
+    window.__sdApplyTr = function(start, arr) {
+      for (let k = 0; k < arr.length; k++) {
+        const i = start + k, node = window.__sdTr.nodes[i], o = window.__sdTr.orig[i];
+        if (!node || arr[k] == null) continue;
+        node.nodeValue = o.match(/^\\s*/)[0] + arr[k].trim() + o.match(/\\s*$/)[0];
+      }
+    };
+    return out.map(function(s) { return s.trim(); });
+    """
+
+    #if canImport(Translation)
+    // Translates the page's text on this iPhone, a batch at a time, so it changes as you watch.
+    @available(iOS 18.0, *)
+    @MainActor
+    func runTranslation(_ session: TranslationSession) async {
+        translating = true
+        defer { translating = false }
+        guard let raw = try? await webView.callAsyncJavaScript(Pane.collectTextJS, arguments: [:], contentWorld: .page) as? [String],
+              !raw.isEmpty else { return }
+        var done = false
+        var i = 0
+        while i < raw.count {
+            let end = min(i + 60, raw.count)
+            let reqs = (i..<end).map { TranslationSession.Request(sourceText: raw[$0], clientIdentifier: String($0)) }
+            guard let res = try? await session.translations(from: reqs) else {
+                if !done { flash("Can't translate this page") }
+                return
+            }
+            var slice = Array(raw[i..<end])
+            for r in res {
+                if let k = r.clientIdentifier.flatMap({ Int($0) }), k >= i, k < end { slice[k - i] = r.targetText }
+            }
+            _ = try? await webView.callAsyncJavaScript("window.__sdApplyTr(start, arr)", arguments: ["start": i, "arr": slice], contentWorld: .page)
+            if !done { done = true; translated = true }
+            i = end
+        }
+    }
+    #endif
 }
 
 // Hosts a web view. Only takes the web view if no other host owns it,
@@ -1490,6 +1749,19 @@ final class HistoryStore: ObservableObject {
         trimAndSave()
     }
 
+    // Adds imported visits (skipping ones already here), newest first. Returns how many were new.
+    func importVisits(_ v: [(url: String, title: String, date: Date)]) -> Int {
+        var seen = Set(items.lazy.filter { !$0.isSearch }.map { "\($0.text)|\(Int($0.date.timeIntervalSince1970))" })
+        var added = 0
+        for e in v where seen.insert("\(e.url)|\(Int(e.date.timeIntervalSince1970))").inserted {
+            items.append(HistoryItem(isSearch: false, text: e.url, title: e.title, date: e.date))
+            added += 1
+        }
+        items.sort { $0.date > $1.date }
+        trimAndSave()
+        return added
+    }
+
     // since == nil clears everything.
     func clear(since: Date?) {
         if let since { items.removeAll { $0.date >= since } } else { items.removeAll() }
@@ -1520,7 +1792,7 @@ final class HistoryStore: ObservableObject {
 }
 
 struct Suggestion: Identifiable {
-    enum Kind { case search, recent, site }
+    enum Kind { case search, recent, site, bookmark }
     let id = UUID()
     let kind: Kind
     let title: String
@@ -1550,6 +1822,12 @@ enum Suggest {
         for r in history.recentSearches where r.lowercased().contains(q) {
             add(Suggestion(kind: .recent, title: r, subtitle: "Recent search", value: r))
             if out.count >= 3 { break }
+        }
+        var marks = 0
+        for b in Bookmarks.shared.items where b.title.lowercased().contains(q) || b.url.lowercased().contains(q) {
+            add(Suggestion(kind: .bookmark, title: b.title, subtitle: b.host, value: b.url))
+            marks += 1
+            if marks >= 3 { break }
         }
         // Sites: address starting with what you typed first, then title or address containing it.
         let visits = history.items.lazy.filter { !$0.isSearch }
@@ -2301,7 +2579,7 @@ struct ShieldsView: View {
                         }
                         .buttonStyle(.plain)
                         .disabled(host.isEmpty)
-                        Text(up ? "\(pane.blockedCount) ads and trackers blocked on this page"
+                        Text(up ? "\(pane.blockedShown) ads and trackers blocked on this page"
                                 : "Ads and trackers are allowed on this site")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
@@ -2422,6 +2700,7 @@ struct PaneActions {
     var exitPrivate: () -> Void
     var closePrivate: () -> Void
     var splitEnabled: Bool
+    var bookmarks: () -> Void
 }
 
 struct PaneView: View {
@@ -2551,6 +2830,7 @@ struct PaneView: View {
                             case .search: Image(systemName: "magnifyingglass")
                             case .recent: Image(systemName: "clock.arrow.circlepath")
                             case .site: Image(systemName: "globe")
+                            case .bookmark: Image(systemName: "book")
                             }
                         }
                         .font(.system(size: 14, weight: .semibold))
@@ -2633,6 +2913,7 @@ struct PaneView: View {
             cover = c
             pane.setCover(c)
         }
+        .modifier(TranslateHook(pane: pane))
         .overlay {
             // Private tabs are hidden when locked, and in the app switcher.
             if pane.isPrivate && (actions.privateLocked || phase != .active) {
@@ -2888,9 +3169,31 @@ struct PaneView: View {
         .padding(.leading, 3)
     }
 
+    // Shown when most of the page is in another language (or while it's translated).
+    private var translateButton: some View {
+        Button { pane.requestTranslation() } label: {
+            Group {
+                if pane.translating {
+                    ProgressView().controlSize(.mini).tint(dark ? .white : .black)
+                } else {
+                    Image(systemName: "translate")
+                        .font(.system(size: compact ? 12 : 15, weight: .semibold))
+                        .foregroundStyle(pane.translated ? AnyShapeStyle(theme.accent) : ink)
+                }
+            }
+            .frame(width: compact ? 28 : 34, height: barH)
+            .contentShape(Rectangle())
+        }
+        .accessibilityLabel(pane.translated ? "Show original" : "Translate page")
+        .transition(.scale(scale: 0.6).combined(with: .opacity))
+    }
+
     // Page and app controls (the other tinted end).
     private var trailingEnd: some View {
         HStack(spacing: 0) {
+            if !pane.isHome && Translate.offer && (pane.foreignLanguage != nil || pane.translated || pane.translating) {
+                translateButton
+            }
             if !pane.isHome { reloadButton }
             if !toolbarLayout {
                 if compact && actions.splitOn && actions.canSwap {
@@ -2977,6 +3280,20 @@ struct PaneView: View {
                     .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
+        .overlay(alignment: atTop ? .bottom : .top) {
+            if let n = pane.notice {
+                Text(n)
+                    .font(.footnote.weight(.semibold).monospacedDigit())
+                    .foregroundStyle(ink)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 7)
+                    .sdGlass(Capsule(), dark: dark, rim: true)
+                    .offset(y: atTop ? 42 : -42)
+                    .transition(.opacity.combined(with: .scale(scale: 0.85)))
+                    .allowsHitTesting(false)
+            }
+        }
+        .animation(spring, value: pane.notice)
         .matchedGeometryEffect(id: "bar", in: ns)
         .transition(.opacity)
     }
@@ -2985,12 +3302,13 @@ struct PaneView: View {
         Menu {
             ControlGroup {
                 Button { actions.settings() } label: { Label("Settings", systemImage: "gearshape") }
+                Button { actions.bookmarks() } label: { Label("Bookmarks", systemImage: "book") }
                 Button { actions.history() } label: { Label("History", systemImage: "clock") }
-                Button { pane.goHome() } label: { Label("Home", systemImage: "house") }
             }
             .controlGroupStyle(.compactMenu)
             Section {
                 Button { actions.newTab() } label: { Label("New Tab", systemImage: "plus.square.on.square") }
+                Button { pane.goHome() } label: { Label("Home", systemImage: "house") }
                 if pane.isPrivate {
                     Button { actions.exitPrivate() } label: { Label("Leave Private Mode", systemImage: "eye") }
                     Button(role: .destructive) { actions.closePrivate() } label: { Label("Close Private Tab", systemImage: "xmark") }
@@ -3001,12 +3319,27 @@ struct PaneView: View {
             if !pane.isHome {
                 Section {
                     if let url = pane.webView.url {
+                        let marked = Bookmarks.shared.find(url.absoluteString) != nil
+                        Button {
+                            Bookmarks.shared.toggle(url: url.absoluteString, title: pane.title)
+                            pane.flash(marked ? "Bookmark removed" : "Bookmarked")
+                        } label: {
+                            Label(marked ? "Remove Bookmark" : "Add Bookmark", systemImage: marked ? "star.fill" : "star")
+                        }
                         ShareLink(item: url, subject: Text(pane.title)) {
                             Label("Share", systemImage: "square.and.arrow.up")
                         }
                     }
+                    Button { pane.requestTranslation() } label: {
+                        Label(pane.translated ? "Show Original" : "Translate to \(Translate.name(Translate.target))", systemImage: "translate")
+                    }
+                    ControlGroup {
+                        Button { pane.zoomOut() } label: { Label("Smaller", systemImage: "textformat.size.smaller") }
+                        Button { pane.setZoom(Zoom.defaultLevel) } label: { Text(Zoom.label(pane.zoom)) }
+                        Button { pane.zoomIn() } label: { Label("Larger", systemImage: "textformat.size.larger") }
+                    }
                     Button { actions.shields() } label: {
-                        Label(actions.shieldsUp ? "Shields · \(pane.blockedCount) blocked" : "Shields Down",
+                        Label(actions.shieldsUp ? "Shields · \(pane.blockedShown) blocked" : "Shields Down",
                               systemImage: actions.shieldsUp ? "shield.lefthalf.filled" : "shield.slash")
                     }
                     Menu {
@@ -3048,6 +3381,46 @@ struct PaneView: View {
     }
 }
 
+// Runs page translation with Apple's on-device Translation framework (iOS 18 and later).
+struct TranslateHook: ViewModifier {
+    @ObservedObject var pane: Pane
+    @ViewBuilder func body(content: Content) -> some View {
+        #if canImport(Translation)
+        if #available(iOS 18.0, *) {
+            content.modifier(PageTranslator(pane: pane))
+        } else {
+            content
+        }
+        #else
+        content
+        #endif
+    }
+}
+
+#if canImport(Translation)
+@available(iOS 18.0, *)
+struct PageTranslator: ViewModifier {
+    @ObservedObject var pane: Pane
+    @State private var config: TranslationSession.Configuration?
+
+    func body(content: Content) -> some View {
+        content
+            .translationTask(config) { session in
+                await pane.runTranslation(session)
+            }
+            .onChange(of: pane.translateRequest) { _, _ in
+                let target = Locale.Language(identifier: Translate.target)
+                let source = pane.foreignLanguage.map { Locale.Language(identifier: $0) }
+                if config == nil || config?.target != target || config?.source != source {
+                    config = TranslationSession.Configuration(source: source, target: target)
+                } else {
+                    config?.invalidate()
+                }
+            }
+    }
+}
+#endif
+
 // Whether a menu, share sheet or other sheet is on screen, so the address bar doesn't fold away under it.
 enum OverlayProbe {
     static func somethingOpen() -> Bool {
@@ -3080,6 +3453,7 @@ func siteShortName(_ h: String) -> String {
 struct FocusSplash: View {
     @ObservedObject var sites: Sites
     @ObservedObject var history: HistoryStore
+    @ObservedObject private var bookmarks = Bookmarks.shared
     var query: String
     var isPrivate: Bool
     var open: (String) -> Void
@@ -3108,6 +3482,7 @@ struct FocusSplash: View {
                     case .search: Image(systemName: "magnifyingglass")
                     case .recent: Image(systemName: "clock.arrow.circlepath")
                     case .site: Image(systemName: "globe")
+                    case .bookmark: Image(systemName: "book")
                     }
                 }
                 .font(.system(size: 16, weight: .semibold))
@@ -3145,6 +3520,17 @@ struct FocusSplash: View {
                                 .buttonStyle(.plain)
                             }
                         }
+                    }
+                    let marks = Array(bookmarks.items.prefix(5))
+                    if !marks.isEmpty {
+                        Text("Bookmarks").font(.title3.bold())
+                        VStack(spacing: 0) {
+                            ForEach(Array(marks.enumerated()), id: \.element.id) { i, b in
+                                if i > 0 { Divider().padding(.leading, 58) }
+                                row(Suggestion(kind: .bookmark, title: b.title, subtitle: b.host, value: b.url))
+                            }
+                        }
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
                     }
                     let recents = isPrivate ? [] : Array(history.recentSearches.prefix(6))
                     if !recents.isEmpty {
@@ -3735,13 +4121,173 @@ struct HistoryView: View {
 
 // MARK: Tab switcher
 
+// Where each tile sits on screen, written while laying out (no view updates), read when a page flies in or out.
+final class TileFrames {
+    var rects: [UUID: CGRect] = [:]
+    func set(_ id: UUID, _ r: CGRect) { rects[id] = r }
+}
+
+// A picture of the page you were on, and where it was, so it can shrink into its tile.
+struct HeroSnap {
+    let id: UUID
+    let image: UIImage
+    let rect: CGRect
+}
+
+enum TabHero {
+    static var keyWindow: UIWindow? {
+        UIApplication.shared.connectedScenes.compactMap { ($0 as? UIWindowScene)?.keyWindow }.first
+    }
+
+    // Web pages come from WebKit's own snapshot; the home page (drawn by the app) from the window.
+    static func capture(_ p: Pane, done: @escaping (HeroSnap?) -> Void) {
+        let wv = p.webView
+        if p.isHome || wv.window == nil || wv.bounds.width < 1 {
+            guard let w = keyWindow else { done(nil); return }
+            let fmt = UIGraphicsImageRendererFormat()
+            fmt.scale = 2
+            fmt.opaque = true
+            let img = UIGraphicsImageRenderer(bounds: w.bounds, format: fmt).image { _ in
+                w.drawHierarchy(in: w.bounds, afterScreenUpdates: false)
+            }
+            done(HeroSnap(id: p.id, image: img, rect: w.bounds))
+            return
+        }
+        let rect = wv.convert(wv.bounds, to: nil)
+        let cfg = WKSnapshotConfiguration()
+        cfg.afterScreenUpdates = false
+        wv.takeSnapshot(with: cfg) { img, _ in
+            done(img.map { HeroSnap(id: p.id, image: $0, rect: rect) })
+        }
+    }
+}
+
+// Safari-style: the page shrinks smoothly into its tile when the grid opens, and the tile you pick
+// grows back out to fill the screen.
+struct TabSwitcher: View {
+    @ObservedObject var tabs: Tabs
+    var startPrivate: Bool
+    var startSlot: Int
+    var privateLocked: Bool
+    var unlock: () -> Void
+    var snap: HeroSnap?
+    var saver: Bool
+    var close: () -> Void
+
+    @State private var frames = TileFrames()
+    @State private var heroID: UUID?
+    @State private var heroImage: UIImage?
+    @State private var heroFull: CGRect = .zero
+    @State private var atTile = false
+    @State private var shown = false
+    @State private var busy = false
+
+    private var spring: Animation? { saver ? nil : .spring(response: 0.46, dampingFraction: 0.88) }
+
+    private func fullRect(_ size: CGSize) -> CGRect {
+        snap?.rect ?? CGRect(origin: .zero, size: size)
+    }
+
+    private func open() {
+        guard let snap, !saver else {
+            withAnimation(saver ? nil : .easeOut(duration: 0.22)) { shown = true }
+            return
+        }
+        heroID = snap.id
+        heroImage = snap.image
+        heroFull = snap.rect
+        atTile = false
+        // Let the grid lay out (and scroll to this tab) before the page shrinks into its tile.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+            withAnimation(spring) {
+                atTile = true
+                shown = true
+            } completion: {
+                heroID = nil
+                heroImage = nil
+            }
+        }
+    }
+
+    // Grows the chosen tile back out to full screen, switching to that tab underneath.
+    private func pick(_ id: UUID, slot: Int, size: CGSize) {
+        guard !busy else { return }
+        busy = true
+        let image = (snap?.id == id ? snap?.image : nil) ?? tabs.thumb(id)
+        tabs.show(id, slot: slot)
+        guard !saver, !tabs.split, let image, frames.rects[id] != nil else {
+            withAnimation(saver ? nil : .easeOut(duration: 0.2)) { shown = false } completion: { close() }
+            return
+        }
+        heroID = id
+        heroImage = image
+        heroFull = fullRect(size)
+        atTile = true
+        DispatchQueue.main.async {
+            withAnimation(spring) {
+                atTile = false
+                shown = false
+            } completion: { close() }
+        }
+    }
+
+    private func newTab(_ isPrivate: Bool, slot: Int) {
+        guard !busy else { return }
+        busy = true
+        tabs.newTab(slot: slot, isPrivate: isPrivate)
+        withAnimation(saver ? nil : .easeOut(duration: 0.2)) { shown = false } completion: { close() }
+    }
+
+    var body: some View {
+        GeometryReader { g in
+            ZStack {
+                TabsView(tabs: tabs,
+                         startPrivate: startPrivate,
+                         startSlot: startSlot,
+                         privateLocked: privateLocked,
+                         unlock: unlock,
+                         frames: frames,
+                         hiddenTile: heroID,
+                         fresh: snap.map { [$0.id: $0.image] } ?? [:],
+                         scrollTo: snap?.id,
+                         pick: { id, slot in pick(id, slot: slot, size: g.size) },
+                         newTab: { priv, slot in newTab(priv, slot: slot) },
+                         done: { pick(tabs.split ? tabs.visible[min(startSlot, tabs.visible.count - 1)] : tabs.left,
+                                      slot: startSlot, size: g.size) })
+                    .opacity(shown ? 1 : 0)
+                if let heroID, let heroImage {
+                    let tile = frames.rects[heroID]
+                    let r = atTile ? (tile ?? CGRect(x: g.size.width / 2 - 40, y: g.size.height / 2 - 60, width: 80, height: 120)) : heroFull
+                    Image(uiImage: heroImage)
+                        .resizable()
+                        .scaledToFill()
+                        .frame(width: r.width, height: r.height, alignment: .top)
+                        .clipShape(RoundedRectangle(cornerRadius: atTile ? 16 : 0, style: .continuous))
+                        .shadow(color: .black.opacity(atTile ? 0.12 : 0), radius: 8, y: 3)
+                        .opacity(atTile && tile == nil ? 0 : 1)
+                        .position(x: r.midX, y: r.midY)
+                        .allowsHitTesting(false)
+                }
+            }
+        }
+        .ignoresSafeArea()
+        .onAppear(perform: open)
+    }
+}
+
 struct TabsView: View {
     @ObservedObject var tabs: Tabs
     var startPrivate: Bool
     var startSlot: Int
     var privateLocked: Bool
     var unlock: () -> Void
-    @Environment(\.dismiss) private var dismiss
+    var frames: TileFrames
+    var hiddenTile: UUID?
+    var fresh: [UUID: UIImage]
+    var scrollTo: UUID?
+    var pick: (UUID, Int) -> Void
+    var newTab: (Bool, Int) -> Void
+    var done: () -> Void
     @State private var slotChoice: Int?
     @State private var privateSection: Bool?
 
@@ -3753,59 +4299,62 @@ struct TabsView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(spacing: 16) {
-                    Picker("Tabs", selection: Binding(get: { showingPrivate }, set: { privateSection = $0 })) {
-                        Text("Tabs (\(tabs.normalCount))").tag(false)
-                        Text("Private (\(tabs.privateCount))").tag(true)
-                    }
-                    .pickerStyle(.segmented)
-                    if tabs.split {
-                        Picker("Open in", selection: Binding(get: { slot }, set: { slotChoice = $0 })) {
-                            Text("First Pane").tag(0)
-                            Text("Second Pane").tag(1)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(spacing: 16) {
+                        Picker("Tabs", selection: Binding(get: { showingPrivate }, set: { privateSection = $0 })) {
+                            Text("Tabs (\(tabs.normalCount))").tag(false)
+                            Text("Private (\(tabs.privateCount))").tag(true)
                         }
                         .pickerStyle(.segmented)
-                    }
-                    if showingPrivate && privateLocked && tabs.privateCount > 0 {
-                        VStack(spacing: 12) {
-                            Image(systemName: "lock.fill").font(.system(size: 30))
-                            Text("Private tabs are locked").font(.headline)
-                            Button("Unlock", action: unlock).buttonStyle(.borderedProminent)
+                        if tabs.split {
+                            Picker("Open in", selection: Binding(get: { slot }, set: { slotChoice = $0 })) {
+                                Text("First Pane").tag(0)
+                                Text("Second Pane").tag(1)
+                            }
+                            .pickerStyle(.segmented)
                         }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 60)
-                    } else if showingPrivate && tabs.privateCount == 0 {
-                        VStack(spacing: 10) {
-                            Image(systemName: "eye.slash").font(.system(size: 30)).foregroundStyle(.secondary)
-                            Text("No private tabs").font(.headline)
-                            Text("Private tabs don't save history, cookies or site data.")
-                                .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                        if showingPrivate && privateLocked && tabs.privateCount > 0 {
+                            VStack(spacing: 12) {
+                                Image(systemName: "lock.fill").font(.system(size: 30))
+                                Text("Private tabs are locked").font(.headline)
+                                Button("Unlock", action: unlock).buttonStyle(.borderedProminent)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 60)
+                        } else if showingPrivate && tabs.privateCount == 0 {
+                            VStack(spacing: 10) {
+                                Image(systemName: "eye.slash").font(.system(size: 30)).foregroundStyle(.secondary)
+                                Text("No private tabs").font(.headline)
+                                Text("Private tabs don't save history, cookies or site data.")
+                                    .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                            }
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 60)
                         }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 60)
-                    }
-                    LazyVGrid(columns: columns, spacing: 18) {
-                        ForEach(tabs.list.filter { $0.isPrivate == showingPrivate && !(showingPrivate && privateLocked) }) { t in
-                            TabCard(t: t, tabs: tabs) {
-                                tabs.show(t.id, slot: tabs.split ? slot : 0)
-                                dismiss()
+                        LazyVGrid(columns: columns, spacing: 18) {
+                            ForEach(tabs.list.filter { $0.isPrivate == showingPrivate && !(showingPrivate && privateLocked) }) { t in
+                                TabCard(t: t, tabs: tabs, frames: frames, hidden: hiddenTile == t.id, fresh: fresh[t.id]) {
+                                    pick(t.id, tabs.split ? slot : 0)
+                                }
+                                .id(t.id)
                             }
                         }
+                        Text("Swipe a tab left or right to close it. Tabs you haven't used recently sleep to save memory and battery, then reload when opened.")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.top, 4)
                     }
-                    Text("Swipe a tab left or right to close it. Tabs you haven't used recently sleep to save memory and battery, then reload when opened.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .padding(.top, 4)
+                    .padding(16)
                 }
-                .padding(16)
+                .onAppear { if let scrollTo { proxy.scrollTo(scrollTo, anchor: .center) } }
             }
             .background(Color(.systemGroupedBackground))
             .navigationTitle(showingPrivate ? "Private Tabs" : "Tabs")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
-                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .cancellationAction) { Button("Done", action: done) }
                 if showingPrivate && tabs.privateCount > 0 && !privateLocked {
                     ToolbarItem(placement: .bottomBar) {
                         Button("Close All Private Tabs", role: .destructive) {
@@ -3815,30 +4364,31 @@ struct TabsView: View {
                 }
                 ToolbarItem(placement: .primaryAction) {
                     Menu {
-                        Button { tabs.newTab(slot: tabs.split ? slot : 0); dismiss() } label: {
+                        Button { newTab(false, tabs.split ? slot : 0) } label: {
                             Label("New Tab", systemImage: "plus.square.on.square")
                         }
-                        Button { tabs.newTab(slot: tabs.split ? slot : 0, isPrivate: true); dismiss() } label: {
+                        Button { newTab(true, tabs.split ? slot : 0) } label: {
                             Label("New Private Tab", systemImage: "eye.slash")
                         }
                     } label: {
                         Image(systemName: "plus")
                     } primaryAction: {
-                        tabs.newTab(slot: tabs.split ? slot : 0, isPrivate: showingPrivate)
-                        dismiss()
+                        newTab(showingPrivate, tabs.split ? slot : 0)
                     }
                     .accessibilityLabel(showingPrivate ? "New private tab" : "New tab")
                 }
             }
         }
     }
-
 }
 
 // One tab in the grid. Swipe it sideways to close it, or tap to open.
 struct TabCard: View {
     let t: TabInfo
     @ObservedObject var tabs: Tabs
+    var frames: TileFrames? = nil
+    var hidden = false
+    var fresh: UIImage? = nil
     var open: () -> Void
     @State private var dx: CGFloat = 0
     @State private var closing = false
@@ -3861,6 +4411,11 @@ struct TabCard: View {
                     .frame(maxWidth: .infinity)
                     .background(Color(.secondarySystemGroupedBackground))
                     .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .background(GeometryReader { g in
+                        let _ = frames?.set(t.id, g.frame(in: .global))
+                        Color.clear
+                    })
+                    .opacity(hidden ? 0 : 1)
                     .overlay(
                         RoundedRectangle(cornerRadius: 16, style: .continuous)
                             .stroke(isVisible ? Color.accentColor : Color.primary.opacity(0.12), lineWidth: isVisible ? 3 : 0.5)
@@ -3927,7 +4482,7 @@ struct TabCard: View {
             }
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let img = tabs.thumb(t.id) {
+        } else if let img = fresh ?? tabs.thumb(t.id) {
             GeometryReader { g in
                 Image(uiImage: img)
                     .resizable()
@@ -4134,6 +4689,15 @@ struct SettingsView: View {
     @ObservedObject var sites: Sites
     @ObservedObject var shields: Shields
     @ObservedObject var themes: ThemeStore
+    @ObservedObject var history: HistoryStore
+    @ObservedObject var vault: Vault
+    @AppStorage("zoomDefault") private var zoomDefault = 1.0
+    @AppStorage("zoomRemember") private var zoomRemember = true
+    @AppStorage("appLock") private var appLock = false
+    @AppStorage("appLockDelay") private var appLockDelay = 0
+    @AppStorage("translateTo") private var translateTo = Translate.target
+    @AppStorage("offerTranslate") private var offerTranslate = true
+    @State private var siteZooms = Zoom.sites.count
     @AppStorage("engine") private var engine = "DuckDuckGo"
     @AppStorage("saver") private var saver = false
     @AppStorage("homeMode") private var homeMode = 0
@@ -4280,6 +4844,64 @@ struct SettingsView: View {
                     Text("Privacy")
                 } footer: {
                     Text("Private tabs are hidden behind Face ID when you leave the app, and covered in the app switcher. VPN connects only to a provider you set up yourself: SplitDeck doesn't host VPN servers, as we don't yet have the resources to run them securely.")
+                }
+                Section {
+                    Toggle("Lock SplitDeck", isOn: Binding(get: { appLock }, set: { on in
+                        // Turning it on (or off) needs the same check it will ask for later.
+                        Task {
+                            if await Vault.confirm(on ? "Turn on app lock" : "Turn off app lock") { appLock = on }
+                        }
+                    }))
+                    if appLock {
+                        Picker("Require", selection: $appLockDelay) {
+                            Text("Immediately").tag(0)
+                            Text("After 1 Minute").tag(60)
+                            Text("After 5 Minutes").tag(300)
+                            Text("After 15 Minutes").tag(900)
+                        }
+                    }
+                } header: {
+                    Text("App Lock")
+                } footer: {
+                    Text("Asks for \(Biometry.kind.name) (or your passcode) when SplitDeck opens, and hides it in the app switcher.")
+                }
+                Section {
+                    Picker("Default Zoom", selection: $zoomDefault) {
+                        ForEach(Zoom.steps, id: \.self) { Text(Zoom.label($0)).tag($0) }
+                    }
+                    Toggle("Remember Zoom for Each Site", isOn: $zoomRemember)
+                    if siteZooms > 0 {
+                        Button("Reset \(siteZooms) Site Zoom Level\(siteZooms == 1 ? "" : "s")", role: .destructive) {
+                            UserDefaults.standard.removeObject(forKey: "zoomSites")
+                            siteZooms = 0
+                        }
+                    }
+                } header: {
+                    Text("Page Zoom")
+                } footer: {
+                    Text("Change a page's zoom from ⋯ in the address bar. The default applies to every site you haven't zoomed yourself.")
+                }
+                Section {
+                    Picker("Translate To", selection: $translateTo) {
+                        ForEach(Translate.languages, id: \.code) { Text($0.name).tag($0.code) }
+                    }
+                    Toggle("Offer to Translate", isOn: $offerTranslate)
+                } header: {
+                    Text("Translation")
+                } footer: {
+                    Text("When most of a page is in another language, a translate button appears in the address bar. You can always translate from ⋯. Runs on this iPhone with Apple Translate; iOS may ask to download a language the first time.")
+                }
+                Section {
+                    NavigationLink("Import from Safari or Chrome") {
+                        ImportContent(history: history, vault: vault).navigationTitle("Import Browsing Data")
+                    }
+                    Button("Default Browser") {
+                        if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
+                    }
+                } header: {
+                    Text("Browsing Data")
+                } footer: {
+                    Text("iOS only offers apps with Apple's browser entitlement as the default browser. That needs a paid developer account and App Store review, which this test build doesn't have yet, so SplitDeck can't be chosen there for now. Meanwhile, other apps and Shortcuts can open any link here with splitdeck://open?url= followed by the address.")
                 }
                 Section {
                     Toggle("Battery Saver", isOn: $saver)
@@ -4893,12 +5515,276 @@ struct CardEditor: View {
     }
 }
 
+// MARK: Bookmarks screen
+
+struct BookmarksView: View {
+    @ObservedObject var bookmarks = Bookmarks.shared
+    var open: (String) -> Void
+    var importData: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+    @State private var renaming: Bookmark?
+    @State private var newTitle = ""
+
+    private var filtered: [Bookmark] {
+        let q = query.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !q.isEmpty else { return bookmarks.items }
+        return bookmarks.items.filter { $0.title.lowercased().contains(q) || $0.url.lowercased().contains(q) }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                ForEach(filtered) { b in
+                    Button {
+                        open(b.url)
+                        dismiss()
+                    } label: {
+                        HStack(spacing: 12) {
+                            SiteIcon(host: b.host, size: 34)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(b.title).foregroundStyle(.primary).lineLimit(1)
+                                Text(b.host).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            }
+                        }
+                    }
+                    .contextMenu {
+                        Button { newTitle = b.title; renaming = b } label: { Label("Rename", systemImage: "pencil") }
+                        Button { UIPasteboard.general.string = b.url } label: { Label("Copy Link", systemImage: "link") }
+                        Button(role: .destructive) { withAnimation { bookmarks.remove(b.id) } } label: { Label("Delete", systemImage: "trash") }
+                    }
+                    .swipeActions {
+                        Button(role: .destructive) { withAnimation { bookmarks.remove(b.id) } } label: { Label("Delete", systemImage: "trash") }
+                    }
+                }
+            }
+            .overlay {
+                if bookmarks.items.isEmpty {
+                    ContentUnavailableView("No Bookmarks", systemImage: "book",
+                                           description: Text("Tap ⋯ › Add Bookmark on any page, or import them from Safari or Chrome."))
+                }
+            }
+            .searchable(text: $query, prompt: "Search bookmarks")
+            .navigationTitle("Bookmarks")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .primaryAction) {
+                    Button(action: importData) { Image(systemName: "square.and.arrow.down") }
+                        .accessibilityLabel("Import bookmarks")
+                }
+            }
+            .alert("Rename Bookmark", isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } }),
+                   presenting: renaming) { b in
+                TextField("Title", text: $newTitle)
+                Button("Save") { bookmarks.rename(b.id, to: newTitle) }
+                Button("Cancel", role: .cancel) {}
+            }
+        }
+    }
+}
+
+// MARK: Import browsing data
+
+enum BrowserImport {
+    // Bookmarks exported by Safari, Chrome, Firefox or Edge (the standard bookmarks .html file).
+    static func bookmarks(fromHTML s: String) -> [Bookmark] {
+        guard let re = try? NSRegularExpression(pattern: #"<a\s[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#,
+                                                options: [.caseInsensitive, .dotMatchesLineSeparators]) else { return [] }
+        let ns = s as NSString
+        return re.matches(in: s, range: NSRange(location: 0, length: ns.length)).compactMap { m in
+            let url = decode(ns.substring(with: m.range(at: 1)))
+            guard url.lowercased().hasPrefix("http") else { return nil }
+            let raw = ns.substring(with: m.range(at: 2)).replacingOccurrences(of: #"<[^>]+>"#, with: "", options: .regularExpression)
+            let title = decode(raw).trimmingCharacters(in: .whitespacesAndNewlines)
+            return Bookmark(title: title.isEmpty ? url : title, url: url)
+        }
+    }
+
+    static func decode(_ s: String) -> String {
+        s.replacingOccurrences(of: "&lt;", with: "<").replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"").replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&amp;", with: "&")
+    }
+
+    // History exported by Safari (History.json). Reads any list of entries that have a web address.
+    static func history(fromJSON d: Data) -> [(url: String, title: String, date: Date)] {
+        guard let obj = try? JSONSerialization.jsonObject(with: d) else { return [] }
+        var out: [(url: String, title: String, date: Date)] = []
+        func time(_ v: Any?) -> Date? {
+            guard let n = (v as? NSNumber)?.doubleValue, n > 0 else { return nil }
+            if n > 1e14 { return Date(timeIntervalSince1970: n / 1_000_000) }   // microseconds
+            if n > 1e11 { return Date(timeIntervalSince1970: n / 1000) }        // milliseconds
+            return Date(timeIntervalSince1970: n)
+        }
+        func walk(_ o: Any, depth: Int) {
+            guard depth < 6, out.count < 20000 else { return }
+            if let a = o as? [Any] {
+                a.forEach { walk($0, depth: depth + 1) }
+            } else if let d = o as? [String: Any] {
+                if let u = d["url"] as? String, u.lowercased().hasPrefix("http") {
+                    let date = time(d["time_usec"]) ?? time(d["visit_time"]) ?? time(d["last_visit_time"]) ?? Date()
+                    out.append((u, d["title"] as? String ?? "", date))
+                } else {
+                    d.values.forEach { walk($0, depth: depth + 1) }
+                }
+            }
+        }
+        walk(obj, depth: 0)
+        return out
+    }
+}
+
+struct ImportContent: View {
+    @ObservedObject var history: HistoryStore
+    @ObservedObject var vault: Vault
+    @State private var picking = false
+    @State private var working = false
+    @State private var results: [String] = []
+
+    var body: some View {
+        List {
+            Section {
+                Label("Bookmarks: the .html bookmarks file", systemImage: "book")
+                Label("History: Safari's History.json", systemImage: "clock")
+                Label("Passwords: a .csv file (goes into the vault after Face ID)", systemImage: "key")
+            } header: {
+                Text("What you can bring in")
+            }
+            Section {
+                Text("On iPhone: Settings › Apps › Safari › Export Browsing Data. Save it to Files, tap the .zip to unzip it, then choose the files below.")
+            } header: {
+                Text("From Safari")
+            }
+            Section {
+                Text("On a computer: Bookmarks › Bookmark Manager › ⋮ › Export Bookmarks. Passwords: Settings › Autofill and passwords › Google Password Manager › Export. Then move the files to your iPhone.")
+            } header: {
+                Text("From Chrome")
+            }
+            Section {
+                Button {
+                    picking = true
+                } label: {
+                    HStack {
+                        Label("Choose Files…", systemImage: "folder")
+                        if working { Spacer(); ProgressView() }
+                    }
+                }
+                .disabled(working)
+            } footer: {
+                Text("Everything stays on this iPhone. Delete exported files once they're imported, especially passwords.")
+            }
+            if !results.isEmpty {
+                Section("Imported") {
+                    ForEach(results, id: \.self) { Label($0, systemImage: "checkmark.circle.fill") }
+                }
+            }
+        }
+        .fileImporter(isPresented: $picking,
+                      allowedContentTypes: [.html, .json, .commaSeparatedText, .plainText],
+                      allowsMultipleSelection: true) { r in
+            guard case .success(let urls) = r else { return }
+            Task { await handle(urls) }
+        }
+    }
+
+    @MainActor
+    private func handle(_ urls: [URL]) async {
+        working = true
+        defer { working = false }
+        var out: [String] = []
+        for url in urls {
+            let ok = url.startAccessingSecurityScopedResource()
+            let data = try? Data(contentsOf: url)
+            if ok { url.stopAccessingSecurityScopedResource() }
+            guard let data else { continue }
+            let name = url.lastPathComponent
+            switch url.pathExtension.lowercased() {
+            case "html", "htm":
+                let n = Bookmarks.shared.merge(BrowserImport.bookmarks(fromHTML: String(decoding: data, as: UTF8.self)))
+                out.append("\(n) bookmarks from \(name)")
+            case "json":
+                let entries = await Task.detached(priority: .userInitiated) { BrowserImport.history(fromJSON: data) }.value
+                out.append("\(history.importVisits(entries)) history entries from \(name)")
+            case "csv", "txt":
+                if !vault.unlocked { await vault.unlock() }
+                guard vault.unlocked else { out.append("Passwords in \(name) skipped: vault stayed locked"); continue }
+                out.append("\(vault.importCSV(String(decoding: data, as: UTF8.self))) passwords from \(name)")
+            default:
+                out.append("\(name): not a file SplitDeck can read")
+            }
+        }
+        withAnimation { results = out.isEmpty ? ["Nothing to import in those files."] : out }
+    }
+}
+
+struct ImportView: View {
+    @ObservedObject var history: HistoryStore
+    @ObservedObject var vault: Vault
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ImportContent(history: history, vault: vault)
+                .navigationTitle("Import Browsing Data")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+        }
+    }
+}
+
+// MARK: App lock
+
+enum Biometry {
+    static var kind: (name: String, icon: String) {
+        let c = LAContext()
+        var e: NSError?
+        guard c.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &e) else { return ("Passcode", "lock.fill") }
+        switch c.biometryType {
+        case .faceID: return ("Face ID", "faceid")
+        case .touchID: return ("Touch ID", "touchid")
+        case .opticID: return ("Optic ID", "opticid")
+        default: return ("Passcode", "lock.fill")
+        }
+    }
+}
+
+// Covers the whole app while it's locked, and in the app switcher.
+struct AppLockCover: View {
+    var active: Bool
+    var unlock: () -> Void
+    @Environment(\.sdTheme) private var theme
+    private let kind = Biometry.kind
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [theme.top, theme.bottom], startPoint: .top, endPoint: .bottom)
+            Rectangle().fill(.ultraThinMaterial)
+            VStack(spacing: 18) {
+                BrandMark(size: 84)
+                Text("SplitDeck is locked").font(.title2.bold())
+                if active {
+                    Button(action: unlock) {
+                        Label("Unlock with \(kind.name)", systemImage: kind.icon)
+                            .font(.headline)
+                            .frame(maxWidth: 260, minHeight: 50)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+        }
+        .ignoresSafeArea()
+    }
+}
+
 // MARK: Main screen
 
 enum Sheet: Identifiable {
-    case vault, settings, calendar, vpn, tabs, shields, history
+    case vault, settings, calendar, vpn, tabs, shields, history, bookmarks, importData
     var id: Int {
         switch self {
+        case .bookmarks: return 7
+        case .importData: return 8
         case .history: return 6
         case .vault: return 0
         case .settings: return 1
@@ -4945,6 +5831,14 @@ struct ContentView: View {
     @Environment(\.colorScheme) private var envScheme
     @State private var toast: String?
     @State private var tabsSlot = 0
+    @State private var tabsOpen = false
+    @State private var switcherSnap: HeroSnap?
+    @State private var bookmarksPane: Pane?
+    @AppStorage("appLock") private var appLock = false
+    @AppStorage("appLockDelay") private var appLockDelay = 0
+    @State private var appLocked = UserDefaults.standard.bool(forKey: "appLock")
+    @State private var leftAt: Date?
+    @State private var unlocking = false
 
     // Battery saver: dark only. Private tab on top: dark. Otherwise your Light / Dark / System choice.
     private var appScheme: ColorScheme? {
@@ -4984,13 +5878,34 @@ struct ContentView: View {
             }
             .overlay(alignment: .top) {
                 if let toast {
-                    Label(toast, systemImage: "key.fill")
+                    Label(toast, systemImage: "checkmark.circle.fill")
                         .font(.footnote.weight(.semibold))
                         .padding(.horizontal, 16)
                         .padding(.vertical, 10)
                         .sdGlass(Capsule())
                         .padding(.top, safe.top + 8)
                         .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .overlay {
+                if tabsOpen {
+                    TabSwitcher(tabs: tabs,
+                                startPrivate: tabs.info(tabsSlot == 1 ? tabs.right : tabs.left)?.isPrivate ?? false,
+                                startSlot: tabsSlot,
+                                privateLocked: privateLocked,
+                                unlock: unlockPrivate,
+                                snap: switcherSnap,
+                                saver: saver) {
+                        tabsOpen = false
+                        switcherSnap = nil
+                    }
+                }
+            }
+            .overlay {
+                // App lock: over everything, including the app switcher snapshot.
+                if appLock && (appLocked || phase != .active) {
+                    AppLockCover(active: appLocked && phase == .active, unlock: unlockApp)
+                        .transition(.opacity)
                 }
             }
         }
@@ -5033,6 +5948,7 @@ struct ContentView: View {
             Pane.ruleProvider = { host in shields.rules(for: host) }
             Pane.youtubeProvider = { host in shields.youtubeOn(for: host) }
             Pane.onBlocked = { shields.countBlocked() }
+            if appLock && appLocked { unlockApp() }
             tabs.configure = { p in configure(p) }
             tabs.allLive.forEach { configure($0) }
             applySaver()
@@ -5051,7 +5967,19 @@ struct ContentView: View {
         .onChange(of: phase) { _, p in
             if p != .active { vault.lock() }
             if p == .background && lockPrivate && tabs.privateCount > 0 { privateLocked = true }
+            if p == .background { leftAt = Date() }
+            if p == .active && appLock {
+                if let leftAt, Date().timeIntervalSince(leftAt) >= Double(appLockDelay) {
+                    sheet = nil
+                    shieldsPane = nil
+                    appLocked = true
+                }
+                leftAt = nil
+                if appLocked { unlockApp() }
+            }
         }
+        .onChange(of: appLock) { _, on in if !on { appLocked = false } }
+        .onOpenURL { openLink($0) }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
             tabs.sleepHidden()
         }
@@ -5074,9 +6002,38 @@ struct ContentView: View {
     }
 
     private func openTabs(slot: Int) {
+        guard !tabsOpen else { return }
         tabsSlot = tabs.split ? slot : 0
         tabs.snapshotVisible()
-        sheet = .tabs
+        // Full screen: capture the page so it can shrink into its tile. Split view simply fades the grid in.
+        guard !saver, !tabs.split else {
+            switcherSnap = nil
+            tabsOpen = true
+            return
+        }
+        TabHero.capture(tabs.pane(tabs.left)) { s in
+            switcherSnap = s
+            tabsOpen = true
+        }
+    }
+
+    private func unlockApp() {
+        guard !unlocking else { return }
+        unlocking = true
+        Task {
+            let ok = try? await LAContext().evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Unlock SplitDeck")
+            await MainActor.run {
+                unlocking = false
+                if ok == true { withAnimation(anim(.easeOut(duration: 0.25))) { appLocked = false } }
+            }
+        }
+    }
+
+    // Opens a link from another app or Shortcuts in a new tab.
+    private func openLink(_ url: URL) {
+        guard let target = DeepLink.target(url) else { return }
+        tabs.newTab(slot: 0)
+        tabs.pane(tabs.left).load(target)
     }
 
     private func unlockPrivate() {
@@ -5209,7 +6166,8 @@ struct ContentView: View {
                 islandShown: showIsland,
                 exitPrivate: { withAnimation(anim(.snappy)) { tabs.exitPrivate(slot: slot) } },
                 closePrivate: { withAnimation(anim(.snappy)) { tabs.closePrivate(slot: slot) } },
-                splitEnabled: splitEnabled
+                splitEnabled: splitEnabled,
+                bookmarks: { bookmarksPane = p; sheet = .bookmarks }
             ),
             compact: compact,
             atTop: atTop,
@@ -5223,19 +6181,21 @@ struct ContentView: View {
     @ViewBuilder private func sheetView(_ s: Sheet) -> some View {
         switch s {
         case .vault: VaultView(vault: vault, fill: fill)
-        case .settings: SettingsView(sites: sites, shields: shields, themes: themes, openVault: { sheet = .vault }, openVPN: { sheet = .vpn })
+        case .settings: SettingsView(sites: sites, shields: shields, themes: themes, history: history, vault: vault,
+                                     openVault: { sheet = .vault }, openVPN: { sheet = .vpn })
         case .calendar: EventEditor(title: calTitle, url: calURL).ignoresSafeArea()
         case .vpn: VPNView(vpn: vpnService)
         case .tabs:
-            TabsView(tabs: tabs,
-                     startPrivate: tabs.info(tabsSlot == 1 ? tabs.right : tabs.left)?.isPrivate ?? false,
-                     startSlot: tabsSlot,
-                     privateLocked: privateLocked,
-                     unlock: unlockPrivate)
+            EmptyView()
         case .history:
             HistoryView(history: history, sites: sites) { text in historyPane?.load(text) }
         case .shields:
             EmptyView()
+        case .bookmarks:
+            BookmarksView(open: { url in (bookmarksPane ?? tabs.pane(tabs.left)).load(url) },
+                          importData: { sheet = .importData })
+        case .importData:
+            ImportView(history: history, vault: vault)
         }
     }
 
