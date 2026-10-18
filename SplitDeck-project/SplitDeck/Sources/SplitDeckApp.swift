@@ -10,6 +10,7 @@ import UniformTypeIdentifiers
 import EventKit
 import EventKitUI
 import NetworkExtension
+import Network
 import PhotosUI
 
 @main
@@ -865,9 +866,12 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     private var loadObs: NSKeyValueObservation?
 
 
+    static var onMediaChange: (() -> Void)?
+
     static func installScripts(_ u: WKUserContentController, youtube: Bool) {
         u.removeAllUserScripts()
         u.addUserScript(WKUserScript(source: Rules.raf, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        u.addUserScript(WKUserScript(source: YouTubeMedia.script(), injectionTime: .atDocumentStart, forMainFrameOnly: true))
         if youtube {
             u.addUserScript(WKUserScript(source: Rules.youtube, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
@@ -1213,6 +1217,10 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         webView.evaluateJavaScript("window.__sdFps=\(Pane.fps)")
         if translated || foreignLanguage != nil || translating { translated = false; foreignLanguage = nil; translating = false }
+        let committed = webView.url?.host ?? ""
+        if committed == "youtube.com" || committed.hasSuffix(".youtube.com") {
+            webView.evaluateJavaScript("window.__sdNet='\(NetworkWatch.shared.name)';window.__sdYTRefresh&&window.__sdYTRefresh()")
+        }
         let z = Zoom.level(for: webView.url?.host ?? "")
         if abs(webView.pageZoom - z) > 0.001 { webView.pageZoom = z }
         if zoom != z { zoom = z }
@@ -1235,6 +1243,18 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.detectLanguage() }
         }
         // Logins and cards on pages are filled by iOS AutoFill (Passwords app), not by SplitDeck.
+    }
+
+    // MARK: YouTube media
+
+    private var isYouTube: Bool { host == "youtube.com" || host.hasSuffix(".youtube.com") }
+
+    // New quality or blocking settings, or a switch between Wi‑Fi and mobile data.
+    func refreshMedia() {
+        let youtubeAds = appliedRules?.contains("youtube-script") ?? false
+        Pane.installScripts(webView.configuration.userContentController, youtube: youtubeAds)
+        guard isYouTube else { return }
+        webView.evaluateJavaScript("window.__sdNet='\(NetworkWatch.shared.name)';window.__sdYTSet&&window.__sdYTSet(\(YouTubeMedia.prefsJSON))")
     }
 
     // MARK: Zoom
@@ -4911,6 +4931,7 @@ struct SettingsView: View {
                 }
                 Section {
                     NavigationLink("Shields") { ShieldsSettings(shields: shields) }
+                    NavigationLink("Media") { MediaSettings() }
                     Button("VPN") { openVPN() }
                     Toggle("Lock Private Tabs", isOn: $lockPrivate)
                 } header: {
@@ -6364,6 +6385,190 @@ struct IntroThanksArt: View {
     }
 }
 
+// MARK: YouTube media settings
+
+// Watches whether the iPhone is on Wi‑Fi or on mobile data (a personal hotspot counts as mobile data).
+final class NetworkWatch {
+    static let shared = NetworkWatch()
+    private(set) var onCellular = false
+    private let monitor = NWPathMonitor()
+
+    private init() {
+        monitor.pathUpdateHandler = { [weak self] path in
+            let cell = path.isExpensive
+            DispatchQueue.main.async {
+                guard let self, self.onCellular != cell else { return }
+                self.onCellular = cell
+                Pane.onMediaChange?()
+            }
+        }
+        monitor.start(queue: DispatchQueue(label: "splitdeck.network"))
+    }
+
+    var name: String { onCellular ? "cell" : "wifi" }
+}
+
+// Video quality and YouTube clean-up, applied by a small script on youtube.com.
+enum YouTubeMedia {
+    enum Quality: String, CaseIterable, Identifiable {
+        case best, auto, saver
+        var id: String { rawValue }
+        var title: String {
+            switch self {
+            case .best: return "Best Available"
+            case .auto: return "Auto"
+            case .saver: return "Data Saver"
+            }
+        }
+    }
+
+    private static var d: UserDefaults { .standard }
+    static var wifi: Quality { Quality(rawValue: d.string(forKey: "ytQualityWifi") ?? "") ?? .best }
+    static var cellular: Quality { Quality(rawValue: d.string(forKey: "ytQualityCell") ?? "") ?? .auto }
+    static var blockRecs: Bool { d.bool(forKey: "ytBlockRecs") }
+    static var blockDistract: Bool { d.bool(forKey: "ytBlockDistract") }
+    static var blockShorts: Bool { d.bool(forKey: "ytBlockShorts") }
+
+    static var prefsJSON: String {
+        "{\"wifi\":\"\(wifi.rawValue)\",\"cell\":\"\(cellular.rawValue)\",\"recs\":\(blockRecs),\"distract\":\(blockDistract),\"shorts\":\(blockShorts)}"
+    }
+
+    // Settings changed: every open tab picks them up straight away.
+    static func changed() { Pane.onMediaChange?() }
+
+    static func script() -> String {
+        source.replacingOccurrences(of: "__PREFS__", with: prefsJSON)
+            .replacingOccurrences(of: "__NET__", with: NetworkWatch.shared.name)
+    }
+
+    private static let source = #"""
+    (function(){
+      if (!/(^|\.)youtube\.com$/.test(location.hostname)) return;
+      var P = __PREFS__;
+      if (!window.__sdNet) window.__sdNet = '__NET__';
+      var CSS = {
+        recs: 'ytm-item-section-renderer[section-identifier="related-items"],ytm-watch ytm-video-with-context-renderer,ytm-watch ytm-compact-video-renderer,ytm-compact-autoplay-renderer,ytm-autonav-bar,#related,ytd-watch-next-secondary-results-renderer,.ytp-endscreen-content,.ytp-ce-element,.ytp-autonav-endscreen,.ytp-autonav-endscreen-countdown-overlay,.ytp-videowall-still,.ytp-suggestion-set,.html5-endscreen{display:none!important}',
+        distract: 'ytm-comments-entry-point-header-renderer,ytm-comment-section-renderer,ytm-engagement-panel-section-list-renderer[target-id*="comment"],#comments,ytd-comments,ytm-live-chat-renderer,#chat,ytd-live-chat-frame,ytm-merch-shelf-renderer,ytd-merch-shelf-renderer,ytm-ticket-shelf-renderer,ytd-ticket-shelf-renderer,ytm-mealbar-promo-renderer,.mealbar-promo-renderer,ytm-statement-banner-renderer,ytd-statement-banner-renderer,ytm-clarification-renderer,ytd-clarification-renderer,ytm-info-panel-container-renderer,ytd-info-panel-container-renderer{display:none!important}',
+        shorts: 'ytm-reel-shelf-renderer,ytm-shorts-lockup-view-model,ytm-rich-section-renderer:has(ytm-shorts-lockup-view-model),ytm-rich-section-renderer:has(ytm-reel-shelf-renderer),grid-shelf-view-model:has(ytm-shorts-lockup-view-model),ytm-video-with-context-renderer:has(a[href^="/shorts/"]),ytm-pivot-bar-item-renderer:has(.pivot-shorts),ytd-reel-shelf-renderer,ytd-rich-shelf-renderer[is-shorts],ytd-rich-section-renderer:has(ytd-rich-shelf-renderer[is-shorts]),ytd-video-renderer:has(a[href^="/shorts/"]),ytd-guide-entry-renderer:has(a[title="Shorts"]),ytd-mini-guide-entry-renderer[aria-label="Shorts"]{display:none!important}'
+      };
+      var style = null;
+      function css() {
+        var s = (P.recs ? CSS.recs : '') + (P.distract ? CSS.distract : '') + (P.shorts ? CSS.shorts : '');
+        if (!style) {
+          style = document.createElement('style');
+          style.id = 'sd-youtube';
+          (document.head || document.documentElement).appendChild(style);
+        }
+        style.textContent = s;
+      }
+      function mode() { return window.__sdNet === 'cell' ? P.cell : P.wifi; }
+      // YouTube remembers a preferred quality; set it so new videos start at the right size.
+      function remember() {
+        try {
+          var m = mode();
+          if (m === 'auto') { localStorage.removeItem('yt-player-quality'); return; }
+          var q = m === 'best' ? 4320 : 480;
+          localStorage.setItem('yt-player-quality', JSON.stringify({
+            data: JSON.stringify({ quality: q, previousQuality: q }),
+            expiration: Date.now() + 2592000000, creation: Date.now() }));
+        } catch (e) {}
+      }
+      function quality() {
+        var m = mode();
+        if (m === 'auto') return;
+        var p = document.getElementById('movie_player');
+        if (!p || !p.getAvailableQualityLevels) return;
+        var lv = (p.getAvailableQualityLevels() || []).filter(function (x) { return x !== 'auto'; });
+        if (!lv.length) return;
+        var q = m === 'best' ? lv[0] : (lv.indexOf('large') >= 0 ? 'large' : (lv.indexOf('medium') >= 0 ? 'medium' : lv[lv.length - 1]));
+        try {
+          if (p.getPlaybackQuality && p.getPlaybackQuality() === q) return;
+          if (p.setPlaybackQualityRange) p.setPlaybackQualityRange(q, q);
+          if (p.setPlaybackQuality) p.setPlaybackQuality(q);
+        } catch (e) {}
+      }
+      function soon() { quality(); setTimeout(quality, 800); setTimeout(quality, 2500); }
+      window.__sdYTSet = function (np) { P = np; css(); remember(); soon(); };
+      window.__sdYTRefresh = function () { remember(); soon(); };
+      remember();
+      css();
+      document.addEventListener('loadedmetadata', soon, true);
+      document.addEventListener('playing', soon, true);
+    })();
+    """#
+}
+
+struct MediaQualitySettings: View {
+    @AppStorage("ytQualityWifi") private var wifi = YouTubeMedia.Quality.best.rawValue
+    @AppStorage("ytQualityCell") private var cell = YouTubeMedia.Quality.auto.rawValue
+
+    var body: some View {
+        Form {
+            Section {
+                Picker("On Wi‑Fi", selection: $wifi) {
+                    ForEach(YouTubeMedia.Quality.allCases) { Text($0.title).tag($0.rawValue) }
+                }
+                Picker("On Mobile Data", selection: $cell) {
+                    ForEach(YouTubeMedia.Quality.allCases) { Text($0.title).tag($0.rawValue) }
+                }
+            } footer: {
+                Text("Best Available plays each video at the highest resolution YouTube offers. Auto lets YouTube choose for your connection. Data Saver keeps videos at 480p or lower. A personal hotspot counts as mobile data.")
+            }
+        }
+        .navigationTitle("Highest Quality Playback")
+        .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: wifi) { _, _ in YouTubeMedia.changed() }
+        .onChange(of: cell) { _, _ in YouTubeMedia.changed() }
+    }
+}
+
+// Settings › Media, laid out like Brave's.
+struct MediaSettings: View {
+    @AppStorage("ytQualityWifi") private var wifi = YouTubeMedia.Quality.best.rawValue
+    @AppStorage("ytQualityCell") private var cell = YouTubeMedia.Quality.auto.rawValue
+    @AppStorage("ytBlockRecs") private var recs = false
+    @AppStorage("ytBlockDistract") private var distract = false
+    @AppStorage("ytBlockShorts") private var shorts = false
+
+    private func row(_ title: String, _ detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+            Text(detail).font(.footnote).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func label(_ raw: String) -> String { (YouTubeMedia.Quality(rawValue: raw) ?? .auto).title }
+
+    var body: some View {
+        Form {
+            Section {
+                NavigationLink {
+                    MediaQualitySettings()
+                } label: {
+                    row("Highest Quality Playback", "Wi‑Fi: \(label(wifi)) · Mobile data: \(label(cell))")
+                }
+                Toggle(isOn: $recs) {
+                    row("Block YouTube Recommended Content", "Blocks the Up Next and end card elements on youtube.com")
+                }
+                Toggle(isOn: $distract) {
+                    row("Block YouTube Distracting Elements", "Hides comments, live chat, merch shelves and app banners on youtube.com")
+                }
+                Toggle(isOn: $shorts) {
+                    row("Block YouTube Shorts", "Blocks Shorts from the home page, trending page and search results on youtube.com")
+                }
+            } footer: {
+                Text("Changes apply to open YouTube tabs straight away.")
+            }
+        }
+        .navigationTitle("Media")
+        .navigationBarTitleDisplayMode(.inline)
+        .onChange(of: recs) { _, _ in YouTubeMedia.changed() }
+        .onChange(of: distract) { _, _ in YouTubeMedia.changed() }
+        .onChange(of: shorts) { _, _ in YouTubeMedia.changed() }
+    }
+}
+
 // MARK: Main screen
 
 enum Sheet: Identifiable {
@@ -6551,6 +6756,8 @@ struct ContentView: View {
             Pane.ruleProvider = { host in shields.rules(for: host) }
             Pane.youtubeProvider = { host in shields.youtubeOn(for: host) }
             Pane.onBlocked = { shields.countBlocked() }
+            Pane.onMediaChange = { tabs.allLive.forEach { $0.refreshMedia() } }
+            _ = NetworkWatch.shared
             if appLock && appLocked { unlockApp() }
             tabs.configure = { p in configure(p) }
             tabs.allLive.forEach { configure($0) }
