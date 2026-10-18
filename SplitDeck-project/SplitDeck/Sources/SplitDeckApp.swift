@@ -1573,6 +1573,89 @@ final class ThemeStore: ObservableObject {
     }
 }
 
+// Home screen icon colour options. `icon` is the alternate icon's name in the asset catalog (nil = the main icon).
+struct AppIconOption: Identifiable {
+    let name: String
+    let icon: String?
+    let bg: Color
+    let left: Color
+    let right: Color
+    var id: String { name }
+
+    static let all: [AppIconOption] = [
+        AppIconOption(name: "Default", icon: nil, bg: Theme.hex("#0A1022"), left: Theme.hex("#2440FF"), right: Theme.hex("#C9DBFF")),
+        AppIconOption(name: "Matcha", icon: "AppIcon-Matcha", bg: Theme.hex("#1C2A16"), left: Theme.hex("#7FB54C"), right: Theme.hex("#EEF3E2")),
+        AppIconOption(name: "Sunrise", icon: "AppIcon-Sunrise", bg: Theme.hex("#2A1020"), left: Theme.hex("#FF6A3D"), right: Theme.hex("#FFD8A8")),
+        AppIconOption(name: "Ocean", icon: "AppIcon-Ocean", bg: Theme.hex("#05263A"), left: Theme.hex("#1E8FE6"), right: Theme.hex("#C4ECFF")),
+        AppIconOption(name: "Lavender", icon: "AppIcon-Lavender", bg: Theme.hex("#1C1433"), left: Theme.hex("#8A68EE"), right: Theme.hex("#ECE4FD")),
+        AppIconOption(name: "Sakura", icon: "AppIcon-Sakura", bg: Theme.hex("#2A1120"), left: Theme.hex("#E5507E"), right: Theme.hex("#FDE3EB")),
+        AppIconOption(name: "Ember", icon: "AppIcon-Ember", bg: Theme.hex("#160907"), left: Theme.hex("#FF5A2B"), right: Theme.hex("#FFC891")),
+        AppIconOption(name: "Mono", icon: "AppIcon-Mono", bg: Theme.hex("#F2F2F5"), left: Theme.hex("#1C1C1E"), right: Theme.hex("#9A9AA2")),
+    ]
+}
+
+// The SplitDeck mark drawn natively, so the picker can preview every colour option.
+struct LogoMark: View {
+    let option: AppIconOption
+    var size: CGFloat = 60
+
+    private func half(_ rect: CGRect, cx: CGFloat, cy: CGFloat, r: CGFloat, left: Bool) -> Path {
+        var p = Path()
+        p.addArc(center: CGPoint(x: cx, y: cy), radius: r, startAngle: .degrees(-90), endAngle: .degrees(90), clockwise: left)
+        p.closeSubpath()
+        return p
+    }
+
+    var body: some View {
+        let k = size / 1024
+        ZStack {
+            RoundedRectangle(cornerRadius: size * 0.225, style: .continuous)
+                .fill(RadialGradient(colors: [option.bg.opacity(0.85), option.bg], center: UnitPoint(x: 0.3, y: 0.22),
+                                     startRadius: 0, endRadius: size))
+            half(.zero, cx: (512 - 15) * k, cy: (512 - 64) * k, r: 300 * k, left: true).fill(option.left)
+            half(.zero, cx: (512 + 15) * k, cy: (512 + 64) * k, r: 300 * k, left: false).fill(option.right)
+        }
+        .frame(width: size, height: size)
+    }
+}
+
+struct AppIconPicker: View {
+    @State private var current = UIApplication.shared.alternateIconName
+    @State private var error: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            LazyVGrid(columns: [GridItem(.adaptive(minimum: 68), spacing: 12)], spacing: 14) {
+                ForEach(AppIconOption.all) { o in
+                    Button {
+                        guard UIApplication.shared.supportsAlternateIcons else { return }
+                        UIApplication.shared.setAlternateIconName(o.icon) { err in
+                            DispatchQueue.main.async {
+                                if let err { error = err.localizedDescription } else { current = o.icon; error = nil }
+                            }
+                        }
+                    } label: {
+                        VStack(spacing: 6) {
+                            LogoMark(option: o, size: 58)
+                                .overlay(RoundedRectangle(cornerRadius: 58 * 0.225 + 4, style: .continuous)
+                                    .stroke(current == o.icon ? Color.accentColor : .clear, lineWidth: 3)
+                                    .padding(-4))
+                            Text(o.name).font(.caption2.weight(.medium)).foregroundStyle(.primary)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("\(o.name) app icon")
+                    .accessibilityAddTraits(current == o.icon ? .isSelected : [])
+                }
+            }
+            .padding(.vertical, 6)
+            if let error {
+                Text(error).font(.footnote).foregroundStyle(.red)
+            }
+        }
+    }
+}
+
 struct ThemeChip: View {
     let theme: Theme
     let selected: Bool
@@ -1617,6 +1700,13 @@ struct ThemeSettings: View {
                 if themes.matchPhoto && themes.homeImage != nil {
                     Text("Your theme is currently matched to your home photo. Turn off Match Theme to Photo to use a preset.")
                 }
+            }
+            Section {
+                AppIconPicker()
+            } header: {
+                Text("App Icon")
+            } footer: {
+                Text("Changes the SplitDeck icon on your Home Screen. iOS shows a short confirmation when it switches.")
             }
             Section {
                 if let img = themes.homeImage {
@@ -2090,6 +2180,8 @@ struct PaneActions {
     var history: () -> Void
     var privateLocked: Bool
     var unlockPrivate: () -> Void
+    var openTabs: () -> Void
+    var tabCount: Int
 }
 
 struct PaneView: View {
@@ -2267,6 +2359,22 @@ struct PaneView: View {
         .animation(saver ? nil : .easeInOut(duration: 0.25), value: dark)
     }
 
+    // Tab count in the full-screen bar (split view keeps it in the edge dock to save room).
+    private var tabsButton: some View {
+        Button { actions.openTabs() } label: {
+            Text("\(actions.tabCount)")
+                .font(.system(size: 12, weight: .bold))
+                .monospacedDigit()
+                .foregroundStyle(ink)
+                .frame(minWidth: 19, minHeight: 19)
+                .padding(.horizontal, 1)
+                .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous).stroke(ink, lineWidth: 1.5))
+                .frame(width: 34, height: barH)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel("\(actions.tabCount) tabs")
+    }
+
     // Small refresh (or stop, while loading) button inside the address capsule.
     private var reloadButton: some View {
         Button {
@@ -2395,6 +2503,7 @@ struct PaneView: View {
                     if !pane.isHome && pane.hasLogin { icon("key.fill") { actions.autofill() } }
                     if !pane.isHome && pane.hasCard { icon("creditcard.fill") { actions.autofill() } }
                     if !pane.isHome { reloadButton }
+                    if !compact { tabsButton }
                     menu
                 }
             }
@@ -3921,7 +4030,9 @@ struct ContentView: View {
                 newPrivateTab: { withAnimation(anim(.snappy)) { tabs.newTab(slot: slot, isPrivate: true) } },
                 history: { historyPane = p; sheet = .history },
                 privateLocked: privateLocked,
-                unlockPrivate: unlockPrivate
+                unlockPrivate: unlockPrivate,
+                openTabs: openTabs,
+                tabCount: p.isPrivate ? tabs.privateCount : tabs.normalCount
             ),
             compact: compact,
             atTop: atTop,
