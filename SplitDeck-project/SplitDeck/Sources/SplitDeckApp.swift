@@ -182,7 +182,7 @@ enum WebFrameRate {
 }
 
 enum Engines {
-    static let names = ["DuckDuckGo", "Google", "Bing", "Brave", "Ecosia"]
+    static let names = ["Google", "DuckDuckGo", "Bing", "Brave", "Ecosia"]
     static let urls = ["DuckDuckGo": "https://duckduckgo.com/?q=", "Google": "https://www.google.com/search?q=",
                        "Bing": "https://www.bing.com/search?q=", "Brave": "https://search.brave.com/search?q=",
                        "Ecosia": "https://www.ecosia.org/search?q="]
@@ -190,7 +190,7 @@ enum Engines {
                        "Bing": "https://www.bing.com", "Brave": "https://search.brave.com",
                        "Ecosia": "https://www.ecosia.org"]
     static var currentHome: String {
-        home[UserDefaults.standard.string(forKey: "engine") ?? "DuckDuckGo"] ?? "https://duckduckgo.com"
+        home[UserDefaults.standard.string(forKey: "engine") ?? "Google"] ?? "https://www.google.com"
     }
 }
 
@@ -958,8 +958,8 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         if t.contains(" ") || !t.contains(".") {
             if !isPrivate { onSearch?(t) }
             let s = t.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? t
-            let name = UserDefaults.standard.string(forKey: "engine") ?? "DuckDuckGo"
-            url = URL(string: (Engines.urls[name] ?? Engines.urls["DuckDuckGo"]!) + s)
+            let name = UserDefaults.standard.string(forKey: "engine") ?? "Google"
+            url = URL(string: (Engines.urls[name] ?? Engines.urls["Google"]!) + s)
         } else {
             if !t.lowercased().hasPrefix("http") { t = "https://" + t }
             url = URL(string: t)
@@ -1955,7 +1955,7 @@ extension EnvironmentValues {
 }
 
 final class ThemeStore: ObservableObject {
-    @Published var name: String = UserDefaults.standard.string(forKey: "theme") ?? "Default" {
+    @Published var name: String = UserDefaults.standard.string(forKey: "theme") ?? "Mono" {
         didSet { UserDefaults.standard.set(name, forKey: "theme") }
     }
     @Published var matchPhoto: Bool = UserDefaults.standard.object(forKey: "matchPhoto") as? Bool ?? true {
@@ -4772,7 +4772,8 @@ struct SettingsView: View {
     @AppStorage("translateTo") private var translateTo = Translate.target
     @AppStorage("offerTranslate") private var offerTranslate = true
     @State private var siteZooms = Zoom.sites.count
-    @AppStorage("engine") private var engine = "DuckDuckGo"
+    @AppStorage("onboarded") private var onboarded = true
+    @AppStorage("engine") private var engine = "Google"
     @AppStorage("saver") private var saver = false
     @AppStorage("homeMode") private var homeMode = 0
     @AppStorage("barStyle") private var barStyle = 1
@@ -4983,6 +4984,12 @@ struct SettingsView: View {
                     Text("iOS only offers apps with Apple's browser entitlement as the default browser. That needs a paid developer account and App Store review, which this test build doesn't have yet, so SplitDeck can't be chosen there for now. Meanwhile, other apps and Shortcuts can open any link here with splitdeck://open?url= followed by the address.")
                 }
                 Section {
+                    Button("Show Welcome Tour") {
+                        dismiss()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { onboarded = false }
+                    }
+                }
+                Section {
                     Toggle("Battery Saver", isOn: $saver)
                 } footer: {
                     Text("Switches the app to dark mode, turns off every animation, keeps the address bar full size, caps page animations at 30 fps and keeps only 2 tabs awake.")
@@ -5085,8 +5092,33 @@ enum VaultDeletion: Identifiable {
     }
 }
 
+// Blur, fade and scale together, for the vault opening.
+struct BlurFade: ViewModifier {
+    var blur: CGFloat
+    var opacity: Double
+    var scale: CGFloat
+    func body(content: Content) -> some View {
+        content.blur(radius: blur).opacity(opacity).scaleEffect(scale)
+    }
+}
+
+extension AnyTransition {
+    // The vault's contents come into focus.
+    static var unblur: AnyTransition {
+        .modifier(active: BlurFade(blur: 24, opacity: 0, scale: 1.04), identity: BlurFade(blur: 0, opacity: 1, scale: 1))
+    }
+    // The lock swings away towards you, blurring as it goes.
+    static var vaultDoor: AnyTransition {
+        .modifier(active: BlurFade(blur: 18, opacity: 0, scale: 1.4), identity: BlurFade(blur: 0, opacity: 1, scale: 1))
+    }
+}
+
 struct VaultView: View {
     @ObservedObject var vault: Vault
+    @AppStorage("saver") private var saver = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var open = false        // contents showing
+    @State private var opening = false     // the lock is springing open
     @AppStorage("appIconName") private var iconName = ""
     @State private var deleting: VaultDeletion?
 
@@ -5121,17 +5153,31 @@ struct VaultView: View {
         unlocking = true
         await vault.unlock()
         unlocking = false
-        if vault.unlocked { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+        guard vault.unlocked else { return }
+        UINotificationFeedbackGenerator().notificationOccurred(.success)
+        await reveal()
+    }
+
+    // The shackle springs open and the logo lifts, then the lock swings away and the vault unblurs into view.
+    @MainActor
+    private func reveal() async {
+        if saver || reduceMotion {
+            withAnimation(saver ? nil : .easeOut(duration: 0.25)) { open = true }
+            return
+        }
+        withAnimation(.spring(response: 0.35, dampingFraction: 0.6)) { opening = true }
+        try? await Task.sleep(nanoseconds: 480_000_000)
+        withAnimation(.easeInOut(duration: 0.6)) { open = true }
     }
 
     var body: some View {
         NavigationStack {
             ZStack {
                 bg.ignoresSafeArea()
-                if vault.unlocked {
-                    unlockedView.transition(.opacity.combined(with: .scale(scale: 0.97)))
+                if open && vault.unlocked {
+                    unlockedView.transition(.unblur)
                 } else {
-                    lockView.transition(.opacity)
+                    lockView.transition(.asymmetric(insertion: .opacity, removal: .vaultDoor))
                 }
                 if phase != .active {
                     // Hidden in the app switcher.
@@ -5141,12 +5187,14 @@ struct VaultView: View {
                     }
                 }
             }
-            .animation(.spring(response: 0.5, dampingFraction: 0.85), value: vault.unlocked)
-            .navigationTitle(vault.unlocked ? "Vault" : "")
+            .onChange(of: vault.unlocked) { _, on in
+                if !on { withAnimation(.easeOut(duration: 0.25)) { open = false; opening = false } }
+            }
+            .navigationTitle(open ? "Vault" : "")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
-                if vault.unlocked {
+                if open {
                     ToolbarItem(placement: .primaryAction) {
                         Button { withAnimation { vault.lock() } } label: { Image(systemName: "lock") }
                             .accessibilityLabel("Lock vault")
@@ -5179,7 +5227,9 @@ struct VaultView: View {
             }
         }
         .preferredColorScheme(.dark)
-        .task { if !vault.unlocked { await unlock() } }
+        .task {
+            if vault.unlocked { open = true } else { await unlock() }
+        }
     }
 
     // MARK: Locked
@@ -5197,8 +5247,9 @@ struct VaultView: View {
                     .fill(.ultraThinMaterial)
                     .frame(width: 118, height: 118)
                 BrandMark(size: 74)
+                    .scaleEffect(opening ? 1.12 : 1)
                     .overlay(alignment: .bottomTrailing) {
-                        Image(systemName: unlocking ? "faceid" : "lock.fill")
+                        Image(systemName: opening ? "lock.open.fill" : (unlocking ? "faceid" : "lock.fill"))
                             .font(.system(size: 14, weight: .bold))
                             .foregroundStyle(.white)
                             .frame(width: 30, height: 30)
@@ -5206,11 +5257,14 @@ struct VaultView: View {
                             .overlay(Circle().stroke(Color.black.opacity(0.5), lineWidth: 2))
                             .contentTransition(.symbolEffect(.replace))
                             .symbolEffect(.pulse, isActive: unlocking)
+                            .symbolEffect(.bounce, value: opening)
                             .offset(x: 9, y: 9)
                     }
             }
+            .shadow(color: .cyan.opacity(opening ? 0.6 : 0), radius: 30)
             VStack(spacing: 6) {
-                Text("Vault Locked").font(.title2.bold()).foregroundStyle(.white)
+                Text(opening ? "Unlocked" : "Vault Locked").font(.title2.bold()).foregroundStyle(.white)
+                    .contentTransition(.opacity)
                 Text("SplitDeck Vault · protected by Face ID and the iPhone Keychain")
                     .font(.subheadline).foregroundStyle(.white.opacity(0.6))
             }
@@ -5855,6 +5909,461 @@ struct AppLockCover: View {
     }
 }
 
+// MARK: Welcome tour
+
+// Shown once, the first time SplitDeck opens (and again from Settings › Show Welcome Tour).
+// Each page and animation is its own small view, so SwiftUI's view types stay shallow.
+struct IntroView: View {
+    var finish: () -> Void
+    @AppStorage("appIconName") private var iconName = ""
+    @AppStorage("saver") private var saver = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var page = 0
+    private let count = 6
+
+    private var still: Bool { saver || reduceMotion }
+
+    private func next() {
+        if page < count - 1 {
+            withAnimation(still ? nil : .spring(response: 0.5, dampingFraction: 0.9)) { page += 1 }
+        } else {
+            finish()
+        }
+    }
+
+    var body: some View {
+        let o = AppIconOption.named(iconName)
+        ZStack {
+            IntroBackground(option: o, still: still)
+            VStack(spacing: 0) {
+                IntroTopBar(showSkip: page < count - 1, skip: finish)
+                TabView(selection: $page) {
+                    IntroPage(title: "Welcome to SplitDeck",
+                              text: "A browser built for your iPhone's big screen: two pages at once, and private by design.",
+                              art: IntroWelcomeArt(option: o, active: page == 0 && !still)).tag(0)
+                    IntroPage(title: "Split View",
+                              text: "Open two sites at once. Tap the split button in the address bar, drag the divider to resize, and drag it off the edge to go back to one page.",
+                              art: IntroSplitArt(option: o, active: page == 1 && !still)).tag(1)
+                    IntroPage(title: "Switch in one tap",
+                              text: "The ⇄ button jumps straight back to the last tab you used. In split view it swaps the two pages.",
+                              art: IntroSwitchArt(option: o, active: page == 2 && !still)).tag(2)
+                    IntroPage(title: "Private by design",
+                              text: "Shields block ads, trackers and cookie pop-ups. Private tabs leave no trace and lock behind Face ID. Your history and settings never leave this iPhone.",
+                              art: IntroPrivacyArt(option: o, active: page == 3 && !still)).tag(3)
+                    IntroPage(title: "Your password vault",
+                              text: "Logins and cards live in the iPhone Keychain behind Face ID. Generate strong passwords, spot weak or reused ones, and confirm every change with Face ID.",
+                              art: IntroVaultArt(option: o, active: page == 4 && !still)).tag(4)
+                    IntroPage(title: "Thank you",
+                              text: "Thanks for trying SplitDeck. You're all set.",
+                              art: IntroThanksArt(option: o, active: page == 5 && !still)).tag(5)
+                }
+                .tabViewStyle(.page(indexDisplayMode: .never))
+                IntroFooter(page: page, count: count, ink: o.bg.isLightColor ? Color(white: 0.08) : o.bg, next: next)
+            }
+        }
+        .environment(\.colorScheme, .dark)
+    }
+}
+
+extension Color {
+    var isLightColor: Bool {
+        var r: CGFloat = 0, g: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        _ = UIColor(self).getRed(&r, green: &g, blue: &b, alpha: &a)
+        return 0.299 * r + 0.587 * g + 0.114 * b > 0.55
+    }
+}
+
+// Deep, dark backdrop in the app icon's colours, with two soft glows drifting slowly.
+struct IntroBackground: View {
+    let option: AppIconOption
+    let still: Bool
+
+    var body: some View {
+        let base = option.bg.isLightColor ? Color(red: 0.05, green: 0.06, blue: 0.09) : option.bg
+        TimelineView(.animation(minimumInterval: 1.0 / 30, paused: still)) { tl in
+            let t = still ? 0 : tl.date.timeIntervalSinceReferenceDate
+            GeometryReader { g in
+                ZStack {
+                    LinearGradient(colors: [base.opacity(0.92), base, .black], startPoint: .top, endPoint: .bottom)
+                    RadialGradient(colors: [option.left.opacity(0.45), .clear], center: .center, startRadius: 0, endRadius: g.size.width * 0.75)
+                        .offset(x: CGFloat(sin(t / 7)) * g.size.width * 0.25, y: -g.size.height * 0.28 + CGFloat(cos(t / 9)) * 40)
+                    RadialGradient(colors: [option.right.opacity(0.25), .clear], center: .center, startRadius: 0, endRadius: g.size.width * 0.7)
+                        .offset(x: CGFloat(cos(t / 8)) * g.size.width * 0.3, y: g.size.height * 0.3 + CGFloat(sin(t / 6)) * 50)
+                }
+            }
+        }
+        .ignoresSafeArea()
+    }
+}
+
+struct IntroTopBar: View {
+    let showSkip: Bool
+    let skip: () -> Void
+    var body: some View {
+        HStack {
+            Spacer()
+            if showSkip {
+                Button("Skip", action: skip)
+                    .font(.body.weight(.semibold))
+                    .foregroundStyle(.white.opacity(0.8))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(.white.opacity(0.1), in: Capsule())
+                    .transition(.opacity)
+            }
+        }
+        .frame(height: 48)
+        .padding(.horizontal, 20)
+    }
+}
+
+struct IntroPage<Art: View>: View {
+    let title: String
+    let text: String
+    let art: Art
+
+    var body: some View {
+        VStack(spacing: 26) {
+            Spacer(minLength: 0)
+            art.frame(height: 300)
+            VStack(spacing: 12) {
+                Text(title)
+                    .font(.system(.largeTitle, design: .rounded).weight(.bold))
+                Text(text)
+                    .font(.body)
+                    .foregroundStyle(.white.opacity(0.72))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 30)
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(.white)
+    }
+}
+
+struct IntroFooter: View {
+    let page: Int
+    let count: Int
+    let ink: Color
+    let next: () -> Void
+
+    var body: some View {
+        VStack(spacing: 22) {
+            HStack(spacing: 7) {
+                ForEach(0..<count, id: \.self) { i in
+                    Capsule()
+                        .fill(.white.opacity(i == page ? 0.95 : 0.3))
+                        .frame(width: i == page ? 22 : 7, height: 7)
+                }
+            }
+            .animation(.spring(response: 0.4, dampingFraction: 0.8), value: page)
+            Button(action: next) {
+                Text(page == 0 ? "Get Started" : (page == count - 1 ? "Start Browsing" : "Continue"))
+                    .font(.headline)
+                    .foregroundStyle(ink)
+                    .frame(maxWidth: .infinity, minHeight: 54)
+                    .background(.white, in: Capsule())
+                    .contentTransition(.opacity)
+            }
+            .padding(.horizontal, 28)
+        }
+        .padding(.bottom, 18)
+    }
+}
+
+// Smooth 0→1→0 timing helpers for the looping demos.
+enum IntroTime {
+    static func ease(_ x: Double) -> Double { let c = min(max(x, 0), 1); return c * c * (3 - 2 * c) }
+    // Progress between two moments of a loop.
+    static func span(_ t: Double, _ a: Double, _ b: Double) -> Double { ease((t - a) / (b - a)) }
+}
+
+// Page 1: the logo, breathing, with rings rippling outwards.
+struct IntroWelcomeArt: View {
+    let option: AppIconOption
+    let active: Bool
+    var body: some View {
+        TimelineView(.animation(minimumInterval: nil, paused: !active)) { tl in
+            let t = tl.date.timeIntervalSinceReferenceDate
+            ZStack {
+                ForEach(0..<3, id: \.self) { i in
+                    let p = (t / 3 + Double(i) / 3).truncatingRemainder(dividingBy: 1)
+                    Circle()
+                        .stroke(option.left.opacity(0.5 * (1 - p)), lineWidth: 2)
+                        .frame(width: 140 + 160 * p, height: 140 + 160 * p)
+                }
+                LogoMark(option: option, size: 132)
+                    .shadow(color: option.left.opacity(0.55), radius: 30, y: 10)
+                    .scaleEffect(1 + 0.025 * sin(t * 1.6))
+            }
+        }
+    }
+}
+
+// A little phone showing a page.
+struct IntroMiniPage: View {
+    let tint: Color
+    let lines: Int
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            RoundedRectangle(cornerRadius: 5).fill(tint.opacity(0.85)).frame(height: 22)
+            ForEach(0..<lines, id: \.self) { i in
+                Capsule().fill(.white.opacity(0.22)).frame(width: i % 3 == 2 ? 70 : 120, height: 6)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.white.opacity(0.07))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+}
+
+// Page 2: one page opens into two, the divider is dragged up and down, then off the edge.
+struct IntroSplitArt: View {
+    let option: AppIconOption
+    let active: Bool
+    var body: some View {
+        TimelineView(.animation(minimumInterval: nil, paused: !active)) { tl in
+            let t = active ? tl.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 7) : 2.2
+            // 0–1.2 one page, 1.2–2 split opens, 2.6–3.6 drag up, 4–5 drag down, 5.6–6.4 off the edge
+            let open = IntroTime.span(t, 1.2, 2.0) * (1 - IntroTime.span(t, 5.6, 6.4))
+            let drag = -0.16 * IntroTime.span(t, 2.6, 3.6) + 0.30 * IntroTime.span(t, 4.0, 5.0) - 0.14 * IntroTime.span(t, 5.6, 6.4)
+            let r = 1 - open * (0.5 - drag)               // top pane's share of the screen
+            let tapping = t > 0.7 && t < 1.3
+            let holding = t > 2.4 && t < 6.4
+            GeometryReader { g in
+                let w: CGFloat = 170, h: CGFloat = 290
+                let inner = h - 20 - 34
+                let top = max(inner * CGFloat(r) - (open > 0.01 ? 3 : 0), 0)
+                ZStack(alignment: .top) {
+                    RoundedRectangle(cornerRadius: 30, style: .continuous)
+                        .fill(Color.black.opacity(0.55))
+                        .overlay(RoundedRectangle(cornerRadius: 30, style: .continuous).stroke(.white.opacity(0.25), lineWidth: 1.5))
+                    VStack(spacing: 6) {
+                        IntroMiniPage(tint: option.left, lines: 5).frame(height: top)
+                        if open > 0.01 {
+                            IntroMiniPage(tint: option.right, lines: 4)
+                        }
+                        // address bar with the split button
+                        HStack(spacing: 6) {
+                            Capsule().fill(.white.opacity(0.18)).frame(height: 18)
+                            Image(systemName: open > 0.5 ? "rectangle.split.1x2.fill" : "rectangle.split.1x2")
+                                .font(.system(size: 11, weight: .bold))
+                                .foregroundStyle(.white)
+                                .frame(width: 26, height: 22)
+                                .background(Circle().fill(option.left.opacity(tapping ? 0.9 : 0)).scaleEffect(tapping ? 1.3 : 0.6))
+                        }
+                        .frame(height: 22)
+                    }
+                    .padding(10)
+                    // finger on the divider
+                    if holding {
+                        Circle()
+                            .fill(.white.opacity(0.85))
+                            .frame(width: 26, height: 26)
+                            .shadow(color: .black.opacity(0.4), radius: 6)
+                            .offset(y: 10 + top + 1)
+                    }
+                    if tapping {
+                        Circle().fill(.white.opacity(0.85)).frame(width: 26, height: 26)
+                            .offset(x: w / 2 - 26, y: h - 34)
+                    }
+                }
+                .frame(width: w, height: h)
+                .position(x: g.size.width / 2, y: g.size.height / 2)
+            }
+        }
+    }
+}
+
+// Page 3: two tabs trade places as the switch button turns.
+struct IntroSwitchArt: View {
+    let option: AppIconOption
+    let active: Bool
+    var body: some View {
+        TimelineView(.animation(minimumInterval: nil, paused: !active)) { tl in
+            let t = active ? tl.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 4) : 0
+            // swap at 1.0–1.8, swap back at 3.0–3.8
+            let s = IntroTime.span(t, 1.0, 1.8) * (1 - IntroTime.span(t, 3.0, 3.8))
+            let pressed = (t > 0.85 && t < 1.1) || (t > 2.85 && t < 3.1)
+            VStack(spacing: 26) {
+                ZStack {
+                    card(tint: option.left, label: "Tab A")
+                        .offset(x: CGFloat(-44 + 88 * s), y: CGFloat(-10 + 20 * s))
+                        .scaleEffect(CGFloat(1 - 0.12 * s))
+                        .zIndex(1 - s)
+                    card(tint: option.right, label: "Tab B")
+                        .offset(x: CGFloat(44 - 88 * s), y: CGFloat(10 - 20 * s))
+                        .scaleEffect(CGFloat(0.88 + 0.12 * s))
+                        .zIndex(s)
+                }
+                .frame(height: 200)
+                Image(systemName: "arrow.left.arrow.right")
+                    .font(.system(size: 22, weight: .bold))
+                    .foregroundStyle(.white)
+                    .rotationEffect(.degrees(180 * s))
+                    .frame(width: 62, height: 62)
+                    .background(Circle().fill(option.left.opacity(pressed ? 0.95 : 0.55)))
+                    .scaleEffect(pressed ? 0.88 : 1)
+                    .shadow(color: option.left.opacity(0.5), radius: 14)
+            }
+        }
+    }
+
+    private func card(tint: Color, label: String) -> some View {
+        IntroMiniPage(tint: tint, lines: 6)
+            .overlay(alignment: .bottom) {
+                Text(label).font(.caption.weight(.bold)).foregroundStyle(.white.opacity(0.9)).padding(.bottom, 10)
+            }
+            .frame(width: 130, height: 180)
+            .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(Color.black.opacity(0.6)))
+            .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(.white.opacity(0.2), lineWidth: 1))
+            .shadow(color: .black.opacity(0.4), radius: 12, y: 6)
+    }
+}
+
+// Page 4: trackers fly at the shield and vanish, the count ticks up, features light up in turn.
+struct IntroPrivacyArt: View {
+    let option: AppIconOption
+    let active: Bool
+    private let features: [(String, String)] = [("shield.lefthalf.filled", "Ad & tracker blocking"), ("eye.slash", "Private tabs"),
+                                                ("faceid", "App lock"), ("iphone", "Stays on this iPhone")]
+    var body: some View {
+        TimelineView(.animation(minimumInterval: nil, paused: !active)) { tl in
+            let t = active ? tl.date.timeIntervalSinceReferenceDate : 10
+            let loop = t.truncatingRemainder(dividingBy: 2.4)
+            VStack(spacing: 22) {
+                ZStack {
+                    ForEach(0..<4, id: \.self) { i in
+                        let p = ((loop / 2.4) + Double(i) / 4).truncatingRemainder(dividingBy: 1)
+                        let ang = Double(i) * .pi / 2 + 0.6
+                        let d = CGFloat(130 * (1 - p))
+                        Image(systemName: "dot.radiowaves.left.and.right")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.white.opacity(active ? 0.75 * (1 - p) : 0))
+                            .offset(x: d * CGFloat(cos(ang)), y: d * CGFloat(sin(ang)))
+                    }
+                    Image(systemName: "shield.lefthalf.filled")
+                        .font(.system(size: 86, weight: .semibold))
+                        .foregroundStyle(LinearGradient(colors: [option.right, option.left], startPoint: .top, endPoint: .bottom))
+                        .shadow(color: option.left.opacity(0.6), radius: 24)
+                        .scaleEffect(1 + 0.04 * (1 - min(loop / 0.25, 1)))
+                }
+                .frame(height: 160)
+                Text("\(1200 + Int((t * 7).truncatingRemainder(dividingBy: 800))) blocked")
+                    .font(.system(.title3, design: .rounded).weight(.bold).monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.9))
+                LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 8) {
+                    ForEach(Array(features.enumerated()), id: \.offset) { i, f in
+                        let lit = !active || (t.truncatingRemainder(dividingBy: 4)) / 1.0 >= Double(i)
+                        Label(f.1, systemImage: f.0)
+                            .font(.caption.weight(.semibold))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                            .padding(.horizontal, 10)
+                            .frame(maxWidth: .infinity, minHeight: 30)
+                            .background(Capsule().fill(.white.opacity(lit ? 0.16 : 0.06)))
+                            .foregroundStyle(.white.opacity(lit ? 1 : 0.5))
+                    }
+                }
+                .padding(.horizontal, 24)
+            }
+        }
+    }
+}
+
+// Page 5: the vault unlocks with Face ID, a password is revealed and its strength fills up.
+struct IntroVaultArt: View {
+    let option: AppIconOption
+    let active: Bool
+    var body: some View {
+        TimelineView(.animation(minimumInterval: nil, paused: !active)) { tl in
+            let t = active ? tl.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: 5) : 4
+            // 0–1 locked, 1–1.8 Face ID, 1.8 open, 2.2–3.2 reveal and strength, 4.6 relock
+            let scanning = t > 1.0 && t < 1.8
+            let open = t >= 1.8 && t < 4.6
+            let reveal = IntroTime.span(t, 2.2, 2.8) * (1 - IntroTime.span(t, 4.4, 4.6))
+            let strength = IntroTime.span(t, 2.4, 3.4) * (1 - IntroTime.span(t, 4.4, 4.6))
+            VStack(spacing: 20) {
+                ZStack {
+                    Circle()
+                        .stroke(AngularGradient(colors: [option.left, .cyan, option.right, option.left], center: .center), lineWidth: 3)
+                        .frame(width: 140, height: 140)
+                        .rotationEffect(.degrees(t * 72))
+                    LogoMark(option: option, size: 78)
+                        .scaleEffect(open ? 1.06 : 1)
+                    Image(systemName: open ? "lock.open.fill" : (scanning ? "faceid" : "lock.fill"))
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 32, height: 32)
+                        .background(Circle().fill(LinearGradient(colors: [.cyan, .blue], startPoint: .top, endPoint: .bottom)))
+                        .offset(x: 34, y: 34)
+                }
+                .frame(height: 150)
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 10) {
+                        Image(systemName: "globe").foregroundStyle(.white.opacity(0.7))
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("example.com").font(.subheadline.weight(.semibold))
+                            ZStack(alignment: .leading) {
+                                Text("••••••••••••••").opacity(1 - reveal)
+                                Text("Vq7#mK2!xR9p").opacity(reveal)
+                            }
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.white.opacity(0.7))
+                        }
+                        Spacer()
+                    }
+                    GeometryReader { g in
+                        ZStack(alignment: .leading) {
+                            Capsule().fill(.white.opacity(0.12))
+                            Capsule().fill(LinearGradient(colors: [.orange, .green], startPoint: .leading, endPoint: .trailing))
+                                .frame(width: g.size.width * CGFloat(0.12 + 0.88 * strength))
+                        }
+                    }
+                    .frame(height: 6)
+                    Text(strength > 0.9 ? "Strong" : (strength > 0.4 ? "Fair" : "Weak"))
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(strength > 0.9 ? Color.green : (strength > 0.4 ? Color.yellow : Color.orange))
+                }
+                .padding(14)
+                .background(RoundedRectangle(cornerRadius: 16, style: .continuous).fill(.white.opacity(0.08)))
+                .padding(.horizontal, 44)
+            }
+        }
+    }
+}
+
+// Page 6: the logo with a little burst of colour.
+struct IntroThanksArt: View {
+    let option: AppIconOption
+    let active: Bool
+    var body: some View {
+        TimelineView(.animation(minimumInterval: nil, paused: !active)) { tl in
+            let t = active ? tl.date.timeIntervalSinceReferenceDate : 0
+            ZStack {
+                ForEach(0..<14, id: \.self) { i in
+                    let p = ((t / 3.2) + Double(i) / 14).truncatingRemainder(dividingBy: 1)
+                    let ang = Double(i) * 2 * .pi / 14
+                    Circle()
+                        .fill(i % 2 == 0 ? option.left : option.right)
+                        .frame(width: 8, height: 8)
+                        .offset(x: CGFloat(cos(ang) * (70 + 90 * p)), y: CGFloat(sin(ang) * (70 + 90 * p)))
+                        .opacity(active ? 1 - p : 0)
+                }
+                LogoMark(option: option, size: 120)
+                    .shadow(color: option.left.opacity(0.5), radius: 26, y: 8)
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 34))
+                    .foregroundStyle(.white, .green)
+                    .offset(x: 50, y: 50)
+            }
+        }
+    }
+}
+
 // MARK: Main screen
 
 enum Sheet: Identifiable {
@@ -5888,7 +6397,7 @@ struct ContentView: View {
     @State private var historyPane: Pane?
     @AppStorage("block") private var blockOn = true
     @AppStorage("saver") private var saver = false
-    @AppStorage("engine") private var engine = "DuckDuckGo"
+    @AppStorage("engine") private var engine = "Google"
     @State private var split: CGFloat = 0.5
     @State private var dragging = false
     @State private var lastTap = Date.distantPast
@@ -5912,6 +6421,7 @@ struct ContentView: View {
     @State private var appLocked = UserDefaults.standard.bool(forKey: "appLock")
     @State private var leftAt: Date?
     @State private var unlocking = false
+    @AppStorage("onboarded") private var onboarded = false
     // Status bar and home indicator sizes. Read from the window after layout, never while SwiftUI is
     // building the screen: asking UIKit then re-enters SwiftUI's update and doubles the stack it uses.
     @State private var insets = UIEdgeInsets(top: 62, left: 0, bottom: 34, right: 0)   // typical iPhone, replaced right after launch
@@ -5973,6 +6483,48 @@ struct ContentView: View {
         }
     }
 
+    // Everything that floats over the pages, in one layer: island, toast, tab switcher, welcome tour, app lock.
+    @ViewBuilder private func overlayLayer(safe: UIEdgeInsets) -> some View {
+        ZStack(alignment: .top) {
+            if showIsland {
+                EdgeDock(tabs: tabs, saver: saver, privateMode: leftIsPrivate, safe: safe, openTabs: { openTabs() })
+                    .transition(.opacity)
+            }
+            if let toast {
+                Label(toast, systemImage: "checkmark.circle.fill")
+                    .font(.footnote.weight(.semibold))
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .sdGlass(Capsule())
+                    .padding(.top, safe.top + 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+            if tabsOpen {
+                TabSwitcher(tabs: tabs,
+                            startPrivate: tabs.info(tabsSlot == 1 ? tabs.right : tabs.left)?.isPrivate ?? false,
+                            startSlot: tabsSlot,
+                            privateLocked: privateLocked,
+                            unlock: unlockPrivate,
+                            snap: switcherSnap,
+                            saver: saver) {
+                    tabsOpen = false
+                    switcherSnap = nil
+                }
+            }
+            if !onboarded {
+                IntroView {
+                    withAnimation(anim(.easeInOut(duration: 0.5))) { onboarded = true }
+                }
+                .transition(.opacity.combined(with: .scale(scale: 1.04)))
+            }
+            // App lock: over everything, including the app switcher snapshot.
+            if appLock && (appLocked || phase != .active) {
+                AppLockCover(active: appLocked && phase == .active, unlock: unlockApp)
+                    .transition(.opacity)
+            }
+        }
+    }
+
     private func refreshInsets() {
         DispatchQueue.main.async {
             let i = ContentView.windowInsets()
@@ -6022,44 +6574,7 @@ struct ContentView: View {
             .onChange(of: root.size) { _, _ in refreshInsets() }
             .ignoresSafeArea(.container, edges: .vertical)
             .background(activeTheme.strip.ignoresSafeArea())
-            .overlay {
-                if showIsland {
-                    EdgeDock(tabs: tabs, saver: saver, privateMode: leftIsPrivate, safe: safe, openTabs: { openTabs() })
-                        .transition(.opacity)
-                }
-            }
-            .overlay(alignment: .top) {
-                if let toast {
-                    Label(toast, systemImage: "checkmark.circle.fill")
-                        .font(.footnote.weight(.semibold))
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 10)
-                        .sdGlass(Capsule())
-                        .padding(.top, safe.top + 8)
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
-            }
-            .overlay {
-                if tabsOpen {
-                    TabSwitcher(tabs: tabs,
-                                startPrivate: tabs.info(tabsSlot == 1 ? tabs.right : tabs.left)?.isPrivate ?? false,
-                                startSlot: tabsSlot,
-                                privateLocked: privateLocked,
-                                unlock: unlockPrivate,
-                                snap: switcherSnap,
-                                saver: saver) {
-                        tabsOpen = false
-                        switcherSnap = nil
-                    }
-                }
-            }
-            .overlay {
-                // App lock: over everything, including the app switcher snapshot.
-                if appLock && (appLocked || phase != .active) {
-                    AppLockCover(active: appLocked && phase == .active, unlock: unlockApp)
-                        .transition(.opacity)
-                }
-            }
+            .overlay { AnyView(overlayLayer(safe: safe)) }
         }
         .environment(\.sdTheme, activeTheme)
         .environment(\.sdHomeImage, themes.homeImage)
