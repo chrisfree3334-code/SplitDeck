@@ -12,6 +12,7 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.example.splitdeck
         GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_FILE: Info.plist
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES: "AppIcon-Matcha AppIcon-Sunrise AppIcon-Ocean AppIcon-Lavender AppIcon-Sakura AppIcon-Ember AppIcon-Mono"
         ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS: YES

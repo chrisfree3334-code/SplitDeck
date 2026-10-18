@@ -110,6 +110,28 @@ func q(_ s: String) -> String {
     (try? String(data: JSONEncoder().encode(s), encoding: .utf8)) ?? "\"\""
 }
 
+// ProMotion for pages: WebKit holds page rendering near 60 fps unless told otherwise. This flips
+// that internal switch so animations and scrolling effects on pages can run at up to 120 fps.
+// Left alone in battery saver. If the switch ever goes away, nothing happens.
+enum WebFrameRate {
+    static func unlock(_ prefs: WKPreferences, on: Bool) {
+        let listSel = NSSelectorFromString("_features")
+        let setSel = NSSelectorFromString("_setEnabled:forFeature:")
+        let keySel = NSSelectorFromString("key")
+        guard let listM = class_getClassMethod(WKPreferences.self, listSel),
+              let setM = class_getInstanceMethod(WKPreferences.self, setSel) else { return }
+        typealias ListFn = @convention(c) (AnyObject, Selector) -> NSArray?
+        typealias SetFn = @convention(c) (AnyObject, Selector, Bool, AnyObject) -> Void
+        let list = unsafeBitCast(method_getImplementation(listM), to: ListFn.self)(WKPreferences.self as AnyObject, listSel) ?? []
+        let set = unsafeBitCast(method_getImplementation(setM), to: SetFn.self)
+        for case let f as NSObject in list where f.responds(to: keySel) {
+            if (f.value(forKey: "key") as? String) == "PreferPageRenderingUpdatesNear60FPSEnabled" {
+                set(prefs, setSel, !on, f)
+            }
+        }
+    }
+}
+
 enum Engines {
     static let names = ["DuckDuckGo", "Google", "Bing", "Brave", "Ecosia"]
     static let urls = ["DuckDuckGo": "https://duckduckgo.com/?q=", "Google": "https://www.google.com/search?q=",
@@ -158,6 +180,16 @@ final class Vault: ObservableObject {
     }
     func lock() { unlocked = false }
     func save() { Store.write("logins", logins); Store.write("cards", cards) }
+
+    // A fresh Face ID scan (passcode as the fallback) before a change that can't be undone.
+    // A new context every time, so an earlier unlock is never reused.
+    static func confirm(_ reason: String) async -> Bool {
+        let ctx = LAContext()
+        ctx.touchIDAuthenticationAllowableReuseDuration = 0
+        let ok = (try? await ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason)) == true
+        UINotificationFeedbackGenerator().notificationOccurred(ok ? .success : .error)
+        return ok
+    }
 
     // Same site and username: update the password; otherwise add a new login.
     func upsert(_ l: Login) {
@@ -669,28 +701,6 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     static var youtubeProvider: ((String) -> Bool)?
     @Published var loading = false
     private var loadObs: NSKeyValueObservation?
-    @Published var ambient: UIImage?
-    private var ambientTimer: Timer?
-
-    // A tiny, frequently refreshed picture of the page; the bars blur it into a glow that follows the content.
-    func setAmbient(_ on: Bool) {
-        ambientTimer?.invalidate()
-        ambientTimer = nil
-        guard on else { if ambient != nil { ambient = nil }; return }
-        ambientTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in self?.captureAmbient() }
-        captureAmbient()
-    }
-
-    private func captureAmbient() {
-        guard !isHome, webView.window != nil, webView.bounds.width > 0,
-              UIApplication.shared.applicationState == .active else { return }
-        let c = WKSnapshotConfiguration()
-        c.snapshotWidth = 40
-        c.afterScreenUpdates = false
-        webView.takeSnapshot(with: c) { [weak self] img, _ in
-            if let img { self?.ambient = img }
-        }
-    }
 
 
     static func installScripts(_ u: WKUserContentController, youtube: Bool) {
@@ -700,12 +710,12 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             u.addUserScript(WKUserScript(source: Rules.youtube, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
         u.addUserScript(WKUserScript(source: Rules.decline, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
-        u.addUserScript(WKUserScript(source: Rules.capture, injectionTime: .atDocumentEnd, forMainFrameOnly: false))
     }
     static var onBlocked: (() -> Void)?
     private var obs: NSKeyValueObservation?
     private var lastY: CGFloat = 0
     private var scrollRun: CGFloat = 0
+    private var barLockUntil = Date.distantPast
     private var tintWork: DispatchWorkItem?
     static let setJS = "function S(e,v){Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,v);e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}))}"
     // Safari-style "Hide Distracting Items": tap an element to fade it out and remember it for this site.
@@ -727,6 +737,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         config.preferences.javaScriptCanOpenWindowsAutomatically = false
         config.applicationNameForUserAgent = "Version/\(ProcessInfo.processInfo.operatingSystemVersion.majorVersion).0 Mobile/15E148 Safari/604.1"
         Pane.installScripts(config.userContentController, youtube: false)
+        WebFrameRate.unlock(config.preferences, on: !UserDefaults.standard.bool(forKey: "saver"))
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.allowsBackForwardNavigationGestures = true
         wv.scrollView.keyboardDismissMode = .interactive
@@ -742,14 +753,27 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             let y = sv.contentOffset.y
             let dy = y - self.lastY
             self.lastY = y
-            // Only react to a deliberate scroll in one direction, so the bar doesn't flicker.
-            if sv.isTracking || sv.isDecelerating {
+            // Only a deliberate scroll inside the page moves the bar. Ignored: pages too short to scroll,
+            // the rubber-band bounce past the top or bottom, and the jolt from the bar's own resize
+            // (a short cool-down after each change stops the shrink / grow / shrink loop).
+            let maxY = sv.contentSize.height - sv.bounds.height + sv.adjustedContentInset.bottom
+            let scrollable = maxY > 120
+            let inBounds = y >= 0 && y <= maxY
+            let unlocked = Date() > self.barLockUntil
+            if (sv.isTracking || sv.isDecelerating) && scrollable && inBounds && unlocked {
                 if (dy > 0) != (self.scrollRun > 0) { self.scrollRun = 0 }
                 self.scrollRun += dy
-                if self.scrollRun > 28 && y > 60 && !self.collapsed { self.collapsed = true }
-                else if self.scrollRun < -28 && self.collapsed { self.collapsed = false }
+                if self.scrollRun > 28 && y > 60 && !self.collapsed {
+                    self.collapsed = true
+                    self.barLockUntil = Date().addingTimeInterval(0.5)
+                    self.scrollRun = 0
+                } else if self.scrollRun < -28 && self.collapsed {
+                    self.collapsed = false
+                    self.barLockUntil = Date().addingTimeInterval(0.5)
+                    self.scrollRun = 0
+                }
             }
-            if y <= 0 && self.collapsed { self.collapsed = false }
+            if y <= 0 && self.collapsed && unlocked && !sv.isDecelerating { self.collapsed = false }
             self.scheduleTint()
         }
         loadObs = wv.observe(\.isLoading, options: [.new]) { [weak self] w, _ in
@@ -1003,13 +1027,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             if let u = webView.url { onPageLoaded?(u, webView.title ?? "") }
         }
         onChange?()
-        webView.evaluateJavaScript("((document.querySelector('input[type=password]')?1:0)+(document.querySelector('[autocomplete=cc-number]')?2:0))") { [weak self] r, _ in
-            guard let self else { return }
-            let v = (r as? Int) ?? 0
-            self.hasLogin = (v & 1) != 0
-            self.hasCard = (v & 2) != 0
-            if self.hasLogin && !self.isHome { self.onLoginField?() }
-        }
+        // Logins and cards on pages are filled by iOS AutoFill (Passwords app), not by SplitDeck.
     }
 }
 
@@ -2241,44 +2259,17 @@ struct PaneView: View {
     var trailingRoom: CGFloat = 0  // space left for the tab pill beside a top bar
     @Environment(\.colorScheme) private var sys
     @AppStorage("saver") private var saver = false
-    @AppStorage("ambientMode") private var ambientMode = false
     @AppStorage("minimalBar") private var minimalBar = true
+    @AppStorage("barLayout") private var barLayout = "twoTone"
     @State private var collapseToken = UUID()
+    @State private var touchedAt = Date.distantPast
     @AppStorage("adaptiveText") private var adaptiveText = true
     @AppStorage("textColor") private var textColor = "System"
     @Environment(\.sdTheme) private var theme
     @Environment(\.scenePhase) private var phase
 
 
-    private var ambientActive: Bool { ambientMode && !saver && !pane.isPrivate && !pane.isHome }
-
-    // Ambient: only the edge you never tap (status bar or home indicator) glows with the colours of the page
-    // edge next to it; the part of the strip holding the address bar stays a plain colour.
-    @ViewBuilder private func stripBackground(top: Bool) -> some View {
-        let zone = top ? safeTop : bottomInset
-        if ambientActive, zone > 0, let img = pane.ambient {
-            ZStack {
-                stripColor
-                GeometryReader { g in
-                    Image(uiImage: img)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: g.size.width, height: max(g.size.height * 3, 140), alignment: top ? .top : .bottom)
-                        .frame(width: g.size.width, height: g.size.height, alignment: top ? .top : .bottom)
-                        .blur(radius: 22, opaque: true)
-                        .saturation(1.5)
-                        .clipped()
-                }
-                .mask(alignment: top ? .top : .bottom) {
-                    LinearGradient(colors: [.black, .black, .clear], startPoint: top ? .top : .bottom, endPoint: top ? .bottom : .top)
-                        .frame(height: zone + 10)
-                }
-            }
-            .animation(.easeInOut(duration: 0.5), value: img)
-        } else {
-            stripColor
-        }
-    }
+    private func stripBackground(top: Bool) -> some View { stripColor }
 
     @State private var desktop = false
     @FocusState private var focused: Bool
@@ -2288,21 +2279,30 @@ struct PaneView: View {
         return TextColors.ink(adaptive: adaptiveText, name: textColor)
     }
     private var mini: Bool { pane.collapsed && !focused && !pane.isHome }
+    // Full-screen layout choice; split view always uses the slim two-tone bar.
+    private var layoutStyle: String { compact ? "twoTone" : barLayout }
+    private var tinted: Bool { layoutStyle == "twoTone" }
+    private var toolbarLayout: Bool { layoutStyle == "toolbar" }
+    private var showToolbar: Bool { toolbarLayout && !mini && !focused && !pane.hiding }
     // The bottom strip takes the page's own colour so it blends in; the top strip matches the status bar.
     private var stripColor: Color {
         if pane.isPrivate { return Color(red: 0.14, green: 0.10, blue: 0.23) }
+        if searching { return atTop ? theme.top : theme.bottom }   // blends into the search screen's gradient
         return pane.isHome || atTop ? theme.strip : (pane.bottomColor ?? theme.strip)
     }
+    // The full-screen search screen is up: the bar follows the theme, not the page behind it.
+    private var searching: Bool { focused && !compact }
     // Whether the bar surface is dark. Adaptive: follows the page so text stays readable.
     // Fixed colour: the surface contrasts with the colour you picked.
     private var dark: Bool {
         if pane.isPrivate { return true }
         if !adaptiveText { return TextColors.isLight(textColor) ?? (sys == .dark) }
-        if pane.isHome || atTop { return sys == .dark }
+        if pane.isHome || atTop || searching { return sys == .dark }
         return pane.pageDark ?? (sys == .dark)
     }
-    private var spring: Animation? { saver ? nil : .spring(response: 0.35, dampingFraction: 0.82) }
-    private var smooth: Animation? { saver ? nil : .smooth(duration: 0.4) }
+    // Tuned for 120 Hz: critically damped enough not to wobble, quick enough to feel direct.
+    private var spring: Animation? { saver ? nil : .spring(response: 0.34, dampingFraction: 0.86) }
+    private var smooth: Animation? { saver ? nil : .smooth(duration: 0.36) }
     @Namespace private var ns
     private var barH: CGFloat { compact ? 36 : 54 }
 
@@ -2313,15 +2313,24 @@ struct PaneView: View {
     }
 
     // Minimal bottom bar: settle into a small pill after the page loads or you stop using the bar.
+    // It waits until the bar has been left alone for a while, and never folds away under an open
+    // ⋯ menu or share sheet (it checks again a little later instead).
+    private static let idle: Double = 8
     private func scheduleCollapse(after delay: Double) {
-        guard minimalBar, !atTop, !pane.isHome else { return }
+        guard minimalBar, !(atTop && compact), !pane.isHome else { return }
         let token = UUID()
         collapseToken = token
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-            if collapseToken == token && !focused && !pane.hiding && !pane.isHome && !showBanner {
-                pane.collapsed = true
-            }
+            guard collapseToken == token, !focused, !pane.hiding, !pane.isHome, !showBanner else { return }
+            let quiet = Date().timeIntervalSince(touchedAt)
+            if quiet < Self.idle { scheduleCollapse(after: Self.idle - quiet); return }
+            if OverlayProbe.somethingOpen() { scheduleCollapse(after: 2); return }
+            pane.collapsed = true
         }
+    }
+    private func touched() {
+        touchedAt = Date()
+        scheduleCollapse(after: Self.idle)
     }
     private var iconW: CGFloat { compact ? 32 : 44 }
 
@@ -2405,7 +2414,7 @@ struct PaneView: View {
                         focused = false
                         pane.load(value)
                     }
-                    .transition(.opacity)
+                    .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: atTop ? .top : .bottom)))
                 } else if focused {
                     Color.black.opacity(0.001)
                         .contentShape(Rectangle())
@@ -2417,6 +2426,7 @@ struct PaneView: View {
             }
             .clipped()
             if !atTop { bottomRow }
+            if atTop && showToolbar { bottomToolbar }
         }
         .overlay {
             // Private tabs are hidden when locked, and in the app switcher.
@@ -2429,25 +2439,23 @@ struct PaneView: View {
         .animation(spring, value: pane.hiding)
         .animation(spring, value: showBanner)
         .animation(spring, value: suggestions.count)
+        .animation(spring, value: barLayout)
+        .animation(spring, value: atTop)
         .onChange(of: pane.loading) { _, l in if !l { scheduleCollapse(after: 1.5) } }
         .onChange(of: focused) { _, f in
             pane.editing = f
-            if !f { scheduleCollapse(after: 4) }
+            if !f { touched() }
             if f && !pane.address.isEmpty {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                     UIApplication.shared.sendAction(#selector(UIResponder.selectAll(_:)), to: nil, from: nil, for: nil)
                 }
             }
         }
-        .onAppear { pane.setAmbient(ambientMode && !saver && !pane.isPrivate) }
-        .onDisappear { pane.setAmbient(false) }
-        .onChange(of: ambientMode) { _, _ in pane.setAmbient(ambientMode && !saver && !pane.isPrivate) }
-        .onChange(of: saver) { _, _ in pane.setAmbient(ambientMode && !saver && !pane.isPrivate) }
     }
 
     private var topRow: some View {
         VStack(spacing: 6) {
-            bar.frame(height: barH)
+            bar.frame(height: mini && !compact ? nil : barH)
             if showBanner { fillBanner }
             if compact && !suggestions.isEmpty { suggestionList }
         }
@@ -2465,6 +2473,9 @@ struct PaneView: View {
             if compact && !suggestions.isEmpty { suggestionList }
             if showBanner { fillBanner }
             bar
+            if showToolbar {
+                toolbar.transition(.move(edge: .bottom).combined(with: .opacity))
+            }
         }
         .environment(\.colorScheme, dark ? .dark : .light)
         .padding(.horizontal, 12)
@@ -2530,6 +2541,53 @@ struct PaneView: View {
         }
         .opacity(enabled ? 1 : 0.35)
         .disabled(!enabled)
+    }
+
+    // Toolbar layout: the buttons get their own row, spread out like Safari's classic bar.
+    private var toolbar: some View {
+        HStack(spacing: 0) {
+            icon("chevron.left", enabled: pane.backEnabled) { pane.back() }.frame(maxWidth: .infinity)
+            icon("chevron.right", enabled: pane.forwardEnabled) { pane.forward() }.frame(maxWidth: .infinity)
+            shareButton.frame(maxWidth: .infinity)
+            if !actions.islandShown && actions.splitEnabled { splitButton.frame(maxWidth: .infinity) }
+            tabsButton.frame(maxWidth: .infinity)
+            menu.frame(maxWidth: .infinity)
+        }
+        .frame(height: 46)
+        .simultaneousGesture(TapGesture().onEnded { touched() })
+    }
+
+    private var shareButton: some View {
+        Group {
+            if let url = pane.webView.url, !pane.isHome {
+                ShareLink(item: url, subject: Text(pane.title)) {
+                    Image(systemName: "square.and.arrow.up")
+                        .font(.system(size: 18, weight: .semibold))
+                        .foregroundStyle(ink)
+                        .frame(width: iconW, height: 46)
+                        .contentShape(Rectangle())
+                }
+            } else {
+                Image(systemName: "square.and.arrow.up")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundStyle(ink)
+                    .opacity(0.35)
+                    .frame(width: iconW, height: 46)
+            }
+        }
+        .accessibilityLabel("Share")
+    }
+
+    // With the address bar at the top, the toolbar sits at the bottom of the screen.
+    private var bottomToolbar: some View {
+        toolbar
+            .padding(.horizontal, 8)
+            .padding(.top, 2)
+            .padding(.bottom, max(bottomInset - 12, 4))
+            .frame(maxWidth: .infinity)
+            .background(stripColor)
+            .environment(\.colorScheme, dark ? .dark : .light)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 
     private var fillBanner: some View {
@@ -2605,7 +2663,7 @@ struct PaneView: View {
             // The expandable pill: just the site. Tap to open the full bar.
             Button {
                 pane.collapsed = false
-                scheduleCollapse(after: 6)
+                touched()
             } label: {
                 HStack(spacing: 6) {
                     if pane.isPrivate {
@@ -2631,7 +2689,15 @@ struct PaneView: View {
         } else {
             // One capsule: back and forward built in, then the address, extras and menu.
             HStack(spacing: 0) {
-                if !focused {
+                if !focused && toolbarLayout && pane.isPrivate {
+                    Image(systemName: "eye.slash.fill")
+                        .font(.system(size: 12, weight: .semibold))
+                        .foregroundStyle(ink)
+                        .opacity(0.8)
+                        .padding(.leading, 16)
+                        .accessibilityLabel("Private tab")
+                }
+                if !focused && !toolbarLayout {
                     // Tinted end: navigation
                     HStack(spacing: 0) {
                         icon("chevron.left", enabled: pane.backEnabled) { pane.back() }
@@ -2646,30 +2712,33 @@ struct PaneView: View {
                         }
                     }
                     .frame(height: barH - 6)
-                    .background(endTint, in: Capsule())
+                    .background(tinted ? endTint : Color.clear, in: Capsule())
+                    .simultaneousGesture(TapGesture().onEnded { touched() })
                     .padding(.leading, 3)
                 }
                 // Clear middle: the address
-                field.padding(.leading, focused ? (compact ? 14 : 18) : 8)
+                field.padding(.leading, focused || toolbarLayout ? (compact ? 14 : 18) : 8)
                 if focused {
                     if !pane.address.isEmpty { icon("xmark.circle.fill") { pane.address = "" } }
                 } else {
                     // Tinted end: page and app controls
                     HStack(spacing: 0) {
-                        if !pane.isHome && pane.hasLogin { icon("key.fill") { actions.autofill() } }
-                        if !pane.isHome && pane.hasCard { icon("creditcard.fill") { actions.autofill() } }
                         if !pane.isHome { reloadButton }
-                        if !actions.islandShown && actions.splitEnabled { splitButton }
-                        if !compact || !actions.islandShown { tabsButton }
-                        menu
+                        if !toolbarLayout {
+                            if !actions.islandShown && actions.splitEnabled { splitButton }
+                            if !compact || !actions.islandShown { tabsButton }
+                            menu
+                        }
                     }
                     .frame(height: barH - 6)
-                    .background(endTint, in: Capsule())
+                    .background(tinted ? endTint : Color.clear, in: Capsule())
+                    .simultaneousGesture(TapGesture().onEnded { touched() })
                     .padding(.trailing, 3)
                 }
             }
             .frame(height: barH)
-            .sdGlass(Capsule(), dark: dark, clear: true)
+            .sdGlass(Capsule(), dark: dark, clear: tinted)
+            .geometryGroup()
             .padding(.trailing, focused && !compact ? 78 : 0)
             .overlay(alignment: .trailing) {
                 if focused && !compact {
@@ -2749,6 +2818,25 @@ struct PaneView: View {
                 .contentShape(Rectangle())
         }
         .environment(\.colorScheme, sys)
+    }
+}
+
+// Whether a menu, share sheet or other sheet is on screen, so the address bar doesn't fold away under it.
+enum OverlayProbe {
+    static func somethingOpen() -> Bool {
+        for scene in UIApplication.shared.connectedScenes {
+            guard let ws = scene as? UIWindowScene else { continue }
+            for w in ws.windows where !w.isHidden {
+                if w.rootViewController?.presentedViewController != nil { return true }
+                if hasMenu(w, depth: 0) { return true }
+            }
+        }
+        return false
+    }
+    private static func hasMenu(_ v: UIView, depth: Int) -> Bool {
+        if NSStringFromClass(type(of: v)).contains("ContextMenu") { return true }
+        guard depth < 3 else { return false }
+        return v.subviews.contains { hasMenu($0, depth: depth + 1) }
     }
 }
 
@@ -2955,110 +3043,313 @@ struct PrivateCover: View {
 
 // MARK: Edge dock
 
-// Tabs, last-tab switch and split view, docked on the right edge. Swipe it right (or tap the chevron)
-// to tuck it away as a thin tab; tap or swipe that tab to bring it back. Drag up or down to move it.
+enum DockEdge: String { case left, right, top }
+
+enum Haptics {
+    static func lift() { UIImpactFeedbackGenerator(style: .medium).impactOccurred(intensity: 0.7) }
+    static func tick() { UISelectionFeedbackGenerator().selectionChanged() }
+    static func land() { UIImpactFeedbackGenerator(style: .soft).impactOccurred() }
+    static func tap() { UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.6) }
+}
+
+// Island buttons sink a little under your finger.
+struct IslandPress: ButtonStyle {
+    var saver: Bool
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(Circle().fill(Color.primary.opacity(configuration.isPressed ? 0.12 : 0)).padding(3))
+            .scaleEffect(configuration.isPressed ? 0.84 : 1)
+            .animation(saver ? nil : .spring(response: 0.24, dampingFraction: 0.6), value: configuration.isPressed)
+    }
+}
+
+// The floating island: tabs, last-tab switch and split view. Drag it anywhere and let go: it springs
+// to the nearest side or the top, turning sideways to lie along the top. Fling it at the edge (or tap
+// the chevron) to tuck it into a slim handle; tap the handle, or pull it out, to bring it back.
 struct EdgeDock: View {
     @ObservedObject var tabs: Tabs
     var saver: Bool
     var privateMode: Bool
+    var safe: UIEdgeInsets
     var openTabs: () -> Void
-    @AppStorage("dockTucked") private var tucked = false
     @AppStorage("splitEnabled") private var splitEnabled = true
-    @AppStorage("dockY") private var dockY = 0.45
     @AppStorage("adaptiveText") private var adaptiveText = true
     @AppStorage("textColor") private var textColor = "System"
-    @State private var dragY: CGFloat = 0
-    @State private var dragX: CGFloat = 0
+    @Environment(\.sdTheme) private var theme
+
+    // Where it rests. Kept in State so every change animates, and saved for next launch.
+    @State private var edge = DockEdge(rawValue: UserDefaults.standard.string(forKey: "dockEdge") ?? "") ?? .right
+    @State private var along = UserDefaults.standard.object(forKey: "dockPos") as? Double
+        ?? UserDefaults.standard.object(forKey: "dockY") as? Double ?? 0.45
+    @State private var tucked = UserDefaults.standard.bool(forKey: "dockTucked")
+
+    // While dragging
+    @State private var start: CGPoint?          // resting centre when the drag began
+    @State private var drag: CGSize = .zero
+    @State private var target: DockEdge?        // the edge it will land on
+    @State private var willTuck = false
+    @State private var swapTick = 0
 
     private var ink: AnyShapeStyle {
         privateMode ? AnyShapeStyle(Color.white) : TextColors.ink(adaptive: adaptiveText, name: textColor)
     }
-    private var anim: Animation? { saver ? nil : .spring(response: 0.35, dampingFraction: 0.8) }
+    private var snap: Animation? { saver ? nil : .spring(response: 0.42, dampingFraction: 0.72) }
+    private var morph: Animation? { saver ? nil : .spring(response: 0.3, dampingFraction: 0.82) }
+    private var quick: Animation? { saver ? nil : .spring(response: 0.22, dampingFraction: 0.75) }
+
+    private var shownEdge: DockEdge { target ?? edge }
+    private var vertical: Bool { shownEdge != .top }
+    private var length: CGFloat { CGFloat(splitEnabled ? 4 : 3) * 44 + 8 }
+    private let girth: CGFloat = 52
+
+    // MARK: Geometry
+
+    private func rest(_ e: DockEdge, _ a: Double, tucked t: Bool, in s: CGSize) -> CGPoint {
+        let half = (t ? 96 : length) / 2
+        switch e {
+        case .left, .right:
+            let lo = safe.top + half + 12
+            let hi = max(s.height - safe.bottom - half - 40, lo)
+            let y = min(max(a * s.height, lo), hi)
+            let inset = t ? 10 : girth / 2 + 6
+            return CGPoint(x: e == .right ? s.width - safe.right - inset : safe.left + inset, y: y)
+        case .top:
+            let lo = safe.left + half + 12
+            let hi = max(s.width - safe.right - half - 12, lo)
+            let x = min(max(a * s.width, lo), hi)
+            return CGPoint(x: x, y: safe.top + (t ? 10 : girth / 2 + 6))
+        }
+    }
+
+    private func nearest(_ p: CGPoint, in s: CGSize) -> DockEdge {
+        let l = p.x - safe.left
+        let r = s.width - safe.right - p.x
+        let t = (p.y - safe.top) * 1.15      // the top needs a slightly firmer pull than the sides
+        if t < l && t < r { return .top }
+        return l < r ? .left : .right
+    }
+
+    // How far past an edge's resting line a point is (positive = toward the screen edge).
+    private func overshoot(_ p: CGPoint, _ e: DockEdge, in s: CGSize) -> CGFloat {
+        let r = rest(e, 0.5, tucked: false, in: s)
+        switch e {
+        case .right: return p.x - r.x
+        case .left: return r.x - p.x
+        case .top: return r.y - p.y
+        }
+    }
+
+    // Follows the finger, with a rubbery give at the screen edges.
+    private func live(in s: CGSize) -> CGPoint? {
+        guard let start else { return nil }
+        func band(_ v: CGFloat, _ lo: CGFloat, _ hi: CGFloat) -> CGFloat {
+            v < lo ? lo - (lo - v) * 0.25 : (v > hi ? hi + (v - hi) * 0.25 : v)
+        }
+        return CGPoint(x: band(start.x + drag.width, 30, s.width - 30),
+                       y: band(start.y + drag.height, safe.top + 26, s.height - safe.bottom - 30))
+    }
+
+    // MARK: Actions
+
+    private func save() {
+        let d = UserDefaults.standard
+        d.set(edge.rawValue, forKey: "dockEdge")
+        d.set(along, forKey: "dockPos")
+        d.set(tucked, forKey: "dockTucked")
+    }
+
+    private func setTucked(_ t: Bool) {
+        Haptics.tap()
+        withAnimation(snap) { tucked = t }
+        save()
+    }
+
+    private func move(to e: DockEdge) {
+        withAnimation(snap) { edge = e; along = e == .top ? 0.5 : 0.45; tucked = false }
+        save()
+    }
+
+    private func dragGesture(in s: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 8, coordinateSpace: .named("dock"))
+            .onChanged { v in
+                if start == nil {
+                    withAnimation(quick) {
+                        start = rest(edge, along, tucked: tucked, in: s)
+                        target = edge
+                    }
+                    Haptics.lift()
+                }
+                drag = v.translation
+                guard let p = live(in: s) else { return }
+                // Pull the handle away from the edge and the island comes out with your finger.
+                if tucked && overshoot(p, edge, in: s) < -12 {
+                    withAnimation(snap) { tucked = false }
+                    Haptics.tick()
+                }
+                let t = nearest(p, in: s)
+                if t != target {
+                    target = t
+                    Haptics.tick()
+                }
+                let wt = !tucked && overshoot(p, t, in: s) > 26
+                if wt != willTuck {
+                    willTuck = wt
+                    Haptics.tick()
+                }
+            }
+            .onEnded { v in
+                guard let st = start else { return }
+                let p = CGPoint(x: st.x + v.translation.width, y: st.y + v.translation.height)
+                let flung = CGPoint(x: st.x + v.predictedEndTranslation.width, y: st.y + v.predictedEndTranslation.height)
+                // Lean toward where a flick was heading.
+                var aim = CGPoint(x: p.x + (flung.x - p.x) * 0.3, y: p.y + (flung.y - p.y) * 0.3)
+                aim.x = min(max(aim.x, 0), s.width)
+                aim.y = min(max(aim.y, 0), s.height)
+                let e = nearest(aim, in: s)
+                let a = Double(e == .top ? aim.x / max(s.width, 1) : aim.y / max(s.height, 1))
+                let tuck = tucked || willTuck || (overshoot(p, e, in: s) > -50 && overshoot(flung, e, in: s) > 140)
+                withAnimation(snap) {
+                    edge = e
+                    along = min(max(a, 0), 1)
+                    tucked = tuck
+                    start = nil
+                    drag = .zero
+                    target = nil
+                    willTuck = false
+                }
+                Haptics.land()
+                save()
+            }
+    }
+
+    // MARK: Views
 
     private func button<L: View>(_ label: String, _ action: @escaping () -> Void, @ViewBuilder content: () -> L) -> some View {
-        Button(action: action) {
+        Button {
+            Haptics.tap()
+            action()
+        } label: {
             content()
                 .font(.system(size: 16, weight: .semibold))
                 .foregroundStyle(ink)
                 .frame(width: 44, height: 44)
                 .contentShape(Rectangle())
         }
+        .buttonStyle(IslandPress(saver: saver))
         .accessibilityLabel(label)
     }
 
+    private var tabCount: Int { privateMode ? tabs.privateCount : tabs.normalCount }
+
     private var panel: some View {
-        VStack(spacing: 0) {
-            button("Tabs", openTabs) {
-                Text("\(privateMode ? tabs.privateCount : tabs.normalCount)")
+        let layout = vertical ? AnyLayout(VStackLayout(spacing: 0)) : AnyLayout(HStackLayout(spacing: 0))
+        return layout {
+            button("\(tabCount) tabs", openTabs) {
+                Text("\(tabCount)")
                     .font(.caption.weight(.bold))
                     .monospacedDigit()
+                    .contentTransition(.numericText())
                     .frame(minWidth: 20, minHeight: 20)
                     .padding(.horizontal, 2)
                     .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(ink, lineWidth: 1.6))
+                    .animation(snap, value: tabCount)
             }
-            button("Switch to last tab", { withAnimation(anim) { tabs.swap() } }) {
+            .contextMenu {
+                Button { withAnimation(snap) { tabs.newTab(slot: 0) } } label: {
+                    Label("New Tab", systemImage: "plus.square.on.square")
+                }
+                Button { withAnimation(snap) { tabs.newTab(slot: 0, isPrivate: true) } } label: {
+                    Label("New Private Tab", systemImage: "eye.slash")
+                }
+                Button(action: openTabs) { Label("Show All Tabs", systemImage: "square.grid.2x2") }
+            }
+            button("Switch to last tab", { swapTick += 1; withAnimation(snap) { tabs.swap() } }) {
                 Image(systemName: "arrow.left.arrow.right")
+                    .rotationEffect(.degrees(vertical ? 0 : 90))
+                    .symbolEffect(.bounce, value: swapTick)
             }
             .disabled(!tabs.canSwap)
             .opacity(tabs.canSwap ? 1 : 0.4)
             if splitEnabled {
-                button(tabs.split ? "Close split view" : "Split view", { withAnimation(anim) { tabs.toggleSplit() } }) {
+                button(tabs.split ? "Close split view" : "Split view", { withAnimation(snap) { tabs.toggleSplit() } }) {
                     Image(systemName: tabs.split ? "rectangle.split.1x2.fill" : "rectangle.split.1x2")
+                        .symbolEffect(.bounce, value: tabs.split)
                 }
             }
-            button("Tuck away", { withAnimation(anim) { tucked = true } }) {
-                Image(systemName: "chevron.compact.right").font(.system(size: 14, weight: .bold))
+            button("Tuck away", { setTucked(true) }) {
+                Image(systemName: shownEdge == .top ? "chevron.compact.up"
+                      : (shownEdge == .left ? "chevron.compact.left" : "chevron.compact.right"))
+                    .font(.system(size: 14, weight: .bold))
             }
             .opacity(0.6)
         }
-        .padding(.vertical, 4)
-        .sdGlass(RoundedRectangle(cornerRadius: 24, style: .continuous), dark: privateMode ? true : nil)
+        .symbolEffectsRemoved(saver)
+        .padding(4)
+        .sdGlass(Capsule(style: .continuous), dark: privateMode ? true : nil)
+        .accessibilityElement(children: .contain)
+        .accessibilityAction(named: "Move to left edge") { move(to: .left) }
+        .accessibilityAction(named: "Move to right edge") { move(to: .right) }
+        .accessibilityAction(named: "Move to top") { move(to: .top) }
     }
 
     private var handle: some View {
         Capsule()
-            .fill(privateMode ? Color.white.opacity(0.7) : Color.primary.opacity(0.35))
-            .frame(width: 5, height: 56)
-            .frame(width: 30, height: 90, alignment: .trailing)
+            .fill(privateMode ? Color.white.opacity(0.75) : Color.primary.opacity(0.45))
+            .background(Capsule().stroke(Color(uiColor: .systemBackground).opacity(0.6), lineWidth: 1.5))
+            .frame(width: vertical ? 5 : 52, height: vertical ? 52 : 5)
+            .frame(width: vertical ? 28 : 96, height: vertical ? 96 : 28)
             .contentShape(Rectangle())
-            .onTapGesture { withAnimation(anim) { tucked = false } }
+            .onTapGesture { setTucked(false) }
             .accessibilityLabel("Show tab controls")
             .accessibilityAddTraits(.isButton)
     }
 
+    private var anchor: UnitPoint {
+        switch shownEdge {
+        case .left: return .leading
+        case .right: return .trailing
+        case .top: return .top
+        }
+    }
+
+    // A glow on the edge it will land on, while you drag.
+    private func glow(_ p: CGPoint, in s: CGSize) -> some View {
+        let e = shownEdge
+        let side = e != .top
+        var at = CGPoint(x: p.x, y: safe.top + 3)
+        if e == .left { at = CGPoint(x: safe.left + 3, y: p.y) }
+        if e == .right { at = CGPoint(x: s.width - safe.right - 3, y: p.y) }
+        return Capsule()
+            .fill(theme.accent.opacity(willTuck ? 0.95 : 0.55))
+            .frame(width: side ? 4 : (willTuck ? 150 : 110), height: side ? (willTuck ? 150 : 110) : 4)
+            .shadow(color: theme.accent.opacity(0.6), radius: 6)
+            .position(at)
+            .allowsHitTesting(false)
+            .transition(.opacity)
+    }
+
     var body: some View {
         GeometryReader { g in
-            let h = g.size.height
-            let y = min(max(dockY * h + dragY, 110), max(h - 110, 110))
-            Group {
-                if tucked { handle } else { panel }
+            let s = g.size
+            let lifted = start != nil
+            let p = live(in: s) ?? rest(edge, along, tucked: tucked, in: s)
+            ZStack {
+                if lifted && !saver { glow(p, in: s) }
+                Group {
+                    if tucked { handle } else { panel }
+                }
+                .transition(.scale(scale: 0.3, anchor: anchor).combined(with: .opacity))
+                .animation(morph, value: vertical)
+                .scaleEffect(lifted ? (willTuck ? 0.84 : 1.07) : 1)
+                .opacity(willTuck ? 0.75 : 1)
+                .shadow(color: .black.opacity(lifted && !saver ? 0.28 : 0), radius: 18, y: 10)
+                .animation(quick, value: lifted)
+                .animation(quick, value: willTuck)
+                .gesture(dragGesture(in: s))
+                .position(p)
             }
-            .offset(x: dragX)
-            .gesture(
-                DragGesture(minimumDistance: 10)
-                    .onChanged { v in
-                        if abs(v.translation.height) > abs(v.translation.width) {
-                            dragY = v.translation.height
-                        } else if !tucked {
-                            dragX = max(0, v.translation.width)
-                        } else {
-                            dragX = min(0, v.translation.width) / 3
-                        }
-                    }
-                    .onEnded { v in
-                        if abs(v.translation.height) > abs(v.translation.width) {
-                            dockY = Double(min(max(dockY * h + v.translation.height, 110), max(h - 110, 110)) / max(h, 1))
-                        } else if !tucked && v.translation.width > 40 {
-                            withAnimation(anim) { tucked = true }
-                        } else if tucked && v.translation.width < -20 {
-                            withAnimation(anim) { tucked = false }
-                        }
-                        dragY = 0
-                        withAnimation(anim) { dragX = 0 }
-                    }
-            )
-            .position(x: g.size.width - (tucked ? 15 : 30), y: y)
         }
+        .coordinateSpace(.named("dock"))
     }
 }
 
@@ -3067,30 +3358,12 @@ struct TopStrip: View {
     @ObservedObject var pane: Pane
     var safeTop: CGFloat
     @Environment(\.sdTheme) private var theme
-    @AppStorage("ambientMode") private var ambientMode = false
-    @AppStorage("saver") private var saver = false
 
     var body: some View {
         Color.clear
             .frame(height: safeTop)
             .frame(maxWidth: .infinity)
-            .background {
-                if ambientMode && !saver && !pane.isPrivate && !pane.isHome, let img = pane.ambient {
-                    GeometryReader { g in
-                        Image(uiImage: img)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: g.size.width, height: max(g.size.height * 3, 140), alignment: .top)
-                            .frame(width: g.size.width, height: g.size.height, alignment: .top)
-                            .blur(radius: 22, opaque: true)
-                            .saturation(1.5)
-                            .clipped()
-                    }
-                    .overlay(theme.strip.opacity(0.2))
-                } else {
-                    pane.isPrivate ? Color(red: 0.14, green: 0.10, blue: 0.23) : theme.strip
-                }
-            }
+            .background(pane.isPrivate ? Color(red: 0.14, green: 0.10, blue: 0.23) : theme.strip)
     }
 }
 
@@ -3501,6 +3774,116 @@ struct MySitesEditor: View {
     }
 }
 
+// MARK: Address bar layout picker
+
+// A tiny phone showing where the bar sits and how it's laid out.
+struct BarLayoutPreview: View {
+    var layout: String
+    var top: Bool
+    var selected: Bool
+    var accent: Color
+
+    private var capsule: some View {
+        HStack(spacing: 0) {
+            if layout == "twoTone" {
+                Capsule().fill(accent.opacity(0.6)).frame(width: 12)
+                Capsule().fill(Color.primary.opacity(0.1))
+                Capsule().fill(accent.opacity(0.6)).frame(width: 15)
+            } else if layout == "toolbar" {
+                Capsule().fill(Color.primary.opacity(0.22)).padding(.horizontal, 6)
+            } else {
+                HStack(spacing: 3) {
+                    Circle().fill(Color.primary.opacity(0.35)).frame(width: 4)
+                    Capsule().fill(Color.primary.opacity(0.22))
+                    Circle().fill(Color.primary.opacity(0.35)).frame(width: 4)
+                }
+                .padding(.horizontal, 3)
+            }
+        }
+        .frame(height: 8)
+        .padding(1.5)
+        .background(Capsule().fill(Color.primary.opacity(0.12)))
+    }
+
+    private var tools: some View {
+        HStack(spacing: 0) {
+            ForEach(0..<5, id: \.self) { _ in
+                Circle().fill(Color.primary.opacity(0.4)).frame(width: 4, height: 4).frame(maxWidth: .infinity)
+            }
+        }
+        .frame(height: 6)
+    }
+
+    private var page: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            ForEach(0..<5, id: \.self) { i in
+                Capsule().fill(Color.primary.opacity(0.12)).frame(width: i % 2 == 0 ? 38 : 26, height: 4)
+            }
+        }
+        .padding(.top, 4)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    var body: some View {
+        let phone = RoundedRectangle(cornerRadius: 14, style: .continuous)
+        VStack(spacing: 5) {
+            if top { capsule }
+            page
+            if !top { capsule }
+            if layout == "toolbar" { tools }
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 9)
+        .frame(width: 64, height: 112)
+        .background(Color(.tertiarySystemFill), in: phone)
+        .overlay(phone.strokeBorder(selected ? accent : Color.primary.opacity(0.08), lineWidth: selected ? 2.5 : 1))
+        .scaleEffect(selected ? 1 : 0.94)
+    }
+}
+
+struct BarLayoutPicker: View {
+    @Binding var layout: String
+    @Binding var position: String
+    var accent: Color
+    @AppStorage("saver") private var saver = false
+    private let layouts: [(id: String, name: String)] = [("twoTone", "Two-Tone"), ("single", "Single"), ("toolbar", "Toolbar")]
+
+    var body: some View {
+        VStack(spacing: 14) {
+            HStack(spacing: 0) {
+                ForEach(layouts, id: \.id) { l in
+                    Button {
+                        withAnimation(saver ? nil : .spring(response: 0.32, dampingFraction: 0.8)) { layout = l.id }
+                    } label: {
+                        VStack(spacing: 7) {
+                            BarLayoutPreview(layout: l.id, top: position == "top", selected: layout == l.id, accent: accent)
+                            Text(l.name)
+                                .font(.caption.weight(layout == l.id ? .semibold : .regular))
+                                .foregroundStyle(layout == l.id ? Color.primary : Color.secondary)
+                            Image(systemName: layout == l.id ? "checkmark.circle.fill" : "circle")
+                                .font(.system(size: 18))
+                                .foregroundStyle(layout == l.id ? accent : Color.secondary.opacity(0.5))
+                        }
+                        .frame(maxWidth: .infinity)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("\(l.name) layout")
+                    .accessibilityAddTraits(layout == l.id ? .isSelected : [])
+                }
+            }
+            Picker("Position", selection: Binding(
+                get: { position },
+                set: { v in withAnimation(saver ? nil : .spring(response: 0.32, dampingFraction: 0.8)) { position = v } })) {
+                Text("Bottom").tag("bottom")
+                Text("Top").tag("top")
+            }
+            .pickerStyle(.segmented)
+        }
+        .padding(.vertical, 8)
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var sites: Sites
     @ObservedObject var shields: Shields
@@ -3517,8 +3900,9 @@ struct SettingsView: View {
     @AppStorage("autoSavePasswords") private var autoSave = false
     @AppStorage("showIsland") private var showIsland = true
     @AppStorage("splitEnabled") private var splitEnabled = true
-    @AppStorage("ambientMode") private var ambientMode = false
     @AppStorage("minimalBar") private var minimalBar = true
+    @AppStorage("barLayout") private var barLayout = "twoTone"
+    @AppStorage("barPosition") private var barPosition = "bottom"
     var openVault: () -> Void
     var openVPN: () -> Void
     @Environment(\.dismiss) private var dismiss
@@ -3584,11 +3968,13 @@ struct SettingsView: View {
                          : "Icons and text use \(textColor == "System" ? "your phone's light or dark mode" : textColor.lowercased()), with the bar shaded to keep it readable.")
                 }
                 Section {
+                    BarLayoutPicker(layout: $barLayout, position: $barPosition, accent: themes.current.accent)
                     Toggle("Minimal Address Bar", isOn: $minimalBar)
                 } header: {
                     Text("Address Bar")
                 } footer: {
-                    Text("The bottom address bar settles into a small pill showing the site, giving the page more room. Tap the pill, or scroll up, to bring the full bar back.")
+                    Text("Layout and position apply in full screen; split view keeps its slim bars."
+                         + (minimalBar ? " The bar settles into a small pill showing the site, giving the page more room. Tap the pill, or scroll up, to bring the full bar back." : ""))
                 }
                 Section {
                     Toggle("Split View", isOn: $splitEnabled)
@@ -3598,7 +3984,7 @@ struct SettingsView: View {
                 } footer: {
                     Text((splitEnabled ? "Split View lets you show two pages at once. " : "Split View is off: SplitDeck always shows one page. ")
                          + (showIsland
-                            ? "The floating island on the right edge holds tabs, last-tab switching" + (splitEnabled ? " and split view" : "") + ". Swipe it right to tuck it away."
+                            ? "The floating island holds tabs, last-tab switching" + (splitEnabled ? " and split view" : "") + ". Drag it to either side or the top. Fling it at the edge, or tap its chevron, to tuck it away. Press and hold the tab count for new tabs."
                             : "With the island hidden, its buttons sit in the address bar and the ⋯ menu."))
                 }
                 Section("Home Page") {
@@ -3620,28 +4006,16 @@ struct SettingsView: View {
                     Text("Private tabs are hidden behind Face ID when you leave the app, and covered in the app switcher. VPN connects only to a provider you set up yourself: SplitDeck doesn't host VPN servers, as we don't yet have the resources to run them securely.")
                 }
                 Section {
-                    Toggle("Ambient Mode", isOn: $ambientMode)
-                        .disabled(saver)
-                } header: {
-                    Text("Ambient Mode")
-                } footer: {
-                    Text(saver
-                         ? "Unavailable while Extreme Battery Saver is on."
-                         : "The very top and bottom edges of the screen (around the clock and the home bar) glow softly with the colours of the page next to them. Uses a little more battery.")
-                }
-                Section {
                     Toggle("Extreme Battery Saver", isOn: $saver)
                 } footer: {
                     Text("Switches the app to dark mode, turns off every animation, caps page animations at 30 fps and keeps only 2 tabs awake.")
                 }
                 Section {
-                    Toggle("Save Passwords Automatically", isOn: $autoSave)
-                    Toggle("Offer to Fill Saved Passwords", isOn: $autoPrompt)
                     Button("Passwords and Cards") { openVault() }
                 } header: {
                     Text("Passwords")
                 } footer: {
-                    Text("Automatic saving stores new or changed passwords in your vault without asking (never in private tabs). Filling always needs Face ID.")
+                    Text("Logins on websites are filled by your iPhone's own AutoFill: tap a login field and pick a password above the keyboard (turn it on in Settings › General › AutoFill & Passwords). The vault keeps the passwords you add or import here, behind Face ID. Changing a username or password, or deleting a login, needs a fresh Face ID scan.")
                 }
             }
             .navigationTitle("Settings")
@@ -3994,12 +4368,17 @@ struct VaultView: View {
         .padding(12)
         .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
         .contentShape(Rectangle())
-        .onTapGesture { fill(l, nil); dismiss() }
+        .onTapGesture { editing = l }
         .contextMenu {
-            Button { fill(l, nil); dismiss() } label: { Label("Fill on Page", systemImage: "arrow.up.forward.app") }
             Button { editing = l } label: { Label("Edit", systemImage: "pencil") }
             Button { PasswordTools.copy(l.user) } label: { Label("Copy Username", systemImage: "person") }
-            Button(role: .destructive) { withAnimation { vault.deleteLogin(l.id) } } label: { Label("Delete", systemImage: "trash") }
+            Button { PasswordTools.copy(l.pass) } label: { Label("Copy Password", systemImage: "key") }
+            Button(role: .destructive) {
+                Task {
+                    guard await Vault.confirm("Delete the login for \(Sites.clean(l.site))") else { return }
+                    withAnimation { vault.deleteLogin(l.id) }
+                }
+            } label: { Label("Delete…", systemImage: "trash") }
         }
     }
 
@@ -4036,10 +4415,14 @@ struct VaultView: View {
                                      startPoint: .topLeading, endPoint: .bottomTrailing))
         )
         .contentShape(Rectangle())
-        .onTapGesture { fill(nil, c); dismiss() }
         .contextMenu {
-            Button { fill(nil, c); dismiss() } label: { Label("Fill on Page", systemImage: "arrow.up.forward.app") }
-            Button(role: .destructive) { withAnimation { vault.deleteCard(c.id) } } label: { Label("Delete", systemImage: "trash") }
+            Button { PasswordTools.copy(c.number) } label: { Label("Copy Card Number", systemImage: "creditcard") }
+            Button(role: .destructive) {
+                Task {
+                    guard await Vault.confirm("Delete this card") else { return }
+                    withAnimation { vault.deleteCard(c.id) }
+                }
+            } label: { Label("Delete…", systemImage: "trash") }
         }
     }
 }
@@ -4049,8 +4432,31 @@ struct LoginEditor: View {
     var isNew: Bool
     var save: (Login) -> Void
     var delete: (UUID) -> Void
+    private let original: Login
     @Environment(\.dismiss) private var dismiss
     @State private var show = false
+    @State private var checking = false
+
+    init(login: Login, isNew: Bool, save: @escaping (Login) -> Void, delete: @escaping (UUID) -> Void) {
+        _login = State(initialValue: login)
+        original = login
+        self.isNew = isNew
+        self.save = save
+        self.delete = delete
+    }
+
+    // Username or password edited on a saved login: needs Face ID before it's stored.
+    private var sensitiveChange: Bool { !isNew && (login.user != original.user || login.pass != original.pass) }
+
+    private func commit() {
+        guard sensitiveChange else { save(login); dismiss(); return }
+        checking = true
+        Task {
+            let ok = await Vault.confirm("Confirm the new username or password for \(Sites.clean(login.site))")
+            checking = false
+            if ok { save(login); dismiss() }
+        }
+    }
 
     var body: some View {
         let st = PasswordTools.strength(login.pass)
@@ -4095,7 +4501,18 @@ struct LoginEditor: View {
                 }
                 if !isNew {
                     Section {
-                        Button("Delete Login", role: .destructive) { delete(login.id); dismiss() }
+                        Button(role: .destructive) {
+                            Task {
+                                guard await Vault.confirm("Delete the login for \(Sites.clean(original.site))") else { return }
+                                delete(login.id)
+                                dismiss()
+                            }
+                        } label: {
+                            Label("Delete Login", systemImage: "trash")
+                        }
+                    } footer: {
+                        Label("Changing the username or password, or deleting, needs Face ID.", systemImage: "faceid")
+                            .font(.footnote)
                     }
                 }
             }
@@ -4104,8 +4521,12 @@ struct LoginEditor: View {
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Save") { save(login); dismiss() }
-                        .disabled(login.site.isEmpty || login.pass.isEmpty)
+                    Button {
+                        commit()
+                    } label: {
+                        if sensitiveChange { Label("Save", systemImage: "faceid").labelStyle(.titleAndIcon) } else { Text("Save") }
+                    }
+                    .disabled(login.site.isEmpty || login.pass.isEmpty || checking)
                 }
             }
         }
@@ -4190,6 +4611,7 @@ struct ContentView: View {
     @AppStorage("autoSavePasswords") private var autoSave = false
     @AppStorage("showIsland") private var showIsland = true
     @AppStorage("splitEnabled") private var splitEnabled = true
+    @AppStorage("barPosition") private var barPosition = "bottom"
     @State private var toast: String?
     @State private var tabsSlot = 0
 
@@ -4210,7 +4632,8 @@ struct ContentView: View {
         GeometryReader { root in
             let safe = ContentView.windowInsets()
             let portrait = root.size.height >= root.size.width
-            let topOwnStrip = tabs.split && portrait   // the top pane draws its own strip under the status bar
+            // The top pane (split, portrait) or a top address bar (full screen) draws its own strip under the status bar.
+            let topOwnStrip = (tabs.split && portrait) || (!tabs.split && barPosition == "top")
             VStack(spacing: 0) {
                 if !topOwnStrip {
                     TopStrip(pane: tabs.pane(tabs.left), safeTop: safe.top)
@@ -4221,7 +4644,7 @@ struct ContentView: View {
             .background(themes.current.strip.ignoresSafeArea())
             .overlay {
                 if showIsland {
-                    EdgeDock(tabs: tabs, saver: saver, privateMode: leftIsPrivate, openTabs: { openTabs() })
+                    EdgeDock(tabs: tabs, saver: saver, privateMode: leftIsPrivate, safe: safe, openTabs: { openTabs() })
                         .transition(.opacity)
                 }
             }
@@ -4339,7 +4762,7 @@ struct ContentView: View {
                     }
                     handle(horizontal: horizontal, total: total, pos: firstSize + gap / 2, size: geo.size)
                 } else {
-                    paneView(tabs.left, slot: 0, bottomInset: safe.bottom)
+                    paneView(tabs.left, slot: 0, atTop: barPosition == "top", safeTop: safe.top, bottomInset: safe.bottom)
                         .frame(width: geo.size.width, height: geo.size.height)
                 }
             }
@@ -4478,21 +4901,9 @@ struct ContentView: View {
     // MARK: Behaviour
 
     private func configure(_ p: Pane) {
-        p.onCredential = { login in
-            if autoSave {
-                vault.upsert(login)
-                showToast("Password saved for \(Sites.clean(login.site))")
-            } else {
-                pending = login
-            }
-        }
         p.onVisit = { sites.record($0) }
         p.onPageLoaded = { url, title in history.addVisit(url, title: title) }
         p.onSearch = { history.addSearch($0) }
-        p.onLoginField = { [weak p] in
-            guard let p, autoPrompt, !vault.match(host: p.host).isEmpty else { return }
-            p.offerFill = true
-        }
         p.applyRules(host: p.host)
         p.applyFPS()
     }
