@@ -75,6 +75,7 @@ enum BarColors {
 struct SDSurface: ViewModifier {
     let shape: AnyShape
     let dark: Bool?
+    var clear = false
     @AppStorage("barStyle") private var style = 0
     @AppStorage("barColor") private var colorName = "System"
     @Environment(\.colorScheme) private var scheme
@@ -87,10 +88,11 @@ struct SDSurface: ViewModifier {
                 .overlay(shape.stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
                 .shadow(color: .black.opacity(0.14), radius: 8, y: 2)
         } else {
-            let tint: Color = dark.map { $0 ? Color.black.opacity(0.42) : Color.white.opacity(0.62) }
-                ?? Color(.systemBackground).opacity(0.5)
+            let tint: Color = dark.map {
+                $0 ? Color.black.opacity(clear ? 0.18 : 0.42) : Color.white.opacity(clear ? 0.28 : 0.62)
+            } ?? Color(.systemBackground).opacity(clear ? 0.2 : 0.5)
             if #available(iOS 26.0, *) {
-                content.glassEffect(Glass.regular.tint(tint).interactive(), in: shape)
+                content.glassEffect((clear ? Glass.clear : Glass.regular).tint(tint).interactive(), in: shape)
             } else {
                 content.background(shape.fill(tint)).background(.regularMaterial, in: shape)
             }
@@ -99,8 +101,8 @@ struct SDSurface: ViewModifier {
 }
 
 extension View {
-    func sdGlass<S: Shape>(_ shape: S, dark: Bool? = nil) -> some View {
-        modifier(SDSurface(shape: AnyShape(shape), dark: dark))
+    func sdGlass<S: Shape>(_ shape: S, dark: Bool? = nil, clear: Bool = false) -> some View {
+        modifier(SDSurface(shape: AnyShape(shape), dark: dark, clear: clear))
     }
 }
 
@@ -2240,6 +2242,8 @@ struct PaneView: View {
     @Environment(\.colorScheme) private var sys
     @AppStorage("saver") private var saver = false
     @AppStorage("ambientMode") private var ambientMode = false
+    @AppStorage("minimalBar") private var minimalBar = true
+    @State private var collapseToken = UUID()
     @AppStorage("adaptiveText") private var adaptiveText = true
     @AppStorage("textColor") private var textColor = "System"
     @Environment(\.sdTheme) private var theme
@@ -2301,6 +2305,24 @@ struct PaneView: View {
     private var smooth: Animation? { saver ? nil : .smooth(duration: 0.4) }
     @Namespace private var ns
     private var barH: CGFloat { compact ? 36 : 54 }
+
+    // Tinted ends of the two-tone bar: the buttons sit on tinted glass, the address on clear glass.
+    private var endTint: Color {
+        if pane.isPrivate { return Color.white.opacity(0.14) }
+        return theme.accent.opacity(dark ? 0.32 : 0.2)
+    }
+
+    // Minimal bottom bar: settle into a small pill after the page loads or you stop using the bar.
+    private func scheduleCollapse(after delay: Double) {
+        guard minimalBar, !atTop, !pane.isHome else { return }
+        let token = UUID()
+        collapseToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            if collapseToken == token && !focused && !pane.hiding && !pane.isHome && !showBanner {
+                pane.collapsed = true
+            }
+        }
+    }
     private var iconW: CGFloat { compact ? 32 : 44 }
 
     // Shows just the site name until you tap in, then the full address.
@@ -2407,8 +2429,10 @@ struct PaneView: View {
         .animation(spring, value: pane.hiding)
         .animation(spring, value: showBanner)
         .animation(spring, value: suggestions.count)
+        .onChange(of: pane.loading) { _, l in if !l { scheduleCollapse(after: 1.5) } }
         .onChange(of: focused) { _, f in
             pane.editing = f
+            if !f { scheduleCollapse(after: 4) }
             if f && !pane.address.isEmpty {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
                     UIApplication.shared.sendAction(#selector(UIResponder.selectAll(_:)), to: nil, from: nil, for: nil)
@@ -2578,46 +2602,74 @@ struct PaneView: View {
             .matchedGeometryEffect(id: "bar", in: ns)
             .transition(.opacity)
         } else if mini {
-            Button { pane.collapsed = false } label: {
-                Text(pane.host.isEmpty ? "Search" : pane.host.replacingOccurrences(of: "www.", with: ""))
-                    .font(compact ? .caption2.weight(.semibold) : .caption.weight(.semibold))
-                    .foregroundStyle(ink)
-                    .lineLimit(1)
-                    .padding(.horizontal, compact ? 12 : 16)
-                    .padding(.vertical, compact ? 5 : 7)
+            // The expandable pill: just the site. Tap to open the full bar.
+            Button {
+                pane.collapsed = false
+                scheduleCollapse(after: 6)
+            } label: {
+                HStack(spacing: 6) {
+                    if pane.isPrivate {
+                        Image(systemName: "eye.slash.fill").font(.system(size: compact ? 9 : 11, weight: .semibold))
+                    } else if pane.loading {
+                        ProgressView().controlSize(.mini).tint(dark ? .white : .black)
+                    } else {
+                        Image(systemName: "lock.fill").font(.system(size: compact ? 8 : 10, weight: .semibold)).opacity(0.6)
+                    }
+                    Text(pane.host.isEmpty ? "Search" : pane.host.replacingOccurrences(of: "www.", with: ""))
+                        .font(compact ? .caption2.weight(.semibold) : .footnote.weight(.semibold))
+                        .lineLimit(1)
+                }
+                .foregroundStyle(ink)
+                .padding(.horizontal, compact ? 12 : 18)
+                .padding(.vertical, compact ? 5 : 9)
+                .contentShape(Capsule())
             }
-            .sdGlass(Capsule(), dark: dark)
+            .sdGlass(Capsule(), dark: dark, clear: true)
+            .accessibilityLabel("Show address bar")
             .matchedGeometryEffect(id: "bar", in: ns)
             .transition(.opacity)
         } else {
             // One capsule: back and forward built in, then the address, extras and menu.
             HStack(spacing: 0) {
                 if !focused {
-                    icon("chevron.left", enabled: pane.backEnabled) { pane.back() }
-                    icon("chevron.right", enabled: pane.forwardEnabled) { pane.forward() }
-                    if pane.isPrivate {
-                        Image(systemName: "eye.slash.fill")
-                            .font(.system(size: compact ? 11 : 12, weight: .semibold))
-                            .foregroundStyle(ink)
-                            .opacity(0.8)
-                            .accessibilityLabel("Private tab")
+                    // Tinted end: navigation
+                    HStack(spacing: 0) {
+                        icon("chevron.left", enabled: pane.backEnabled) { pane.back() }
+                        icon("chevron.right", enabled: pane.forwardEnabled) { pane.forward() }
+                        if pane.isPrivate {
+                            Image(systemName: "eye.slash.fill")
+                                .font(.system(size: compact ? 11 : 12, weight: .semibold))
+                                .foregroundStyle(ink)
+                                .opacity(0.8)
+                                .padding(.trailing, 6)
+                                .accessibilityLabel("Private tab")
+                        }
                     }
+                    .frame(height: barH - 6)
+                    .background(endTint, in: Capsule())
+                    .padding(.leading, 3)
                 }
-                field.padding(.leading, focused ? (compact ? 14 : 18) : 4)
+                // Clear middle: the address
+                field.padding(.leading, focused ? (compact ? 14 : 18) : 8)
                 if focused {
                     if !pane.address.isEmpty { icon("xmark.circle.fill") { pane.address = "" } }
                 } else {
-                    if !pane.isHome && pane.hasLogin { icon("key.fill") { actions.autofill() } }
-                    if !pane.isHome && pane.hasCard { icon("creditcard.fill") { actions.autofill() } }
-                    if !pane.isHome { reloadButton }
-                    if !actions.islandShown && actions.splitEnabled { splitButton }
-                    if !compact || !actions.islandShown { tabsButton }
-                    menu
+                    // Tinted end: page and app controls
+                    HStack(spacing: 0) {
+                        if !pane.isHome && pane.hasLogin { icon("key.fill") { actions.autofill() } }
+                        if !pane.isHome && pane.hasCard { icon("creditcard.fill") { actions.autofill() } }
+                        if !pane.isHome { reloadButton }
+                        if !actions.islandShown && actions.splitEnabled { splitButton }
+                        if !compact || !actions.islandShown { tabsButton }
+                        menu
+                    }
+                    .frame(height: barH - 6)
+                    .background(endTint, in: Capsule())
+                    .padding(.trailing, 3)
                 }
             }
-            .padding(.horizontal, 2)
             .frame(height: barH)
-            .sdGlass(Capsule(), dark: dark)
+            .sdGlass(Capsule(), dark: dark, clear: true)
             .padding(.trailing, focused && !compact ? 78 : 0)
             .overlay(alignment: .trailing) {
                 if focused && !compact {
@@ -3466,6 +3518,7 @@ struct SettingsView: View {
     @AppStorage("showIsland") private var showIsland = true
     @AppStorage("splitEnabled") private var splitEnabled = true
     @AppStorage("ambientMode") private var ambientMode = false
+    @AppStorage("minimalBar") private var minimalBar = true
     var openVault: () -> Void
     var openVPN: () -> Void
     @Environment(\.dismiss) private var dismiss
@@ -3529,6 +3582,13 @@ struct SettingsView: View {
                     Text(adaptiveText
                          ? "Icons and text switch between light and dark to stay readable on each page."
                          : "Icons and text use \(textColor == "System" ? "your phone's light or dark mode" : textColor.lowercased()), with the bar shaded to keep it readable.")
+                }
+                Section {
+                    Toggle("Minimal Address Bar", isOn: $minimalBar)
+                } header: {
+                    Text("Address Bar")
+                } footer: {
+                    Text("The bottom address bar settles into a small pill showing the site, giving the page more room. Tap the pill, or scroll up, to bring the full bar back.")
                 }
                 Section {
                     Toggle("Split View", isOn: $splitEnabled)
