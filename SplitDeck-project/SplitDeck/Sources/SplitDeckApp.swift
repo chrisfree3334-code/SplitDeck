@@ -1044,6 +1044,34 @@ final class Tabs: ObservableObject {
     func closeAllPrivate() {
         for t in list where t.isPrivate { close(t.id) }
     }
+
+    // Most recently used normal tab that isn't already showing in the other pane.
+    private func recentNormal(excluding other: UUID?) -> UUID? {
+        list.filter { !$0.isPrivate && $0.id != other }
+            .max { (used[$0.id] ?? .distantPast) < (used[$1.id] ?? .distantPast) }?.id
+    }
+
+    // Switches one pane back to a normal tab (the private tab stays open in the Private section).
+    func exitPrivate(slot: Int) {
+        let cur = slot == 0 ? left : right
+        guard info(cur)?.isPrivate == true else { return }
+        let other: UUID? = split ? (slot == 0 ? right : left) : nil
+        if let target = recentNormal(excluding: other) {
+            show(target, slot: slot)
+        } else {
+            newTab(slot: slot)
+        }
+    }
+
+    // Closes the private tab in a pane and puts a normal tab in its place.
+    func closePrivate(slot: Int) {
+        let cur = slot == 0 ? left : right
+        guard info(cur)?.isPrivate == true else { return }
+        exitPrivate(slot: slot)
+        close(cur)
+    }
+
+    func slot(of id: UUID) -> Int { split && right == id && left != id ? 1 : 0 }
     @Published var thumbs: [UUID: UIImage] = [:]
 
     static let thumbDir: URL = {
@@ -1205,8 +1233,13 @@ final class Tabs: ObservableObject {
             right = t.id
             split = false
         }
-        if !list.contains(where: { $0.id == left }) { left = list.first { $0.id != right }?.id ?? list[0].id }
-        if !list.contains(where: { $0.id == right }) { right = list.first { $0.id != left }?.id ?? list[0].id }
+        // Replace a closed pane with the most recent normal tab, so closing a private tab leaves private mode.
+        if !list.contains(where: { $0.id == left }) {
+            left = recentNormal(excluding: split ? right : nil) ?? list.first { $0.id != right }?.id ?? list[0].id
+        }
+        if !list.contains(where: { $0.id == right }) {
+            right = recentNormal(excluding: left) ?? list.first { $0.id != left }?.id ?? list[0].id
+        }
         if split && left == right {
             let t = TabInfo()
             list.append(t)
@@ -2162,6 +2195,8 @@ struct PaneActions {
     var swapTabs: () -> Void
     var canSwap: Bool
     var islandShown: Bool
+    var exitPrivate: () -> Void
+    var closePrivate: () -> Void
 }
 
 struct PaneView: View {
@@ -2275,7 +2310,7 @@ struct PaneView: View {
                     .opacity(pane.isHome ? 0 : 1)
                 if pane.isHome {
                     if pane.isPrivate {
-                        PrivateStartPage()
+                        PrivateStartPage(leave: actions.exitPrivate)
                     } else {
                         StartPage(sites: sites, blocked: actions.totalBlocked) { pane.load($0) }
                     }
@@ -2295,7 +2330,7 @@ struct PaneView: View {
         .overlay {
             // Private tabs are hidden when locked, and in the app switcher.
             if pane.isPrivate && (actions.privateLocked || phase != .active) {
-                PrivateCover(locked: actions.privateLocked, unlock: actions.unlockPrivate)
+                PrivateCover(locked: actions.privateLocked, unlock: actions.unlockPrivate, leave: actions.exitPrivate)
             }
         }
         .animation(smooth, value: mini)
@@ -2512,7 +2547,12 @@ struct PaneView: View {
         Menu {
             Button { pane.goHome() } label: { Label("Home", systemImage: "house") }
             Button { actions.newTab() } label: { Label("New Tab", systemImage: "plus.square.on.square") }
-            Button { actions.newPrivateTab() } label: { Label("New Private Tab", systemImage: "eye.slash") }
+            if pane.isPrivate {
+                Button { actions.exitPrivate() } label: { Label("Leave Private Mode", systemImage: "eye") }
+                Button(role: .destructive) { actions.closePrivate() } label: { Label("Close Private Tab", systemImage: "xmark") }
+            } else {
+                Button { actions.newPrivateTab() } label: { Label("New Private Tab", systemImage: "eye.slash") }
+            }
             Button { actions.history() } label: { Label("History", systemImage: "clock") }
             Button { actions.toggleSplit() } label: {
                 Label(actions.splitOn ? "Close Split View" : "Split View",
@@ -2559,6 +2599,8 @@ struct PaneView: View {
 // MARK: Private mode screens
 
 struct PrivateStartPage: View {
+    var leave: () -> Void
+
     private func row(_ icon: String, _ text: String) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: icon).frame(width: 22).foregroundStyle(.white.opacity(0.75))
@@ -2591,6 +2633,14 @@ struct PrivateStartPage: View {
                 Text("Your activity may still be visible to the websites you visit, your network or internet provider, and your employer or school.")
                     .font(.footnote)
                     .foregroundStyle(.white.opacity(0.6))
+                Button(action: leave) {
+                    Label("Leave Private Mode", systemImage: "eye")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .padding(.horizontal, 18)
+                        .frame(height: 44)
+                        .background(.white.opacity(0.15), in: Capsule())
+                }
             }
             .padding(.horizontal, 24)
             .padding(.vertical, 32)
@@ -2606,6 +2656,7 @@ struct PrivateStartPage: View {
 struct PrivateCover: View {
     var locked: Bool
     var unlock: () -> Void
+    var leave: () -> Void
 
     var body: some View {
         ZStack {
@@ -2618,6 +2669,10 @@ struct PrivateCover: View {
                         .buttonStyle(.borderedProminent)
                         .tint(.white)
                         .foregroundStyle(.black)
+                    // Leaving doesn't reveal anything, so it doesn't need Face ID.
+                    Button("Leave Private Mode", action: leave)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.85))
                 }
             }
         }
@@ -2869,11 +2924,14 @@ struct HistoryView: View {
 struct TabsView: View {
     @ObservedObject var tabs: Tabs
     var startPrivate: Bool
+    var startSlot: Int
     var privateLocked: Bool
     var unlock: () -> Void
     @Environment(\.dismiss) private var dismiss
-    @State private var slot = 0
+    @State private var slotChoice: Int?
     @State private var privateSection: Bool?
+
+    private var slot: Int { slotChoice ?? startSlot }
 
     private var showingPrivate: Bool { privateSection ?? startPrivate }
 
@@ -2889,7 +2947,7 @@ struct TabsView: View {
                     }
                     .pickerStyle(.segmented)
                     if tabs.split {
-                        Picker("Open in", selection: $slot) {
+                        Picker("Open in", selection: Binding(get: { slot }, set: { slotChoice = $0 })) {
                             Text("First Pane").tag(0)
                             Text("Second Pane").tag(1)
                         }
@@ -3815,6 +3873,7 @@ struct ContentView: View {
     @AppStorage("autoSavePasswords") private var autoSave = false
     @AppStorage("showIsland") private var showIsland = true
     @State private var toast: String?
+    @State private var tabsSlot = 0
 
     // Battery saver: dark only. Private tab on top: dark. Otherwise the theme decides.
     private var appScheme: ColorScheme? {
@@ -3844,7 +3903,7 @@ struct ContentView: View {
             .background(themes.current.strip.ignoresSafeArea())
             .overlay {
                 if showIsland {
-                    EdgeDock(tabs: tabs, saver: saver, privateMode: leftIsPrivate, openTabs: openTabs)
+                    EdgeDock(tabs: tabs, saver: saver, privateMode: leftIsPrivate, openTabs: { openTabs() })
                         .transition(.opacity)
                 }
             }
@@ -3921,7 +3980,14 @@ struct ContentView: View {
 
     private var leftIsPrivate: Bool { tabs.info(tabs.left)?.isPrivate ?? false }
 
+    // From the island: aim at the private pane if one is showing, else the first pane.
     private func openTabs() {
+        let rightPrivate = tabs.split && (tabs.info(tabs.right)?.isPrivate ?? false)
+        openTabs(slot: !leftIsPrivate && rightPrivate ? 1 : 0)
+    }
+
+    private func openTabs(slot: Int) {
+        tabsSlot = tabs.split ? slot : 0
         tabs.snapshotVisible()
         sheet = .tabs
     }
@@ -4045,13 +4111,15 @@ struct ContentView: View {
                 history: { historyPane = p; sheet = .history },
                 privateLocked: privateLocked,
                 unlockPrivate: unlockPrivate,
-                openTabs: openTabs,
+                openTabs: { openTabs(slot: slot) },
                 tabCount: p.isPrivate ? tabs.privateCount : tabs.normalCount,
                 toggleSplit: { withAnimation(anim(.snappy)) { tabs.toggleSplit() } },
                 splitOn: tabs.split,
                 swapTabs: { withAnimation(anim(.snappy)) { tabs.swap() } },
                 canSwap: tabs.canSwap,
-                islandShown: showIsland
+                islandShown: showIsland,
+                exitPrivate: { withAnimation(anim(.snappy)) { tabs.exitPrivate(slot: slot) } },
+                closePrivate: { withAnimation(anim(.snappy)) { tabs.closePrivate(slot: slot) } }
             ),
             compact: compact,
             atTop: atTop,
@@ -4068,7 +4136,12 @@ struct ContentView: View {
         case .settings: SettingsView(sites: sites, shields: shields, themes: themes, openVault: { sheet = .vault }, openVPN: { sheet = .vpn })
         case .calendar: EventEditor(title: calTitle, url: calURL).ignoresSafeArea()
         case .vpn: VPNView(vpn: vpnService)
-        case .tabs: TabsView(tabs: tabs, startPrivate: leftIsPrivate, privateLocked: privateLocked, unlock: unlockPrivate)
+        case .tabs:
+            TabsView(tabs: tabs,
+                     startPrivate: tabs.info(tabsSlot == 1 ? tabs.right : tabs.left)?.isPrivate ?? false,
+                     startSlot: tabsSlot,
+                     privateLocked: privateLocked,
+                     unlock: unlockPrivate)
         case .history:
             HistoryView(history: history, sites: sites) { text in historyPane?.load(text) }
         case .shields:
