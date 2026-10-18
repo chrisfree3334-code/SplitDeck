@@ -1562,6 +1562,31 @@ struct Theme: Equatable {
         Theme(name: "Forest", top: hex("#1F3326"), bottom: hex("#0B140E"), strip: hex("#111D15"), accent: hex("#7FD39A"), dark: true),
     ]
 
+    // The same theme for light or dark mode: keeps its hues and accent, changes the shades.
+    // Default uses the system colours, which already follow light and dark.
+    func variant(dark wantDark: Bool) -> Theme {
+        guard let native = dark, native != wantDark else { return self }
+        func tone(_ c: Color, _ sat: (CGFloat) -> CGFloat, _ bright: (CGFloat) -> CGFloat) -> Color {
+            var h: CGFloat = 0, s: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+            guard UIColor(c).getHue(&h, saturation: &s, brightness: &b, alpha: &a) else { return c }
+            return Color(hue: Double(h), saturation: Double(min(max(sat(s), 0), 1)), brightness: Double(min(max(bright(b), 0), 1)))
+        }
+        if wantDark {
+            return Theme(name: name,
+                         top: tone(top, { min($0 * 1.5 + 0.22, 0.6) }, { _ in 0.22 }),
+                         bottom: tone(bottom, { min($0 * 1.5 + 0.25, 0.65) }, { _ in 0.09 }),
+                         strip: tone(strip, { min($0 * 1.5 + 0.22, 0.6) }, { _ in 0.14 }),
+                         accent: tone(accent, { $0 * 0.8 }, { max($0, 0.85) }),
+                         dark: true)
+        }
+        return Theme(name: name,
+                     top: tone(top, { _ in 0.08 }, { _ in 0.97 }),
+                     bottom: tone(bottom, { _ in 0.22 }, { _ in 0.9 }),
+                     strip: tone(strip, { _ in 0.07 }, { _ in 0.975 }),
+                     accent: tone(accent, { max($0, 0.6) }, { min($0, 0.62) }),
+                     dark: false)
+    }
+
     // Builds a theme from a photo: the average colour for the bars, the most vivid colour as the accent.
     static func fromImage(_ img: UIImage) -> Theme? {
         guard let cg = img.cgImage else { return nil }
@@ -1630,8 +1655,22 @@ final class ThemeStore: ObservableObject {
     @Published var matchPhoto: Bool = UserDefaults.standard.object(forKey: "matchPhoto") as? Bool ?? true {
         didSet { UserDefaults.standard.set(matchPhoto, forKey: "matchPhoto") }
     }
+    // Light, Dark or System, kept apart from the theme: the theme's colours come in both.
+    @Published var appearance: String = UserDefaults.standard.string(forKey: "appearance") ?? "System" {
+        didSet { UserDefaults.standard.set(appearance, forKey: "appearance") }
+    }
     @Published private(set) var homeImage: UIImage?
     @Published private(set) var photoTheme: Theme?
+
+    var forcedScheme: ColorScheme? {
+        appearance == "Light" ? .light : (appearance == "Dark" ? .dark : nil)
+    }
+
+    // The theme as it should look right now.
+    func active(systemDark: Bool, forceDark: Bool = false) -> Theme {
+        let d = forceDark || (forcedScheme.map { $0 == .dark } ?? systemDark)
+        return current.variant(dark: d)
+    }
 
     static let imageURL: URL = {
         let d = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -1693,10 +1732,15 @@ struct AppIconOption: Identifiable {
     ]
 }
 
+extension AppIconOption {
+    static func named(_ icon: String) -> AppIconOption { all.first { ($0.icon ?? "") == icon } ?? all[0] }
+}
+
 // The SplitDeck mark drawn natively, so the picker can preview every colour option.
 struct LogoMark: View {
     let option: AppIconOption
     var size: CGFloat = 60
+    var plate = true    // false: just the two halves, no tile
 
     private func half(_ rect: CGRect, cx: CGFloat, cy: CGFloat, r: CGFloat, left: Bool) -> Path {
         var p = Path()
@@ -1706,21 +1750,42 @@ struct LogoMark: View {
     }
 
     var body: some View {
-        let k = size / 1024
+        let k = size / (plate ? 1024 : 728)
+        let c = size / 2
         ZStack {
-            RoundedRectangle(cornerRadius: size * 0.225, style: .continuous)
-                .fill(RadialGradient(colors: [option.bg.opacity(0.85), option.bg], center: UnitPoint(x: 0.3, y: 0.22),
-                                     startRadius: 0, endRadius: size))
-            half(.zero, cx: (512 - 15) * k, cy: (512 - 64) * k, r: 300 * k, left: true).fill(option.left)
-            half(.zero, cx: (512 + 15) * k, cy: (512 + 64) * k, r: 300 * k, left: false).fill(option.right)
+            if plate {
+                RoundedRectangle(cornerRadius: size * 0.225, style: .continuous)
+                    .fill(RadialGradient(colors: [option.bg.opacity(0.85), option.bg], center: UnitPoint(x: 0.3, y: 0.22),
+                                         startRadius: 0, endRadius: size))
+            }
+            half(.zero, cx: c - 15 * k, cy: c - 64 * k, r: 300 * k, left: true).fill(option.left)
+            half(.zero, cx: c + 15 * k, cy: c + 64 * k, r: 300 * k, left: false).fill(option.right)
         }
         .frame(width: size, height: size)
+    }
+}
+
+// The logo as it appears around the app, in the colours of the app icon you picked.
+struct BrandMark: View {
+    var size: CGFloat = 40
+    var glow = true
+    @AppStorage("appIconName") private var iconName = ""
+
+    var body: some View {
+        let o = AppIconOption.named(iconName)
+        LogoMark(option: o, size: size)
+            .overlay(RoundedRectangle(cornerRadius: size * 0.225, style: .continuous)
+                .strokeBorder(LinearGradient(colors: [.white.opacity(0.35), .white.opacity(0.05)], startPoint: .top, endPoint: .bottom),
+                              lineWidth: max(size / 90, 0.5)))
+            .shadow(color: glow ? o.left.opacity(0.35) : .clear, radius: size * 0.22, y: size * 0.08)
+            .accessibilityHidden(true)
     }
 }
 
 struct AppIconPicker: View {
     @State private var current = UIApplication.shared.alternateIconName
     @State private var error: String?
+    @AppStorage("appIconName") private var iconName = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1730,7 +1795,7 @@ struct AppIconPicker: View {
                         guard UIApplication.shared.supportsAlternateIcons else { return }
                         UIApplication.shared.setAlternateIconName(o.icon) { err in
                             DispatchQueue.main.async {
-                                if let err { error = err.localizedDescription } else { current = o.icon; error = nil }
+                                if let err { error = err.localizedDescription } else { current = o.icon; iconName = o.icon ?? ""; error = nil }
                             }
                         }
                     } label: {
@@ -1777,6 +1842,7 @@ struct ThemeChip: View {
 struct ThemeSettings: View {
     @ObservedObject var themes: ThemeStore
     @State private var pick: PhotosPickerItem?
+    @Environment(\.colorScheme) private var scheme
 
     var body: some View {
         Form {
@@ -1785,7 +1851,7 @@ struct ThemeSettings: View {
                     HStack(spacing: 14) {
                         ForEach(Theme.presets, id: \.name) { t in
                             Button { withAnimation(.snappy) { themes.name = t.name } } label: {
-                                ThemeChip(theme: t, selected: themes.current.name == t.name)
+                                ThemeChip(theme: t.variant(dark: scheme == .dark), selected: themes.current.name == t.name)
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel("\(t.name) theme")
@@ -1827,7 +1893,7 @@ struct ThemeSettings: View {
             } header: {
                 Text("Home Background")
             } footer: {
-                Text("Your photo stays on this iPhone. Matching picks the bar, accent and light or dark look from its colours.")
+                Text("Your photo stays on this iPhone. Matching picks the bar and accent colours from it.")
             }
         }
         .navigationTitle("Themes")
@@ -1919,6 +1985,8 @@ struct StartPage: View {
     @Environment(\.sdTheme) private var theme
     @Environment(\.sdHomeImage) private var homeImage
     @Environment(\.colorScheme) private var sys
+    @AppStorage("saver") private var saver = false
+    @State private var shown = false
 
     private func name(_ h: String) -> String {
         let parts = h.split(separator: ".")
@@ -1930,14 +1998,24 @@ struct StartPage: View {
         let hosts = mode == 1 ? sites.custom : sites.frequent
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                if blocked > 0 {
-                    HStack(spacing: 8) {
-                        Image(systemName: "shield.lefthalf.filled").foregroundStyle(.orange)
-                        Text("\(blocked.formatted()) ads and trackers blocked")
-                            .font(.footnote.weight(.semibold))
-                            .foregroundStyle(.secondary)
+                HStack(spacing: 12) {
+                    BrandMark(size: 42)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("SplitDeck")
+                            .font(.system(.title3, design: .rounded).weight(.bold))
+                            .foregroundStyle(.primary)
+                        HStack(spacing: 5) {
+                            Image(systemName: "shield.lefthalf.filled").foregroundStyle(.orange)
+                            Text(blocked > 0 ? "\(blocked.formatted()) ads and trackers blocked" : "Shields up · private by design")
+                                .foregroundStyle(.secondary)
+                                .contentTransition(.numericText())
+                        }
+                        .font(.caption.weight(.semibold))
                     }
                 }
+                .opacity(shown ? 1 : 0)
+                .offset(y: shown ? 0 : 6)
+                .onAppear { withAnimation(saver ? nil : .spring(response: 0.5, dampingFraction: 0.85)) { shown = true } }
                 Menu {
                     Picker("Show", selection: $mode) {
                         Text("Frequently Visited").tag(0)
@@ -2167,6 +2245,10 @@ struct ShieldsView: View {
             List {
                 Section {
                     VStack(spacing: 12) {
+                        HStack(spacing: 8) {
+                            BrandMark(size: 22, glow: false)
+                            Text("SplitDeck Shields").font(.footnote.weight(.semibold)).foregroundStyle(.secondary)
+                        }
                         if !host.isEmpty { SiteIcon(host: host, size: 52) }
                         Text(host.isEmpty ? "This page" : host).font(.headline)
                         Button { shields.setUp(host, !up) } label: {
@@ -2220,9 +2302,20 @@ struct ShieldsSettings: View {
     var body: some View {
         Form {
             Section {
+                HStack(spacing: 14) {
+                    BrandMark(size: 48)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("SplitDeck Shields").font(.headline)
+                        Text("\(shields.totalBlocked.formatted()) ads and trackers blocked so far")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .contentTransition(.numericText())
+                    }
+                }
+                .padding(.vertical, 4)
                 Toggle("Block Ads and Trackers", isOn: $blockOn)
             } footer: {
-                Text("\(shields.totalBlocked.formatted()) ads and trackers blocked so far.")
+                Text("Blocking runs on this iPhone with Apple's built-in content blocker. Nothing about your browsing is sent anywhere.")
             }
             Section {
                 ForEach(Shields.lists) { l in
@@ -4006,16 +4099,45 @@ struct SettingsView: View {
     var openVault: () -> Void
     var openVPN: () -> Void
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var envScheme
+
+    private var version: String {
+        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
+        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "1"
+        return "Version \(v) (\(b))"
+    }
 
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    VStack(spacing: 10) {
+                        BrandMark(size: 72)
+                        Text("SplitDeck")
+                            .font(.system(.title2, design: .rounded).weight(.bold))
+                        Text(version).font(.footnote).foregroundStyle(.secondary)
+                        Label("Shields, a Face ID vault and private tabs, all on this iPhone", systemImage: "checkmark.seal.fill")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+                    .listRowBackground(Color.clear)
+                }
                 Section("Search Engine") {
                     Picker("Search with", selection: $engine) {
                         ForEach(Engines.names, id: \.self) { Text($0).tag($0) }
                     }
                 }
                 Section {
+                    Picker("Appearance", selection: $themes.appearance) {
+                        Text("System").tag("System")
+                        Text("Light").tag("Light")
+                        Text("Dark").tag("Dark")
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(saver)
                     NavigationLink {
                         ThemeSettings(themes: themes)
                     } label: {
@@ -4063,12 +4185,13 @@ struct SettingsView: View {
                 } header: {
                     Text("Appearance")
                 } footer: {
-                    Text(adaptiveText
-                         ? "Icons and text switch between light and dark to stay readable on each page."
-                         : "Icons and text use \(textColor == "System" ? "your phone's light or dark mode" : textColor.lowercased()), with the bar shaded to keep it readable.")
+                    Text((saver ? "Battery Saver keeps SplitDeck dark. " : "Light and Dark keep your theme's colours, in lighter or darker shades. ")
+                         + (adaptiveText
+                            ? "Icons and text switch between light and dark to stay readable on each page."
+                            : "Icons and text use \(textColor == "System" ? "your phone's light or dark mode" : textColor.lowercased()), with the bar shaded to keep it readable."))
                 }
                 Section {
-                    BarLayoutPicker(layout: $barLayout, position: $barPosition, accent: themes.current.accent)
+                    BarLayoutPicker(layout: $barLayout, position: $barPosition, accent: themes.active(systemDark: envScheme == .dark).accent)
                     Toggle("Minimal Address Bar", isOn: $minimalBar)
                 } header: {
                     Text("Address Bar")
@@ -4194,6 +4317,7 @@ enum PasswordTools {
 struct VaultView: View {
     @ObservedObject var vault: Vault
     var fill: (Login?, Card?) -> Void
+    @AppStorage("appIconName") private var iconName = ""
     @Environment(\.dismiss) private var dismiss
     @Environment(\.scenePhase) private var phase
     @State private var query = ""
@@ -4272,23 +4396,31 @@ struct VaultView: View {
     private var lockView: some View {
         VStack(spacing: 22) {
             ZStack {
+                let o = AppIconOption.named(iconName)
                 Circle()
-                    .stroke(AngularGradient(colors: [.cyan, .blue, .purple, .cyan], center: .center), lineWidth: 3)
+                    .stroke(AngularGradient(colors: [o.left, .cyan, o.right, o.left], center: .center), lineWidth: 3)
                     .frame(width: 150, height: 150)
                     .rotationEffect(.degrees(spin ? 360 : 0))
                     .animation(.linear(duration: 5).repeatForever(autoreverses: false), value: spin)
                 Circle()
                     .fill(.ultraThinMaterial)
                     .frame(width: 118, height: 118)
-                Image(systemName: unlocking ? "faceid" : "lock.fill")
-                    .font(.system(size: 46, weight: .semibold))
-                    .foregroundStyle(LinearGradient(colors: [.cyan, .blue], startPoint: .top, endPoint: .bottom))
-                    .contentTransition(.symbolEffect(.replace))
-                    .symbolEffect(.pulse, isActive: unlocking)
+                BrandMark(size: 74)
+                    .overlay(alignment: .bottomTrailing) {
+                        Image(systemName: unlocking ? "faceid" : "lock.fill")
+                            .font(.system(size: 14, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 30, height: 30)
+                            .background(Circle().fill(LinearGradient(colors: [.cyan, .blue], startPoint: .top, endPoint: .bottom)))
+                            .overlay(Circle().stroke(Color.black.opacity(0.5), lineWidth: 2))
+                            .contentTransition(.symbolEffect(.replace))
+                            .symbolEffect(.pulse, isActive: unlocking)
+                            .offset(x: 9, y: 9)
+                    }
             }
             VStack(spacing: 6) {
                 Text("Vault Locked").font(.title2.bold()).foregroundStyle(.white)
-                Text("Protected by Face ID and the iPhone Keychain")
+                Text("SplitDeck Vault · protected by Face ID and the iPhone Keychain")
                     .font(.subheadline).foregroundStyle(.white.opacity(0.6))
             }
             Button { Task { await unlock() } } label: {
@@ -4317,6 +4449,14 @@ struct VaultView: View {
         let reused = vault.logins.filter { reusedSet.contains($0.pass) }.count
         return ScrollView {
             VStack(spacing: 18) {
+                HStack(spacing: 10) {
+                    BrandMark(size: 26, glow: false)
+                    Text("SplitDeck Vault").font(.subheadline.weight(.semibold)).foregroundStyle(.white.opacity(0.85))
+                    Spacer()
+                    Label("Face ID", systemImage: "faceid")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.6))
+                }
                 statusCard(weak: weak, reused: reused)
                 HStack(spacing: 8) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.white.opacity(0.5))
@@ -4712,13 +4852,19 @@ struct ContentView: View {
     @AppStorage("showIsland") private var showIsland = true
     @AppStorage("splitEnabled") private var splitEnabled = true
     @AppStorage("barPosition") private var barPosition = "bottom"
+    @AppStorage("appIconName") private var appIconName = ""
+    @Environment(\.colorScheme) private var envScheme
     @State private var toast: String?
     @State private var tabsSlot = 0
 
-    // Battery saver: dark only. Private tab on top: dark. Otherwise the theme decides.
+    // Battery saver: dark only. Private tab on top: dark. Otherwise your Light / Dark / System choice.
     private var appScheme: ColorScheme? {
         if saver || leftIsPrivate { return .dark }
-        return themes.current.scheme
+        return themes.forcedScheme
+    }
+    // The theme's colours in the shade that matches.
+    private var activeTheme: Theme {
+        themes.active(systemDark: envScheme == .dark, forceDark: saver || leftIsPrivate)
     }
 
     private func showToast(_ text: String) {
@@ -4740,7 +4886,7 @@ struct ContentView: View {
                 deck(portrait: portrait, safe: safe)
             }
             .ignoresSafeArea(.container, edges: .vertical)
-            .background(themes.current.strip.ignoresSafeArea())
+            .background(activeTheme.strip.ignoresSafeArea())
             .overlay {
                 if showIsland {
                     EdgeDock(tabs: tabs, saver: saver, privateMode: leftIsPrivate, safe: safe, openTabs: { openTabs() })
@@ -4759,9 +4905,9 @@ struct ContentView: View {
                 }
             }
         }
-        .environment(\.sdTheme, themes.current)
+        .environment(\.sdTheme, activeTheme)
         .environment(\.sdHomeImage, themes.homeImage)
-        .tint(themes.current.accent)
+        .tint(activeTheme.accent)
         .preferredColorScheme(appScheme)
         .transaction { t in
             if saver { t.animation = nil; t.disablesAnimations = true }
@@ -4769,7 +4915,7 @@ struct ContentView: View {
         .sheet(item: $sheet) { s in
             sheetView(s)
                 .preferredColorScheme(appScheme)
-                .tint(themes.current.accent)
+                .tint(activeTheme.accent)
                 .transaction { t in if saver { t.animation = nil; t.disablesAnimations = true } }
         }
         // Its own sheet, carrying the page with it, so it never opens blank.
@@ -4777,7 +4923,7 @@ struct ContentView: View {
             ShieldsView(shields: shields, pane: p)
                 .presentationDetents([.medium, .large])
                 .preferredColorScheme(appScheme)
-                .tint(themes.current.accent)
+                .tint(activeTheme.accent)
         }
         .alert("Save password?", isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } })) {
             Button("Save") { if let p = pending { vault.logins.append(p); vault.save() }; pending = nil }
@@ -4809,7 +4955,8 @@ struct ContentView: View {
         .onChange(of: splitEnabled) { _, on in
             if !on && tabs.split { withAnimation(anim(.snappy)) { tabs.closeSplit(keep: 0) } }
         }
-        .onChange(of: themes.current) { _, _ in tabs.allLive.forEach { $0.objectWillChange.send() } }
+        .onChange(of: activeTheme) { _, _ in tabs.allLive.forEach { $0.objectWillChange.send() } }
+        .onAppear { appIconName = UIApplication.shared.alternateIconName ?? "" }
         .onChange(of: engine) { _, _ in tabs.visible.forEach { tabs.pane($0).goHome() } }
         .onChange(of: phase) { _, p in
             if p != .active { vault.lock() }
