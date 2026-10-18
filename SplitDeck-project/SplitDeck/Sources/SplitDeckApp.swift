@@ -12,15 +12,63 @@ struct SplitDeckApp: App {
     var body: some Scene { WindowGroup { ContentView() } }
 }
 
-extension View {
-    // Liquid Glass on iOS 26+, tinted towards the page colour so controls stay readable.
-    @ViewBuilder func sdGlass<S: Shape>(_ shape: S, dark: Bool? = nil) -> some View {
-        let tint: Color? = dark.map { $0 ? Color.black.opacity(0.28) : Color.white.opacity(0.45) }
-        if #available(iOS 26.0, *) {
-            self.glassEffect(Glass.regular.tint(tint).interactive(), in: shape)
-        } else {
-            self.background(shape.fill(tint ?? Color.clear)).background(.ultraThinMaterial, in: shape)
+enum BarColors {
+    static let names = ["System", "White", "Black", "Graphite", "Blue", "Green", "Purple", "Orange"]
+
+    static func color(_ n: String, scheme: ColorScheme) -> Color {
+        switch n {
+        case "White": return .white
+        case "Black": return .black
+        case "Graphite": return Color(red: 0.23, green: 0.24, blue: 0.27)
+        case "Blue": return Color(red: 0.0, green: 0.38, blue: 0.85)
+        case "Green": return Color(red: 0.13, green: 0.52, blue: 0.32)
+        case "Purple": return Color(red: 0.43, green: 0.29, blue: 0.78)
+        case "Orange": return Color(red: 0.90, green: 0.43, blue: 0.10)
+        default: return scheme == .dark ? Color(white: 0.16) : Color(white: 0.97)
         }
+    }
+
+    static func isDark(_ n: String, scheme: ColorScheme) -> Bool {
+        switch n {
+        case "White": return false
+        case "System": return scheme == .dark
+        default: return true
+        }
+    }
+
+    static func swatch(_ n: String) -> Color { n == "System" ? Color(.systemGray3) : color(n, scheme: .light) }
+}
+
+// Bar surface: Liquid Glass (tinted towards the page colour for readability) or a solid colour.
+struct SDSurface: ViewModifier {
+    let shape: AnyShape
+    let dark: Bool?
+    @AppStorage("barStyle") private var style = 0
+    @AppStorage("barColor") private var colorName = "System"
+    @Environment(\.colorScheme) private var scheme
+
+    @ViewBuilder func body(content: Content) -> some View {
+        if style == 1 {
+            content
+                .environment(\.colorScheme, BarColors.isDark(colorName, scheme: scheme) ? .dark : .light)
+                .background(BarColors.color(colorName, scheme: scheme), in: shape)
+                .overlay(shape.stroke(Color.primary.opacity(0.08), lineWidth: 0.5))
+                .shadow(color: .black.opacity(0.14), radius: 8, y: 2)
+        } else {
+            let tint: Color = dark.map { $0 ? Color.black.opacity(0.42) : Color.white.opacity(0.62) }
+                ?? Color(.systemBackground).opacity(0.5)
+            if #available(iOS 26.0, *) {
+                content.glassEffect(Glass.regular.tint(tint).interactive(), in: shape)
+            } else {
+                content.background(shape.fill(tint)).background(.regularMaterial, in: shape)
+            }
+        }
+    }
+}
+
+extension View {
+    func sdGlass<S: Shape>(_ shape: S, dark: Bool? = nil) -> some View {
+        modifier(SDSurface(shape: AnyShape(shape), dark: dark))
     }
 }
 
@@ -498,6 +546,9 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     @Published var hiddenCount = 0
     @Published var canUndoHide = false
     private var lastHidden: String?
+    private var hiddenSels: [String] = []
+    @Published var offerFill = false
+    var onLoginField: (() -> Void)?
     var editing = false
     var onCredential: ((Login) -> Void)?
     var onVisit: ((String) -> Void)?
@@ -505,22 +556,12 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     static var fps = 0
     private var obs: NSKeyValueObservation?
     private var lastY: CGFloat = 0
+    private var scrollRun: CGFloat = 0
     private var tintWork: DispatchWorkItem?
     static let setJS = "function S(e,v){Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(e,v);e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}))}"
     // Safari-style "Hide Distracting Items": tap an element to fade it out and remember it for this site.
     static let hideStartJS = "(function(){if(window.__sdHiding)return;window.__sdHiding=true;var cur=null;function sel(e){var p=[];while(e&&e.nodeType===1&&e!==document.body&&e!==document.documentElement){if(e.id&&!/\\d{3,}/.test(e.id)){p.unshift('#'+CSS.escape(e.id));return p.join('>')}var i=1,x=e;while((x=x.previousElementSibling))if(x.tagName===e.tagName)i++;p.unshift(e.tagName.toLowerCase()+':nth-of-type('+i+')');e=e.parentElement}return 'body>'+p.join('>')}function pick(e){var r;while(e&&e!==document.body){r=e.getBoundingClientRect();if(r.width*r.height>2500)break;e=e.parentElement}if(!e||e===document.body||e===document.documentElement)return null;r=e.getBoundingClientRect();if(r.width>=innerWidth*0.98&&r.height>=innerHeight*0.9)return null;return e}function mark(e){if(cur){cur.style.outline=cur.__sdO||'';cur.style.outlineOffset=''}cur=e;if(e){e.__sdO=e.style.outline;e.style.outline='3px solid rgba(10,132,255,.9)';e.style.outlineOffset='-3px'}}window.__sdMark=mark;window.__sdDown=function(ev){mark(pick(ev.target))};window.__sdClick=function(ev){ev.preventDefault();ev.stopPropagation();ev.stopImmediatePropagation();var e=pick(ev.target);mark(null);if(!e)return;var s=sel(e);e.style.transition='opacity .25s ease,transform .25s ease';e.style.opacity='0';e.style.transform='scale(.94)';setTimeout(function(){e.style.setProperty('display','none','important')},260);window.webkit.messageHandlers.hide.postMessage(s)};document.addEventListener('pointerdown',window.__sdDown,true);document.addEventListener('click',window.__sdClick,true)})()"
     static let hideStopJS = "(function(){window.__sdHiding=false;if(window.__sdMark)window.__sdMark(null);document.removeEventListener('pointerdown',window.__sdDown,true);document.removeEventListener('click',window.__sdClick,true)})()"
-
-    static func hiddenList(_ host: String) -> [String] {
-        let all = UserDefaults.standard.dictionary(forKey: "hidden") as? [String: [String]] ?? [:]
-        return all[host] ?? []
-    }
-
-    static func setHidden(_ list: [String], for host: String) {
-        var all = UserDefaults.standard.dictionary(forKey: "hidden") as? [String: [String]] ?? [:]
-        all[host] = list.isEmpty ? nil : list
-        UserDefaults.standard.set(all, forKey: "hidden")
-    }
 
     static let tintJS = "(function(){function L(c){var m=c&&c.match(/[\\d.]+/g);if(!m||m.length<3)return -1;if(m.length>3&&+m[3]<0.5)return -1;return 0.299*m[0]+0.587*m[1]+0.114*m[2]}function at(x,y){var e=document.elementFromPoint(x,y);while(e){var v=L(getComputedStyle(e).backgroundColor);if(v>=0)return v;e=e.parentElement}return 255}var w=innerWidth/2;return [at(w,50),at(w,innerHeight-70)]})()"
 
@@ -551,8 +592,14 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             let y = sv.contentOffset.y
             let dy = y - self.lastY
             self.lastY = y
-            if dy > 6 && y > 80 { if !self.collapsed { self.collapsed = true } }
-            else if dy < -6 { if self.collapsed { self.collapsed = false } }
+            // Only react to a deliberate scroll in one direction, so the bar doesn't flicker.
+            if sv.isTracking || sv.isDecelerating {
+                if (dy > 0) != (self.scrollRun > 0) { self.scrollRun = 0 }
+                self.scrollRun += dy
+                if self.scrollRun > 28 && y > 60 && !self.collapsed { self.collapsed = true }
+                else if self.scrollRun < -28 && self.collapsed { self.collapsed = false }
+            }
+            if y <= 0 && self.collapsed { self.collapsed = false }
             self.scheduleTint()
         }
         if let start, !start.isEmpty { load(start) }
@@ -581,6 +628,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
 
     func goHome() {
         if hiding { stopHiding() }
+        offerFill = false
         webView.evaluateJavaScript("document.querySelectorAll('video,audio').forEach(function(m){m.pause()})")
         isHome = true
         collapsed = false
@@ -631,15 +679,6 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         webView.evaluateJavaScript("(function(c){\(Pane.setJS)[['cc-number',c[0]],['cc-name',c[1]],['cc-exp',c[2]],['cc-csc',c[3]]].forEach(function(x){var e=document.querySelector('[autocomplete='+x[0]+']');if(e)S(e,x[1])})})([\(q(c.number)),\(q(c.name)),\(q(c.exp)),\(q(c.cvc))])")
     }
 
-    private var hideKey: String { host.replacingOccurrences(of: "www.", with: "") }
-
-    func applyHidden() {
-        let list = Pane.hiddenList(hideKey)
-        hiddenCount = list.count
-        let css = list.isEmpty ? "" : list.joined(separator: ",") + "{display:none!important}"
-        webView.evaluateJavaScript("(function(){var d=document.documentElement;if(!d)return;var s=document.getElementById('sd-hidden');if(!s){s=document.createElement('style');s.id='sd-hidden';d.appendChild(s)}s.textContent=\(q(css))})()")
-    }
-
     func startHiding() {
         guard !isHome else { return }
         hiding = true
@@ -655,24 +694,23 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         webView.evaluateJavaScript(Pane.hideStopJS)
     }
 
+    private func unhide(_ sel: String) {
+        webView.evaluateJavaScript("document.querySelectorAll(\(q(sel))).forEach(function(e){e.style.removeProperty('display');e.style.opacity='';e.style.transform=''})")
+    }
+
     func undoHide() {
         guard let last = lastHidden else { return }
-        var list = Pane.hiddenList(hideKey)
-        list.removeAll { $0 == last }
-        Pane.setHidden(list, for: hideKey)
-        webView.evaluateJavaScript("document.querySelectorAll(\(q(last))).forEach(function(e){e.style.removeProperty('display');e.style.opacity='';e.style.transform=''})")
-        applyHidden()
+        unhide(last)
+        hiddenSels.removeAll { $0 == last }
+        hiddenCount = hiddenSels.count
         lastHidden = nil
         canUndoHide = false
     }
 
     func showAllHidden() {
-        let list = Pane.hiddenList(hideKey)
-        Pane.setHidden([], for: hideKey)
-        for sel in list {
-            webView.evaluateJavaScript("document.querySelectorAll(\(q(sel))).forEach(function(e){e.style.removeProperty('display');e.style.opacity='';e.style.transform=''})")
-        }
-        applyHidden()
+        hiddenSels.forEach { unhide($0) }
+        hiddenSels = []
+        hiddenCount = 0
     }
 
     private func refreshMeta() {
@@ -706,10 +744,8 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
         if m.name == "hide" {
             guard let sel = m.body as? String, !sel.isEmpty else { return }
-            var list = Pane.hiddenList(hideKey)
-            if !list.contains(sel) { list.append(sel) }
-            Pane.setHidden(list, for: hideKey)
-            hiddenCount = list.count
+            if !hiddenSels.contains(sel) { hiddenSels.append(sel) }
+            hiddenCount = hiddenSels.count
             lastHidden = sel
             canUndoHide = true
             return
@@ -750,20 +786,24 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
         webView.evaluateJavaScript("window.__sdFps=\(Pane.fps)")
         if hiding { hiding = false; canUndoHide = false }
+        hiddenSels = []
+        hiddenCount = 0
+        lastHidden = nil
+        offerFill = false
         refreshMeta()
-        applyHidden()
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         refreshMeta()
-        applyHidden()
         detectTint()
         if !host.isEmpty { onVisit?(host) }
         onChange?()
         webView.evaluateJavaScript("((document.querySelector('input[type=password]')?1:0)+(document.querySelector('[autocomplete=cc-number]')?2:0))") { [weak self] r, _ in
+            guard let self else { return }
             let v = (r as? Int) ?? 0
-            self?.hasLogin = (v & 1) != 0
-            self?.hasCard = (v & 2) != 0
+            self.hasLogin = (v & 1) != 0
+            self.hasCard = (v & 2) != 0
+            if self.hasLogin && !self.isHome { self.onLoginField?() }
         }
     }
 }
@@ -811,6 +851,47 @@ final class Tabs: ObservableObject {
     private var used: [UUID: Date] = [:]
     var maxLive = 4
     var configure: ((Pane) -> Void)?
+    @Published var thumbs: [UUID: UIImage] = [:]
+
+    static let thumbDir: URL = {
+        let d = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("thumbs")
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }()
+    static func thumbURL(_ id: UUID) -> URL { thumbDir.appendingPathComponent(id.uuidString + ".jpg") }
+
+    // Small, downscaled page snapshot for the tab grid; also cached to disk for sleeping or restored tabs.
+    func snapshot(_ p: Pane) {
+        guard !p.isHome, p.webView.window != nil, p.webView.bounds.width > 0 else { return }
+        let cfg = WKSnapshotConfiguration()
+        cfg.snapshotWidth = 220
+        p.webView.takeSnapshot(with: cfg) { [weak self] img, _ in
+            guard let self, let img else { return }
+            let w: CGFloat = 220
+            let h = min(img.size.height * w / img.size.width, w * 2)
+            let fmt = UIGraphicsImageRendererFormat()
+            fmt.scale = 2
+            let small = UIGraphicsImageRenderer(size: CGSize(width: w, height: h), format: fmt).image { _ in
+                img.draw(in: CGRect(x: 0, y: 0, width: w, height: img.size.height * w / img.size.width))
+            }
+            self.thumbs[p.id] = small
+            if let d = small.jpegData(compressionQuality: 0.7) { try? d.write(to: Tabs.thumbURL(p.id)) }
+        }
+    }
+
+    func snapshotVisible() { visible.compactMap { live[$0] }.forEach { snapshot($0) } }
+
+    func thumb(_ id: UUID) -> UIImage? {
+        if let t = thumbs[id] { return t }
+        guard let img = UIImage(contentsOfFile: Tabs.thumbURL(id).path) else { return nil }
+        DispatchQueue.main.async { self.thumbs[id] = img }
+        return img
+    }
+
+    private func dropThumb(_ id: UUID) {
+        if thumbs[id] != nil { thumbs[id] = nil }
+        try? FileManager.default.removeItem(at: Tabs.thumbURL(id))
+    }
 
     init() {
         var saved: [TabInfo] = []
@@ -856,6 +937,13 @@ final class Tabs: ObservableObject {
         guard let i = list.firstIndex(where: { $0.id == p.id }) else { return }
         let url = p.isHome ? "" : (p.webView.url?.absoluteString ?? list[i].url)
         let title = p.isHome ? "" : (p.title.isEmpty ? p.host : p.title)
+        if p.isHome {
+            dropThumb(p.id)
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self, weak p] in
+                if let self, let p { self.snapshot(p) }
+            }
+        }
         if list[i].url != url || list[i].title != title {
             list[i].url = url
             list[i].title = title
@@ -891,6 +979,7 @@ final class Tabs: ObservableObject {
     func show(_ id: UUID, slot: Int) {
         let cur = slot == 0 ? left : right
         guard cur != id else { return }
+        if let p = live[cur] { snapshot(p) }
         if split {
             if slot == 0, right == id { right = left }
             if slot == 1, left == id { left = right }
@@ -910,6 +999,7 @@ final class Tabs: ObservableObject {
 
     func close(_ id: UUID) {
         sleep(id)
+        dropThumb(id)
         list.removeAll { $0.id == id }
         if previous == id { previous = nil }
         if list.isEmpty {
@@ -948,6 +1038,7 @@ final class Tabs: ObservableObject {
 
     func closeSplit(keep slot: Int) {
         guard split else { return }
+        snapshotVisible()
         if slot == 1 {
             previous = left
             left = right
@@ -960,6 +1051,7 @@ final class Tabs: ObservableObject {
     }
 
     func swap() {
+        snapshotVisible()
         if split {
             let l = left
             left = right
@@ -1157,6 +1249,8 @@ struct PaneView: View {
     private var mini: Bool { pane.collapsed && !focused && !pane.isHome }
     private var dark: Bool { pane.isHome ? sys == .dark : (pane.pageDark ?? (sys == .dark)) }
     private var spring: Animation? { saver ? nil : .spring(response: 0.35, dampingFraction: 0.82) }
+    private var smooth: Animation? { saver ? nil : .smooth(duration: 0.4) }
+    @Namespace private var ns
     private var barH: CGFloat { compact ? 36 : 48 }
     private var iconW: CGFloat { compact ? 32 : 40 }
 
@@ -1189,7 +1283,15 @@ struct PaneView: View {
                         if v.translation.height > 16 { focused = false }
                     })
             }
-            bar
+            VStack(spacing: 8) {
+                if atTop {
+                    bar
+                    if showBanner { fillBanner }
+                } else {
+                    if showBanner { fillBanner }
+                    bar
+                }
+            }
                 .environment(\.colorScheme, dark ? .dark : .light)
                 .padding(.leading, 12)
                 .padding(.trailing, 12 + trailingRoom)
@@ -1197,26 +1299,37 @@ struct PaneView: View {
                 .simultaneousGesture(DragGesture(minimumDistance: 12).onEnded { v in
                     if focused && abs(v.translation.height) > 20 { focused = false }
                 })
-                .animation(spring, value: mini)
+                .animation(smooth, value: mini)
                 .animation(spring, value: focused)
                 .animation(spring, value: pane.hiding)
+                .animation(spring, value: showBanner)
                 .animation(saver ? nil : .easeInOut(duration: 0.25), value: dark)
         }
         .clipped()
         .onChange(of: focused) { _, f in pane.editing = f }
     }
 
-    private func roundButton(_ icon: String, _ enabled: Bool, _ action: @escaping () -> Void) -> some View {
+    private func navButton(_ icon: String, _ enabled: Bool, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
-                .font(.system(size: 18, weight: .semibold))
+                .font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(.primary)
-                .frame(width: 48, height: 48)
-                .contentShape(Circle())
+                .frame(width: 44, height: 48)
+                .contentShape(Rectangle())
         }
-        .sdGlass(Circle(), dark: dark)
-        .opacity(enabled ? 1 : 0.45)
+        .opacity(enabled ? 1 : 0.35)
         .disabled(!enabled)
+    }
+
+    private var navPair: some View {
+        HStack(spacing: 0) {
+            navButton("chevron.left", pane.backEnabled) { pane.back() }
+            navButton("chevron.right", pane.forwardEnabled) { pane.forward() }
+        }
+        .padding(.horizontal, 2)
+        .frame(height: 48)
+        .sdGlass(Capsule(), dark: dark)
+        .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .leading)))
     }
 
     private func icon(_ name: String, enabled: Bool = true, _ action: @escaping () -> Void) -> some View {
@@ -1230,6 +1343,38 @@ struct PaneView: View {
         .opacity(enabled ? 1 : 0.35)
         .disabled(!enabled)
     }
+
+    private var fillBanner: some View {
+        HStack(spacing: 0) {
+            Image(systemName: "key.fill")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(.primary)
+                .padding(.leading, 14)
+            Text("Use saved password")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .padding(.leading, 8)
+            Spacer(minLength: 8)
+            Button {
+                pane.offerFill = false
+                actions.autofill()
+            } label: {
+                Text("Fill")
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .frame(height: 26)
+                    .background(Color.accentColor, in: Capsule())
+            }
+            icon("xmark") { pane.offerFill = false }
+        }
+        .frame(height: 36)
+        .sdGlass(Capsule(), dark: dark)
+        .transition(.move(edge: atTop ? .top : .bottom).combined(with: .opacity))
+    }
+
+    private var showBanner: Bool { pane.offerFill && !focused && !pane.hiding && !pane.isHome }
 
     private var field: some View {
         TextField("Search or enter site", text: addressText)
@@ -1266,7 +1411,8 @@ struct PaneView: View {
             }
             .frame(height: barH)
             .sdGlass(Capsule(), dark: dark)
-            .transition(.scale(scale: 0.95).combined(with: .opacity))
+            .matchedGeometryEffect(id: "bar", in: ns)
+            .transition(.opacity)
         } else if mini {
             Button { pane.collapsed = false } label: {
                 Text(pane.host.isEmpty ? "Search" : pane.host.replacingOccurrences(of: "www.", with: ""))
@@ -1277,7 +1423,8 @@ struct PaneView: View {
                     .padding(.vertical, compact ? 5 : 7)
             }
             .sdGlass(Capsule(), dark: dark)
-            .transition(.scale(scale: 0.85).combined(with: .opacity))
+            .matchedGeometryEffect(id: "bar", in: ns)
+            .transition(.opacity)
         } else if compact {
             // One slim capsule: back, forward, address, extras, menu.
             HStack(spacing: 0) {
@@ -1297,10 +1444,11 @@ struct PaneView: View {
             .padding(.horizontal, 2)
             .frame(height: barH)
             .sdGlass(Capsule(), dark: dark)
-            .transition(.scale(scale: 0.95).combined(with: .opacity))
+            .matchedGeometryEffect(id: "bar", in: ns)
+            .transition(.opacity)
         } else {
             HStack(spacing: 8) {
-                if !focused { roundButton("chevron.left", pane.backEnabled) { pane.back() } }
+                if !focused { navPair }
                 HStack(spacing: 0) {
                     field
                     if focused {
@@ -1315,9 +1463,9 @@ struct PaneView: View {
                 .padding(.trailing, 4)
                 .frame(height: barH)
                 .sdGlass(Capsule(), dark: dark)
-                if !focused { roundButton("chevron.right", pane.forwardEnabled) { pane.forward() } }
             }
-            .transition(.scale(scale: 0.95).combined(with: .opacity))
+            .matchedGeometryEffect(id: "bar", in: ns)
+            .transition(.opacity)
         }
     }
 
@@ -1382,7 +1530,7 @@ struct TopBar: View {
                         .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(.primary, lineWidth: 1.6))
                 }
                 button({ withAnimation(saver ? nil : .snappy) { tabs.swap() } }) {
-                    Image(systemName: "arrow.left.arrow.right")
+                    Image(systemName: "arrow.triangle.2.circlepath")
                 }
                 .disabled(!tabs.canSwap)
                 .opacity(tabs.canSwap ? 1 : 0.4)
@@ -1407,55 +1555,31 @@ struct TabsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var slot = 0
 
+    private let columns = [GridItem(.flexible(), spacing: 14), GridItem(.flexible(), spacing: 14)]
+
     var body: some View {
         NavigationStack {
-            List {
-                if tabs.split {
-                    Picker("Open in", selection: $slot) {
-                        Text("First Pane").tag(0)
-                        Text("Second Pane").tag(1)
-                    }
-                    .pickerStyle(.segmented)
-                    .listRowBackground(Color.clear)
-                }
-                Section {
-                    ForEach(tabs.list) { t in
-                        let host = URL(string: t.url)?.host ?? ""
-                        Button {
-                            tabs.show(t.id, slot: tabs.split ? slot : 0)
-                            dismiss()
-                        } label: {
-                            HStack(spacing: 12) {
-                                if host.isEmpty {
-                                    Image(systemName: "house")
-                                        .frame(width: 36, height: 36)
-                                        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-                                } else {
-                                    SiteIcon(host: host.replacingOccurrences(of: "www.", with: ""), size: 36)
-                                }
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(t.title.isEmpty ? (host.isEmpty ? "Home" : host) : t.title).lineLimit(1)
-                                    if !host.isEmpty {
-                                        Text(host).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                                    }
-                                }
-                                Spacer()
-                                if tabs.visible.contains(t.id) {
-                                    Image(systemName: "eye.fill").foregroundStyle(.secondary)
-                                } else if !tabs.isLive(t.id) {
-                                    Image(systemName: "moon.zzz").foregroundStyle(.tertiary)
-                                }
-                            }
+            ScrollView {
+                VStack(spacing: 16) {
+                    if tabs.split {
+                        Picker("Open in", selection: $slot) {
+                            Text("First Pane").tag(0)
+                            Text("Second Pane").tag(1)
                         }
-                        .foregroundStyle(.primary)
+                        .pickerStyle(.segmented)
                     }
-                    .onDelete { idx in
-                        idx.map { tabs.list[$0].id }.forEach { tabs.close($0) }
+                    LazyVGrid(columns: columns, spacing: 18) {
+                        ForEach(tabs.list) { t in card(t) }
                     }
-                } footer: {
-                    Text("Tabs you haven't used recently go to sleep to save memory and battery, then reload when you open them. Swipe left to close.")
+                    Text("Tabs you haven't used recently sleep to save memory and battery, then reload when opened.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.top, 4)
                 }
+                .padding(16)
             }
+            .background(Color(.systemGroupedBackground))
             .navigationTitle(tabs.list.count == 1 ? "1 Tab" : "\(tabs.list.count) Tabs")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -1467,6 +1591,82 @@ struct TabsView: View {
                     } label: { Image(systemName: "plus") }
                 }
             }
+        }
+    }
+
+    private func card(_ t: TabInfo) -> some View {
+        let host = (URL(string: t.url)?.host ?? "").replacingOccurrences(of: "www.", with: "")
+        let isVisible = tabs.visible.contains(t.id)
+        return VStack(spacing: 7) {
+            ZStack(alignment: .topTrailing) {
+                preview(t, host: host)
+                    .frame(height: 220)
+                    .frame(maxWidth: .infinity)
+                    .background(Color(.secondarySystemGroupedBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(isVisible ? Color.accentColor : Color.primary.opacity(0.12), lineWidth: isVisible ? 3 : 0.5)
+                    )
+                    .shadow(color: .black.opacity(0.08), radius: 6, y: 2)
+                Button {
+                    withAnimation(.snappy) { tabs.close(t.id) }
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(.white)
+                        .frame(width: 24, height: 24)
+                        .background(Color.black.opacity(0.55), in: Circle())
+                }
+                .padding(8)
+            }
+            HStack(spacing: 6) {
+                if host.isEmpty {
+                    Image(systemName: "house.fill").font(.caption2).foregroundStyle(.secondary)
+                } else {
+                    SiteIcon(host: host, size: 16)
+                }
+                Text(t.title.isEmpty ? (host.isEmpty ? "Home" : host) : t.title)
+                    .font(.caption)
+                    .lineLimit(1)
+                if !isVisible && !tabs.isLive(t.id) {
+                    Image(systemName: "moon.zzz.fill").font(.caption2).foregroundStyle(.tertiary)
+                }
+            }
+            .padding(.horizontal, 4)
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            tabs.show(t.id, slot: tabs.split ? slot : 0)
+            dismiss()
+        }
+        .contextMenu {
+            Button(role: .destructive) { withAnimation(.snappy) { tabs.close(t.id) } } label: {
+                Label("Close Tab", systemImage: "xmark")
+            }
+        }
+        .transition(.scale(scale: 0.8).combined(with: .opacity))
+    }
+
+    @ViewBuilder private func preview(_ t: TabInfo, host: String) -> some View {
+        if host.isEmpty {
+            VStack(spacing: 8) {
+                Image(systemName: "house").font(.title2)
+                Text("Home").font(.footnote.weight(.medium))
+            }
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if let img = tabs.thumb(t.id) {
+            GeometryReader { g in
+                Image(uiImage: img)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(width: g.size.width, height: g.size.height, alignment: .top)
+                    .clipped()
+            }
+        } else {
+            SiteIcon(host: host, size: 52)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 }
@@ -1555,6 +1755,9 @@ struct SettingsView: View {
     @AppStorage("block") private var blockOn = true
     @AppStorage("saver") private var saver = false
     @AppStorage("homeMode") private var homeMode = 0
+    @AppStorage("autoFillPrompt") private var autoPrompt = true
+    @AppStorage("barStyle") private var barStyle = 0
+    @AppStorage("barColor") private var barColor = "System"
     var openVault: () -> Void
     var openVPN: () -> Void
     @Environment(\.dismiss) private var dismiss
@@ -1566,6 +1769,33 @@ struct SettingsView: View {
                     Picker("Search with", selection: $engine) {
                         ForEach(Engines.names, id: \.self) { Text($0).tag($0) }
                     }
+                }
+                Section {
+                    Picker("Bar Style", selection: $barStyle) {
+                        Text("Glass").tag(0)
+                        Text("Solid").tag(1)
+                    }
+                    .pickerStyle(.segmented)
+                    if barStyle == 1 {
+                        HStack(spacing: 10) {
+                            ForEach(BarColors.names, id: \.self) { n in
+                                Circle()
+                                    .fill(BarColors.swatch(n))
+                                    .frame(width: 28, height: 28)
+                                    .overlay(Circle().stroke(Color.primary.opacity(0.15), lineWidth: 0.5))
+                                    .overlay(Circle().stroke(Color.accentColor, lineWidth: barColor == n ? 2.5 : 0).padding(-4))
+                                    .contentShape(Circle())
+                                    .onTapGesture { barColor = n }
+                                    .accessibilityLabel(n)
+                            }
+                        }
+                        .padding(.vertical, 6)
+                        Text(barColor == "System" ? "System follows the page's light or dark look." : barColor)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Appearance")
                 }
                 Section("Home Page") {
                     Picker("Show", selection: $homeMode) {
@@ -1585,7 +1815,14 @@ struct SettingsView: View {
                 } footer: {
                     Text("Turns off app animations, caps page animations at 30 fps and keeps only 2 tabs awake. Scrolling smoothness is controlled by iOS.")
                 }
-                Section { Button("Passwords and Cards") { openVault() } }
+                Section {
+                    Toggle("Offer to Fill Saved Passwords", isOn: $autoPrompt)
+                    Button("Passwords and Cards") { openVault() }
+                } header: {
+                    Text("Passwords")
+                } footer: {
+                    Text("When a sign-in form appears on a site you have a saved login for, a prompt offers to fill it after Face ID.")
+                }
             }
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
@@ -1707,13 +1944,16 @@ struct ContentView: View {
     @State private var pending: Login?
     @State private var calTitle = ""
     @State private var calURL = ""
+    @State private var choosePane: Pane?
+    @State private var chooseList: [Login] = []
+    @AppStorage("autoFillPrompt") private var autoPrompt = true
 
     var body: some View {
         GeometryReader { root in
             ZStack(alignment: .top) {
                 Color(.systemBackground).ignoresSafeArea()
                 deck(topInset: root.safeAreaInsets.top).ignoresSafeArea(.container)
-                TopBar(pane: tabs.pane(tabs.left), tabs: tabs, saver: saver, openTabs: { sheet = .tabs })
+                TopBar(pane: tabs.pane(tabs.left), tabs: tabs, saver: saver, openTabs: { tabs.snapshotVisible(); sheet = .tabs })
             }
         }
         .sheet(item: $sheet) { s in sheetView(s) }
@@ -1721,6 +1961,17 @@ struct ContentView: View {
             Button("Save") { if let p = pending { vault.logins.append(p); vault.save() }; pending = nil }
             Button("Not now", role: .cancel) { pending = nil }
         } message: { Text(pending?.site ?? "") }
+        .confirmationDialog("Choose a saved login",
+                            isPresented: Binding(get: { choosePane != nil }, set: { if !$0 { choosePane = nil } }),
+                            titleVisibility: .visible) {
+            ForEach(chooseList) { l in
+                Button(l.user.isEmpty ? l.site : l.user) {
+                    choosePane?.fill(login: l)
+                    choosePane = nil
+                }
+            }
+            Button("Cancel", role: .cancel) { choosePane = nil }
+        }
         .task {
             tabs.configure = { p in configure(p) }
             tabs.allLive.forEach { configure($0) }
@@ -1743,7 +1994,7 @@ struct ContentView: View {
         GeometryReader { geo in
             let horizontal = geo.size.width > geo.size.height
             let total = horizontal ? geo.size.width : geo.size.height
-            let gap: CGFloat = 1
+            let gap: CGFloat = 3
             let firstSize = (total - gap) * split
             ZStack(alignment: .topLeading) {
                 if tabs.split {
@@ -1763,7 +2014,7 @@ struct ContentView: View {
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
-            .background(Color(.separator).opacity(dragging ? 0.8 : 0.3))
+            .background(Color(.separator).opacity(dragging ? 0.9 : 0.55))
             .coordinateSpace(.named("deck"))
         }
     }
@@ -1870,6 +2121,10 @@ struct ContentView: View {
     private func configure(_ p: Pane) {
         p.onCredential = { pending = $0 }
         p.onVisit = { sites.record($0) }
+        p.onLoginField = { [weak p] in
+            guard let p, autoPrompt, !vault.match(host: p.host).isEmpty else { return }
+            p.offerFill = true
+        }
         if blockOn, let r = rules { p.webView.configuration.userContentController.add(r) }
         p.applyFPS()
     }
@@ -1878,9 +2133,13 @@ struct ContentView: View {
         Task {
             if !vault.unlocked { await vault.unlock() }
             guard vault.unlocked else { return }
-            if p.hasLogin, let l = vault.match(host: p.host).first { p.fill(login: l) }
-            else if p.hasCard, let c = vault.cards.first { p.fill(card: c) }
-            else { sheet = .vault }
+            if p.hasLogin {
+                let found = vault.match(host: p.host)
+                if found.count == 1 { p.fill(login: found[0]); return }
+                if found.count > 1 { chooseList = found; choosePane = p; return }
+            }
+            if p.hasCard, let c = vault.cards.first { p.fill(card: c); return }
+            sheet = .vault
         }
     }
 
