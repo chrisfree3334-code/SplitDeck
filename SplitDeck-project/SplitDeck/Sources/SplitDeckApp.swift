@@ -71,6 +71,29 @@ enum BarColors {
     static func swatch(_ n: String) -> Color { n == "System" ? Color(.systemGray3) : color(n, scheme: .light) }
 }
 
+extension Color {
+    // A calmer version of a colour for large tinted areas: most of the saturation taken out.
+    func muted(_ amount: CGFloat = 0.55) -> Color {
+        var h: CGFloat = 0, sat: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        guard UIColor(self).getHue(&h, saturation: &sat, brightness: &b, alpha: &a) else { return self }
+        return Color(hue: Double(h), saturation: Double(sat * (1 - amount)), brightness: Double(min(b * 0.9 + 0.06, 1)))
+    }
+}
+
+// Space the floating bars cover at the top and bottom of a page.
+struct BarCover: Equatable {
+    var top: CGFloat = 0
+    var bottom: CGFloat = 0
+}
+struct BarCoverKey: PreferenceKey {
+    static let defaultValue = BarCover()
+    static func reduce(value: inout BarCover, nextValue: () -> BarCover) {
+        let n = nextValue()
+        value.top = max(value.top, n.top)
+        value.bottom = max(value.bottom, n.bottom)
+    }
+}
+
 // Bar surface: Liquid Glass (tinted towards the page colour for readability) or a solid colour.
 struct SDSurface: ViewModifier {
     let shape: AnyShape
@@ -89,8 +112,8 @@ struct SDSurface: ViewModifier {
                 .shadow(color: .black.opacity(0.14), radius: 8, y: 2)
         } else {
             let tint: Color = dark.map {
-                $0 ? Color.black.opacity(clear ? 0.18 : 0.42) : Color.white.opacity(clear ? 0.28 : 0.62)
-            } ?? Color(.systemBackground).opacity(clear ? 0.2 : 0.5)
+                $0 ? Color.black.opacity(clear ? 0.24 : 0.42) : Color.white.opacity(clear ? 0.34 : 0.62)
+            } ?? Color(.systemBackground).opacity(clear ? 0.26 : 0.5)
             if #available(iOS 26.0, *) {
                 content.glassEffect((clear ? Glass.clear : Glass.regular).tint(tint).interactive(), in: shape)
             } else {
@@ -740,6 +763,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         WebFrameRate.unlock(config.preferences, on: !UserDefaults.standard.bool(forKey: "saver"))
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.allowsBackForwardNavigationGestures = true
+        wv.scrollView.contentInsetAdjustmentBehavior = .never   // the floating bars set the insets
         wv.scrollView.keyboardDismissMode = .interactive
         wv.isOpaque = false
         webView = wv
@@ -750,13 +774,13 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         config.userContentController.add(WeakHandler(self), name: "hide")
         obs = wv.scrollView.observe(\.contentOffset, options: [.new]) { [weak self] sv, _ in
             guard let self else { return }
-            let y = sv.contentOffset.y
+            let y = sv.contentOffset.y + sv.adjustedContentInset.top   // 0 = top of the page
             let dy = y - self.lastY
             self.lastY = y
             // Only a deliberate scroll inside the page moves the bar. Ignored: pages too short to scroll,
             // the rubber-band bounce past the top or bottom, and the jolt from the bar's own resize
             // (a short cool-down after each change stops the shrink / grow / shrink loop).
-            let maxY = sv.contentSize.height - sv.bounds.height + sv.adjustedContentInset.bottom
+            let maxY = sv.contentSize.height - sv.bounds.height + sv.adjustedContentInset.bottom + sv.adjustedContentInset.top
             let scrollable = maxY > 120
             let inBounds = y >= 0 && y <= maxY
             let unlocked = Date() > self.barLockUntil
@@ -906,6 +930,26 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         let w = DispatchWorkItem { [weak self] in self?.detectTint() }
         tintWork = w
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: w)
+    }
+
+    // The floating bars cover part of the page. The page scrolls clear of them, and WebKit lays out
+    // fixed headers and footers (cookie bars, YouTube's tab bar) in the uncovered part.
+    private var cover = UIEdgeInsets.zero
+    func setCover(_ c: BarCover) {
+        let e = UIEdgeInsets(top: c.top, left: 0, bottom: c.bottom, right: 0)
+        guard e != cover else { return }
+        cover = e
+        let sv = webView.scrollView
+        let atTop = sv.contentOffset.y <= -sv.adjustedContentInset.top + 1
+        sv.contentInset = e
+        sv.verticalScrollIndicatorInsets = e
+        let v = NSValue(uiEdgeInsets: e)
+        if webView.responds(to: NSSelectorFromString("setObscuredContentInsets:")) {
+            webView.setValue(v, forKey: "obscuredContentInsets")       // iOS 26
+        } else if webView.responds(to: NSSelectorFromString("_setObscuredInsets:")) {
+            webView.setValue(v, forKey: "obscuredInsets")              // earlier iOS
+        }
+        if atTop { sv.contentOffset.y = -sv.adjustedContentInset.top }
     }
 
     private func detectTint() {
@@ -2272,6 +2316,7 @@ struct PaneView: View {
     private func stripBackground(top: Bool) -> some View { stripColor }
 
     @State private var desktop = false
+    @State private var cover = BarCover()
     @FocusState private var focused: Bool
 
     private var ink: AnyShapeStyle {
@@ -2279,6 +2324,8 @@ struct PaneView: View {
         return TextColors.ink(adaptive: adaptiveText, name: textColor)
     }
     private var mini: Bool { pane.collapsed && !focused && !pane.isHome }
+    // Full screen: the bar floats over the page instead of sitting in a strip beside it.
+    private var floating: Bool { !compact }
     // Full-screen layout choice; split view always uses the slim two-tone bar.
     private var layoutStyle: String { compact ? "twoTone" : barLayout }
     private var tinted: Bool { layoutStyle == "twoTone" }
@@ -2297,7 +2344,8 @@ struct PaneView: View {
     private var dark: Bool {
         if pane.isPrivate { return true }
         if !adaptiveText { return TextColors.isLight(textColor) ?? (sys == .dark) }
-        if pane.isHome || atTop || searching { return sys == .dark }
+        if pane.isHome || searching || (atTop && compact) { return sys == .dark }
+        if atTop { return pane.topDark ?? pane.pageDark ?? (sys == .dark) }
         return pane.pageDark ?? (sys == .dark)
     }
     // Tuned for 120 Hz: critically damped enough not to wobble, quick enough to feel direct.
@@ -2308,8 +2356,8 @@ struct PaneView: View {
 
     // Tinted ends of the two-tone bar: the buttons sit on tinted glass, the address on clear glass.
     private var endTint: Color {
-        if pane.isPrivate { return Color.white.opacity(0.14) }
-        return theme.accent.opacity(dark ? 0.32 : 0.2)
+        if pane.isPrivate { return Color.white.opacity(0.12) }
+        return theme.accent.muted().opacity(dark ? 0.26 : 0.17)
     }
 
     // Minimal bottom bar: settle into a small pill after the page loads or you stop using the bar.
@@ -2393,19 +2441,24 @@ struct PaneView: View {
         return max(bottomInset - (compact ? 10 : 4), compact ? 8 : 10)
     }
 
-    // The page never sits under the bars: it fills the space between them, and grows as they shrink.
+    // Full screen: the page runs underneath the floating bar, scrolling clear of it.
+    // Split view: each page sits between slim strips.
     var body: some View {
         VStack(spacing: 0) {
-            if atTop { topRow }
+            if atTop && !floating { topRow }
             ZStack {
                 WebHost(webView: pane.webView)
                     .opacity(pane.isHome ? 0 : 1)
                 if pane.isHome {
-                    if pane.isPrivate {
-                        PrivateStartPage(leave: actions.exitPrivate)
-                    } else {
-                        StartPage(sites: sites, blocked: actions.totalBlocked) { pane.load($0) }
+                    Group {
+                        if pane.isPrivate {
+                            PrivateStartPage(leave: actions.exitPrivate)
+                        } else {
+                            StartPage(sites: sites, blocked: actions.totalBlocked) { pane.load($0) }
+                        }
                     }
+                    .safeAreaPadding(.top, cover.top)
+                    .safeAreaPadding(.bottom, cover.bottom)
                 }
                 if focused && !compact {
                     FocusSplash(sites: sites, history: history,
@@ -2414,6 +2467,8 @@ struct PaneView: View {
                         focused = false
                         pane.load(value)
                     }
+                    .safeAreaPadding(.top, cover.top)
+                    .safeAreaPadding(.bottom, cover.bottom)
                     .transition(.opacity.combined(with: .scale(scale: 0.985, anchor: atTop ? .top : .bottom)))
                 } else if focused {
                     Color.black.opacity(0.001)
@@ -2425,8 +2480,17 @@ struct PaneView: View {
                 }
             }
             .clipped()
-            if !atTop { bottomRow }
-            if atTop && showToolbar { bottomToolbar }
+            .overlay(alignment: atTop ? .top : .bottom) {
+                if floating { floatingBar }
+            }
+            .overlay(alignment: .bottom) {
+                if floating && atTop && showToolbar { floatingToolbar }
+            }
+            if !atTop && !floating { bottomRow }
+        }
+        .onPreferenceChange(BarCoverKey.self) { c in
+            cover = c
+            pane.setCover(c)
         }
         .overlay {
             // Private tabs are hidden when locked, and in the app switcher.
@@ -2578,15 +2642,51 @@ struct PaneView: View {
         .accessibilityLabel("Share")
     }
 
-    // With the address bar at the top, the toolbar sits at the bottom of the screen.
-    private var bottomToolbar: some View {
+    private var toolbarCapsule: some View {
         toolbar
-            .padding(.horizontal, 8)
-            .padding(.top, 2)
-            .padding(.bottom, max(bottomInset - 12, 4))
-            .frame(maxWidth: .infinity)
-            .background(stripColor)
+            .padding(.horizontal, 4)
+            .sdGlass(Capsule(), dark: dark, clear: true)
+    }
+
+    private var floatPad: CGFloat {
+        if focused { return 8 }
+        if mini { return max(bottomInset - 12, 6) }
+        return max(bottomInset - 8, 10)
+    }
+
+    // Full screen: the bar (and toolbar) float over the page with the page showing around them.
+    private var floatingBar: some View {
+        VStack(spacing: 8) {
+            if !atTop && showBanner { fillBanner }
+            bar
+            if !atTop && showToolbar {
+                toolbarCapsule.transition(.move(edge: .bottom).combined(with: .opacity))
+            }
+            if atTop && showBanner { fillBanner }
+        }
+        .environment(\.colorScheme, dark ? .dark : .light)
+        .padding(.horizontal, 12)
+        .padding(.top, atTop ? 6 : 0)
+        .padding(.bottom, atTop ? 0 : floatPad)
+        .background(GeometryReader { g in
+            Color.clear.preference(key: BarCoverKey.self,
+                                   value: atTop ? BarCover(top: g.size.height + 4) : BarCover(bottom: g.size.height + 4))
+        })
+        .simultaneousGesture(DragGesture(minimumDistance: 12).onEnded { v in
+            if focused && v.translation.height > 20 { focused = false }
+        })
+        .animation(saver ? nil : .easeInOut(duration: 0.25), value: dark)
+    }
+
+    // Address bar at the top: the toolbar floats at the bottom.
+    private var floatingToolbar: some View {
+        toolbarCapsule
             .environment(\.colorScheme, dark ? .dark : .light)
+            .padding(.horizontal, 12)
+            .padding(.bottom, floatPad)
+            .background(GeometryReader { g in
+                Color.clear.preference(key: BarCoverKey.self, value: BarCover(bottom: g.size.height + 4))
+            })
             .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 
@@ -2737,7 +2837,7 @@ struct PaneView: View {
                 }
             }
             .frame(height: barH)
-            .sdGlass(Capsule(), dark: dark, clear: tinted)
+            .sdGlass(Capsule(), dark: dark, clear: tinted || floating)
             .geometryGroup()
             .padding(.trailing, focused && !compact ? 78 : 0)
             .overlay(alignment: .trailing) {
@@ -3786,9 +3886,9 @@ struct BarLayoutPreview: View {
     private var capsule: some View {
         HStack(spacing: 0) {
             if layout == "twoTone" {
-                Capsule().fill(accent.opacity(0.6)).frame(width: 12)
+                Capsule().fill(accent.muted().opacity(0.55)).frame(width: 12)
                 Capsule().fill(Color.primary.opacity(0.1))
-                Capsule().fill(accent.opacity(0.6)).frame(width: 15)
+                Capsule().fill(accent.muted().opacity(0.55)).frame(width: 15)
             } else if layout == "toolbar" {
                 Capsule().fill(Color.primary.opacity(0.22)).padding(.horizontal, 6)
             } else {
@@ -4632,8 +4732,7 @@ struct ContentView: View {
         GeometryReader { root in
             let safe = ContentView.windowInsets()
             let portrait = root.size.height >= root.size.width
-            // The top pane (split, portrait) or a top address bar (full screen) draws its own strip under the status bar.
-            let topOwnStrip = (tabs.split && portrait) || (!tabs.split && barPosition == "top")
+            let topOwnStrip = tabs.split && portrait   // the top pane draws its own strip under the status bar
             VStack(spacing: 0) {
                 if !topOwnStrip {
                     TopStrip(pane: tabs.pane(tabs.left), safeTop: safe.top)
@@ -4672,6 +4771,13 @@ struct ContentView: View {
                 .preferredColorScheme(appScheme)
                 .tint(themes.current.accent)
                 .transaction { t in if saver { t.animation = nil; t.disablesAnimations = true } }
+        }
+        // Its own sheet, carrying the page with it, so it never opens blank.
+        .sheet(item: $shieldsPane) { p in
+            ShieldsView(shields: shields, pane: p)
+                .presentationDetents([.medium, .large])
+                .preferredColorScheme(appScheme)
+                .tint(themes.current.accent)
         }
         .alert("Save password?", isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } })) {
             Button("Save") { if let p = pending { vault.logins.append(p); vault.save() }; pending = nil }
@@ -4850,7 +4956,7 @@ struct ContentView: View {
                 vpn: { sheet = .vpn },
                 vpnOn: vpnService.status == .connected,
                 newTab: { withAnimation(anim(.snappy)) { tabs.newTab(slot: slot) } },
-                shields: { shieldsPane = p; sheet = .shields },
+                shields: { shieldsPane = p },
                 shieldsUp: blockOn && shields.isUp(p.host),
                 totalBlocked: shields.totalBlocked,
                 newPrivateTab: { withAnimation(anim(.snappy)) { tabs.newTab(slot: slot, isPrivate: true) } },
@@ -4892,9 +4998,7 @@ struct ContentView: View {
         case .history:
             HistoryView(history: history, sites: sites) { text in historyPane?.load(text) }
         case .shields:
-            if let p = shieldsPane {
-                ShieldsView(shields: shields, pane: p).presentationDetents([.medium, .large])
-            }
+            EmptyView()
         }
     }
 
