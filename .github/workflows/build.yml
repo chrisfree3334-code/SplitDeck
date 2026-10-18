@@ -56,11 +56,10 @@ jobs:
           python3 ../../tools/compress_blocklists.py Sources/Blocklists || true
       - name: Generate Xcode project
         run: xcodegen generate
-      - name: Build for the simulator (Release settings, symbols kept)
+      - name: Build for the simulator (same Release settings as the device build)
         run: |
           xcodebuild -project SplitDeck.xcodeproj -scheme SplitDeck \
             -configuration Release -sdk iphonesimulator -derivedDataPath simbuild \
-            STRIP_INSTALLED_PRODUCT=NO DEPLOYMENT_POSTPROCESSING=NO \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" | tail -5
           codesign -f -s - simbuild/Build/Products/Release-iphonesimulator/SplitDeck.app
       - name: Launch in the simulator
