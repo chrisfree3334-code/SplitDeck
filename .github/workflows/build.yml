@@ -16,10 +16,10 @@ jobs:
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Build ad-block lists
-        run: python3 tools/build_blocklists.py Sources/Blocklists
+        run: python3 ../../tools/build_blocklists.py Sources/Blocklists
       - name: Check lists compile in WebKit
         run: |
-          swiftc -swift-version 5 -O tools/validate_blocklists.swift -o validate_blocklists
+          swiftc -swift-version 5 -O ../../tools/validate_blocklists.swift -o validate_blocklists
           ls Sources/Blocklists/sd-*.json >/dev/null 2>&1 && ./validate_blocklists Sources/Blocklists/sd-*.json || echo "No lists to check"
       - name: Generate Xcode project
         run: xcodegen generate
