@@ -1803,7 +1803,7 @@ final class HistoryStore: ObservableObject {
 
 struct Suggestion: Identifiable {
     enum Kind { case search, recent, site, bookmark }
-    let id = UUID()
+    var id: String { "\(kind)|\(value)" }   // stable, so rows update in place as you type
     let kind: Kind
     let title: String
     let subtitle: String
@@ -1811,8 +1811,13 @@ struct Suggestion: Identifiable {
 }
 
 enum Suggest {
-    static func make(query raw: String, history: HistoryStore, sites: Sites, limit: Int) -> [Suggestion] {
-        let q = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    private static func looksLikeAddress(_ s: String) -> Bool { s.contains(".") && !s.contains(" ") }
+
+    // Typing: what you typed, then a top hit from your sites, then live suggestions from your search
+    // engine, then bookmarks, recent searches and other sites you've visited.
+    static func make(query raw: String, history: HistoryStore, sites: Sites, limit: Int, live: [String] = []) -> [Suggestion] {
+        let typed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        let q = typed.lowercased()
         var out: [Suggestion] = []
         var seen = Set<String>()
         func add(_ s: Suggestion) {
@@ -1828,28 +1833,112 @@ enum Suggest {
             }
             return out
         }
-        add(Suggestion(kind: .search, title: raw.trimmingCharacters(in: .whitespaces), subtitle: "Search", value: raw))
-        for r in history.recentSearches where r.lowercased().contains(q) {
-            add(Suggestion(kind: .recent, title: r, subtitle: "Recent search", value: r))
-            if out.count >= 3 { break }
-        }
-        var marks = 0
-        for b in Bookmarks.shared.items where b.title.lowercased().contains(q) || b.url.lowercased().contains(q) {
-            add(Suggestion(kind: .bookmark, title: b.title, subtitle: b.host, value: b.url))
-            marks += 1
-            if marks >= 3 { break }
-        }
-        // Sites: address starting with what you typed first, then title or address containing it.
+        let engine = UserDefaults.standard.string(forKey: "engine") ?? "Google"
+        add(Suggestion(kind: looksLikeAddress(typed) ? .site : .search, title: typed,
+                       subtitle: looksLikeAddress(typed) ? "Go to site" : "Search \(engine)", value: typed))
+
         var starts: [HistoryItem] = [], contains: [HistoryItem] = []
         for v in history.searchIndex {
-            if v.host.hasPrefix(q) { starts.append(v.item) }
+            if v.host.hasPrefix(q) || v.host.hasPrefix("www." + q) { starts.append(v.item) }
             else if v.host.contains(q) || v.title.contains(q) { contains.append(v.item) }
             if starts.count >= 6 && contains.count >= 6 { break }
         }
-        for v in starts + contains {
+        let marks = Bookmarks.shared.items.filter { $0.title.lowercased().contains(q) || $0.url.lowercased().contains(q) }
+        if let top = starts.first {
+            add(Suggestion(kind: .site, title: top.title.isEmpty ? top.host : top.title, subtitle: "Top hit · \(top.host)", value: top.text))
+        } else if let b = marks.first(where: { $0.host.hasPrefix(q) }) {
+            add(Suggestion(kind: .bookmark, title: b.title, subtitle: "Top hit · \(b.host)", value: b.url))
+        }
+        for s in live.prefix(5) where s.lowercased() != q {
+            add(Suggestion(kind: .search, title: s, subtitle: "", value: s))
+        }
+        for b in marks.prefix(2) {
+            add(Suggestion(kind: .bookmark, title: b.title, subtitle: b.host, value: b.url))
+        }
+        var recents = 0
+        for r in history.recentSearches where r.lowercased().contains(q) && recents < 2 {
+            add(Suggestion(kind: .recent, title: r, subtitle: "Recent search", value: r))
+            recents += 1
+        }
+        for v in starts.dropFirst() + contains {
             add(Suggestion(kind: .site, title: v.title.isEmpty ? v.host : v.title, subtitle: v.host, value: v.text))
         }
         return out
+    }
+}
+
+// Live suggestions from your search engine as you type (never in private tabs).
+@MainActor
+final class LiveSuggest: ObservableObject {
+    @Published private(set) var items: [String] = []
+    private var task: Task<Void, Never>?
+    private static let cache = NSCache<NSString, NSArray>()
+
+    static var enabled: Bool { UserDefaults.standard.object(forKey: "liveSuggest") as? Bool ?? true }
+
+    func update(_ raw: String, allowed: Bool) {
+        task?.cancel()
+        let q = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard allowed, LiveSuggest.enabled, !q.isEmpty, q.count < 120, !q.contains("://") else {
+            if !items.isEmpty { items = [] }
+            return
+        }
+        let key = (UserDefaults.standard.string(forKey: "engine") ?? "Google") + "|" + q.lowercased()
+        if let hit = LiveSuggest.cache.object(forKey: key as NSString) as? [String] {
+            items = hit
+            return
+        }
+        task = Task { [weak self] in
+            // A short pause, so fast typing sends one request rather than one per letter.
+            try? await Task.sleep(nanoseconds: 120_000_000)
+            guard !Task.isCancelled, let url = LiveSuggest.url(for: q) else { return }
+            var req = URLRequest(url: url)
+            req.timeoutInterval = 4
+            guard let (data, _) = try? await URLSession.shared.data(for: req), !Task.isCancelled else { return }
+            let list = LiveSuggest.parse(data)
+            LiveSuggest.cache.setObject(list as NSArray, forKey: key as NSString)
+            self?.items = list
+        }
+    }
+
+    private static func url(for q: String) -> URL? {
+        let engine = UserDefaults.standard.string(forKey: "engine") ?? "Google"
+        var c: URLComponents?
+        switch engine {
+        case "DuckDuckGo":
+            c = URLComponents(string: "https://duckduckgo.com/ac/")
+            c?.queryItems = [URLQueryItem(name: "type", value: "list"), URLQueryItem(name: "q", value: q)]
+        case "Bing":
+            c = URLComponents(string: "https://api.bing.com/osjson.aspx")
+            c?.queryItems = [URLQueryItem(name: "query", value: q)]
+        case "Brave":
+            c = URLComponents(string: "https://search.brave.com/api/suggest")
+            c?.queryItems = [URLQueryItem(name: "q", value: q)]
+        case "Ecosia":
+            c = URLComponents(string: "https://ac.ecosia.org/autocomplete")
+            c?.queryItems = [URLQueryItem(name: "type", value: "list"), URLQueryItem(name: "q", value: q)]
+        default:
+            c = URLComponents(string: "https://suggestqueries.google.com/complete/search")
+            c?.queryItems = [URLQueryItem(name: "client", value: "firefox"), URLQueryItem(name: "ie", value: "utf-8"),
+                             URLQueryItem(name: "oe", value: "utf-8"), URLQueryItem(name: "q", value: q)]
+        }
+        // '+' must be escaped too, or engines read it as a space.
+        c?.percentEncodedQuery = c?.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
+        return c?.url
+    }
+
+    // Engines answer as ["query", ["s1", "s2", …]] (OpenSearch), or with a list of {"phrase": …}.
+    private static func parse(_ d: Data) -> [String] {
+        guard let obj = try? JSONSerialization.jsonObject(with: d) else { return [] }
+        var out: [String] = []
+        if let a = obj as? [Any], a.count > 1, let list = a[1] as? [Any] {
+            out = list.compactMap { $0 as? String }
+        } else if let a = obj as? [[String: Any]] {
+            out = a.compactMap { $0["phrase"] as? String }
+        } else if let d = obj as? [String: Any], let s = d["suggestions"] as? [Any] {
+            out = s.compactMap { ($0 as? String) ?? (($0 as? [String: Any])?["phrase"] as? String) }
+        }
+        return Array(out.prefix(8))
     }
 }
 
@@ -2818,6 +2907,7 @@ struct PaneView: View {
 
     @State private var desktop = false
     @State private var cover = BarCover()
+    @StateObject private var live = LiveSuggest()
     @FocusState private var focused: Bool
 
     private var ink: AnyShapeStyle {
@@ -2902,7 +2992,7 @@ struct PaneView: View {
     private var suggestions: [Suggestion] {
         guard focused, compact, !pane.isPrivate else { return [] }
         let typed = pane.address == pane.webView.url?.absoluteString ? "" : pane.address
-        return Suggest.make(query: typed, history: history, sites: sites, limit: compact ? 4 : 6)
+        return Suggest.make(query: typed, history: history, sites: sites, limit: 5, live: live.items)
     }
 
     private var suggestionList: some View {
@@ -2927,7 +3017,7 @@ struct PaneView: View {
                         .frame(width: 24)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(s.title).font(.subheadline).foregroundStyle(ink).lineLimit(1)
-                            Text(s.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                            if !s.subtitle.isEmpty { Text(s.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
                         }
                         Spacer(minLength: 0)
                         Image(systemName: atTop ? "arrow.down.left" : "arrow.up.left")
@@ -3030,6 +3120,9 @@ struct PaneView: View {
         .animation(spring, value: barLayout)
         .animation(spring, value: atTop)
         .onChange(of: pane.loading) { _, l in if !l { scheduleCollapse(after: 1.5) } }
+        .onChange(of: pane.address) { _, a in
+            if focused && compact { live.update(a == pane.webView.url?.absoluteString ? "" : a, allowed: !pane.isPrivate) }
+        }
         .onChange(of: focused) { _, f in
             pane.editing = f
             if !f { touched() }
@@ -3558,6 +3651,7 @@ struct FocusSplash: View {
     var query: String
     var isPrivate: Bool
     var open: (String) -> Void
+    @StateObject private var live = LiveSuggest()
     @Environment(\.sdTheme) private var theme
 
     private var typed: String { query.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -3572,7 +3666,7 @@ struct FocusSplash: View {
             }
             return out
         }
-        return Suggest.make(query: typed, history: history, sites: sites, limit: 9)
+        return Suggest.make(query: typed, history: history, sites: sites, limit: 10, live: live.items)
     }
 
     private func row(_ s: Suggestion) -> some View {
@@ -3591,7 +3685,7 @@ struct FocusSplash: View {
                 .frame(width: 28)
                 VStack(alignment: .leading, spacing: 2) {
                     Text(s.title).font(.body).foregroundStyle(.primary).lineLimit(1)
-                    Text(s.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    if !s.subtitle.isEmpty { Text(s.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
                 }
                 Spacer(minLength: 0)
                 Image(systemName: "arrow.up.left").font(.system(size: 13, weight: .semibold)).foregroundStyle(.tertiary)
@@ -3666,6 +3760,8 @@ struct FocusSplash: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .scrollDismissesKeyboard(.interactively)
+        .onChange(of: typed) { _, q in live.update(q, allowed: !isPrivate) }
+        .onAppear { live.update(typed, allowed: !isPrivate) }
         .background(isPrivate
                     ? AnyShapeStyle(Color(red: 0.10, green: 0.07, blue: 0.17))
                     : AnyShapeStyle(LinearGradient(colors: [theme.top, theme.bottom], startPoint: .top, endPoint: .bottom)))
@@ -4786,6 +4882,51 @@ struct BarLayoutPicker: View {
     }
 }
 
+// Settings › Media: YouTube playback quality and clean-up.
+struct MediaSection: View {
+    @AppStorage("ytQualityWifi") private var wifi = YouTubeMedia.Quality.high.rawValue
+    @AppStorage("ytQualityCell") private var cell = YouTubeMedia.Quality.auto.rawValue
+    @AppStorage("ytBlockRecs") private var recs = false
+    @AppStorage("ytBlockDistract") private var distract = false
+    @AppStorage("ytBlockShorts") private var shorts = false
+
+    private func row(_ title: String, _ detail: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+            Text(detail).font(.footnote).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private func label(_ raw: String) -> String { (YouTubeMedia.Quality(rawValue: raw) ?? .auto).short }
+
+    var body: some View {
+        Section {
+            NavigationLink {
+                MediaQualitySettings()
+            } label: {
+                row("Highest Quality Playback", "Wi‑Fi: \(label(wifi)) · Mobile data: \(label(cell))")
+            }
+            Toggle(isOn: $recs) {
+                row("Block YouTube Recommended Content", "Blocks the Up Next and end card elements on youtube.com")
+            }
+            .onChange(of: recs) { _, _ in YouTubeMedia.changed() }
+            Toggle(isOn: $distract) {
+                row("Block YouTube Distracting Elements", "Hides comments, live chat, merch shelves and app banners on youtube.com")
+            }
+            .onChange(of: distract) { _, _ in YouTubeMedia.changed() }
+            Toggle(isOn: $shorts) {
+                row("Block YouTube Shorts", "Blocks Shorts from the home page, trending page and search results on youtube.com")
+            }
+            .onChange(of: shorts) { _, _ in YouTubeMedia.changed() }
+        } header: {
+            Text("Media")
+        } footer: {
+            Text("Changes apply to open YouTube tabs straight away.")
+        }
+    }
+}
+
 struct SettingsView: View {
     @ObservedObject var sites: Sites
     @ObservedObject var shields: Shields
@@ -4801,6 +4942,7 @@ struct SettingsView: View {
     @State private var siteZooms = Zoom.sites.count
     @AppStorage("onboarded") private var onboarded = true
     @AppStorage("engine") private var engine = "Google"
+    @AppStorage("liveSuggest") private var liveSuggest = true
     @AppStorage("saver") private var saver = false
     @AppStorage("homeMode") private var homeMode = 0
     @AppStorage("barStyle") private var barStyle = 1
@@ -4813,6 +4955,7 @@ struct SettingsView: View {
     @AppStorage("minimalBar") private var minimalBar = true
     @AppStorage("barLayout") private var barLayout = "twoTone"
     @AppStorage("barPosition") private var barPosition = "bottom"
+    @State private var query = ""
     var openVault: () -> Void
     var openVPN: () -> Void
     @Environment(\.dismiss) private var dismiss
@@ -4824,215 +4967,302 @@ struct SettingsView: View {
         return "Version \(v) (\(b))"
     }
 
+    // Words each section answers to in the settings search.
+    private enum Keys {
+        static let passwords = ["Passwords", "Cards", "Vault", "AutoFill", "Logins", "Face ID", "Keychain"]
+        static let search = ["Search Engine", "Google", "DuckDuckGo", "Bing", "Brave", "Ecosia", "Suggestions"]
+        static let appearance = ["Appearance", "Theme", "Dark", "Light", "Bar Style", "Glass", "Solid", "Colour", "Color", "Text", "Icon", "Photo"]
+        static let addressBar = ["Address Bar", "Layout", "Position", "Top", "Bottom", "Toolbar", "Minimal", "Pill", "Two-Tone"]
+        static let split = ["Split View", "Island", "Floating", "Divider"]
+        static let home = ["Home Page", "Frequently Visited", "My Sites", "Visit History", "Start Page"]
+        static let media = ["Media", "YouTube", "Video", "Quality", "1440p", "Playback", "Shorts", "Recommended", "Comments", "Wi-Fi", "Mobile Data"]
+        static let privacy = ["Privacy", "Security", "Shields", "Ads", "Trackers", "Cookies", "VPN", "Private Tabs", "App Lock", "Lock", "Passcode", "Face ID"]
+        static let translation = ["Translation", "Translate", "Language"]
+        static let zoom = ["Page Zoom", "Zoom", "Text Size"]
+        static let battery = ["Battery Saver", "Battery", "Power", "Animations"]
+        static let data = ["Browsing Data", "Import", "Safari", "Chrome", "Bookmarks", "History", "Cache", "Clear", "Storage", "Default Browser"]
+        static let about = ["About", "Welcome Tour", "Tour", "Version"]
+        static let all = [passwords, search, appearance, addressBar, split, home, media, privacy, translation, zoom, battery, data, about]
+    }
+
+    private var q: String { query.trimmingCharacters(in: .whitespaces) }
+    private func show(_ words: [String]) -> Bool { q.isEmpty || words.contains { $0.localizedCaseInsensitiveContains(q) } }
+    private var nothingFound: Bool { !q.isEmpty && !Keys.all.contains { show($0) } }
+
     var body: some View {
         NavigationStack {
             Form {
-                Section {
-                    VStack(spacing: 10) {
-                        BrandMark(size: 72)
-                        Text("SplitDeck")
-                            .font(.system(.title2, design: .rounded).weight(.bold))
-                        Text(version).font(.footnote).foregroundStyle(.secondary)
-                        Label("Shields, a Face ID vault and private tabs, all on this iPhone", systemImage: "checkmark.seal.fill")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-                    .listRowBackground(Color.clear)
-                }
-                Section("Search Engine") {
-                    Picker("Search with", selection: $engine) {
-                        ForEach(Engines.names, id: \.self) { Text($0).tag($0) }
-                    }
-                }
-                Section {
-                    Picker("Appearance", selection: $themes.appearance) {
-                        Text("System").tag("System")
-                        Text("Light").tag("Light")
-                        Text("Dark").tag("Dark")
-                    }
-                    .pickerStyle(.segmented)
-                    .disabled(saver)
-                    NavigationLink {
-                        ThemeSettings(themes: themes)
-                    } label: {
-                        LabeledContent("Themes", value: themes.homeImage != nil && themes.matchPhoto ? "Photo" : themes.current.name)
-                    }
-                    Picker("Bar Style", selection: $barStyle) {
-                        Text("Glass").tag(0)
-                        Text("Solid").tag(1)
-                    }
-                    .pickerStyle(.segmented)
-                    if barStyle == 1 {
-                        HStack(spacing: 10) {
-                            ForEach(BarColors.names, id: \.self) { n in
-                                Circle()
-                                    .fill(BarColors.swatch(n))
-                                    .frame(width: 28, height: 28)
-                                    .overlay(Circle().stroke(Color.primary.opacity(0.15), lineWidth: 0.5))
-                                    .overlay(Circle().stroke(Color.accentColor, lineWidth: barColor == n ? 2.5 : 0).padding(-4))
-                                    .contentShape(Circle())
-                                    .onTapGesture { barColor = n }
-                                    .accessibilityLabel(n)
-                            }
-                        }
-                        .padding(.vertical, 6)
-                        Text(barColor == "System" ? "System follows the page's light or dark look." : barColor)
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-                    Toggle("Adapt Text to Page", isOn: $adaptiveText)
-                    if !adaptiveText {
-                        HStack(spacing: 10) {
-                            ForEach(TextColors.names, id: \.self) { n in
-                                Circle()
-                                    .fill(TextColors.color(n) ?? Color(.label))
-                                    .frame(width: 28, height: 28)
-                                    .overlay(Circle().stroke(Color.primary.opacity(0.2), lineWidth: 0.5))
-                                    .overlay(Circle().stroke(Color.accentColor, lineWidth: textColor == n ? 2.5 : 0).padding(-4))
-                                    .contentShape(Circle())
-                                    .onTapGesture { textColor = n }
-                                    .accessibilityLabel(n)
-                            }
-                        }
-                        .padding(.vertical, 6)
-                    }
-                } header: {
-                    Text("Appearance")
-                } footer: {
-                    Text((saver ? "Battery Saver keeps SplitDeck dark. " : "Light and Dark keep your theme's colours, in lighter or darker shades. ")
-                         + (adaptiveText
-                            ? "Icons and text switch between light and dark to stay readable on each page."
-                            : "Icons and text use \(textColor == "System" ? "your phone's light or dark mode" : textColor.lowercased()), with the bar shaded to keep it readable."))
-                }
-                Section {
-                    BarLayoutPicker(layout: $barLayout, position: $barPosition, accent: themes.active(systemDark: envScheme == .dark).accent)
-                    Toggle("Minimal Address Bar", isOn: $minimalBar)
-                } header: {
-                    Text("Address Bar")
-                } footer: {
-                    Text("Layout and position apply in full screen; split view keeps its slim bars."
-                         + (minimalBar ? " The bar settles into a small pill showing the site, giving the page more room. Tap the pill, or scroll up, to bring the full bar back." : ""))
-                }
-                Section {
-                    Toggle("Split View", isOn: $splitEnabled)
-                    Toggle("Show Floating Island", isOn: $showIsland)
-                } header: {
-                    Text("Split View")
-                } footer: {
-                    Text((splitEnabled ? "Split View lets you show two pages at once. " : "Split View is off: SplitDeck always shows one page. ")
-                         + (showIsland
-                            ? "The floating island holds tabs, last-tab switching" + (splitEnabled ? " and split view" : "") + ". Drag it to either side or the top. Fling it at the edge, or tap its chevron, to tuck it away. Press and hold the tab count for new tabs."
-                            : "With the island hidden, its buttons sit in the address bar and the ⋯ menu."))
-                }
-                Section("Home Page") {
-                    Picker("Show", selection: $homeMode) {
-                        Text("Frequently Visited").tag(0)
-                        Text("My Sites").tag(1)
-                    }
-                    .pickerStyle(.segmented)
-                    NavigationLink("Edit My Sites") { MySitesEditor(sites: sites) }
-                    Button("Clear Visit History", role: .destructive) { sites.clearVisits() }
-                }
-                Section {
-                    NavigationLink("Shields") { ShieldsSettings(shields: shields) }
-                    NavigationLink("Media") { MediaSettings() }
-                    Button("VPN") { openVPN() }
-                    Toggle("Lock Private Tabs", isOn: $lockPrivate)
-                } header: {
-                    Text("Privacy")
-                } footer: {
-                    Text("Private tabs are hidden behind Face ID when you leave the app, and covered in the app switcher. VPN connects only to a provider you set up yourself: SplitDeck doesn't host VPN servers, as we don't yet have the resources to run them securely.")
-                }
-                Section {
-                    Toggle("Lock SplitDeck", isOn: Binding(get: { appLock }, set: { on in
-                        // Turning it on (or off) needs the same check it will ask for later.
-                        Task {
-                            if await Vault.confirm(on ? "Turn on app lock" : "Turn off app lock") { appLock = on }
-                        }
-                    }))
-                    if appLock {
-                        Picker("Require", selection: $appLockDelay) {
-                            Text("Immediately").tag(0)
-                            Text("After 1 Minute").tag(60)
-                            Text("After 5 Minutes").tag(300)
-                            Text("After 15 Minutes").tag(900)
-                        }
-                    }
-                } header: {
-                    Text("App Lock")
-                } footer: {
-                    Text("Asks for \(Biometry.kind.name) (or your passcode) when SplitDeck opens, and hides it in the app switcher.")
-                }
-                Section {
-                    Picker("Default Zoom", selection: $zoomDefault) {
-                        ForEach(Zoom.steps, id: \.self) { Text(Zoom.label($0)).tag($0) }
-                    }
-                    Toggle("Remember Zoom for Each Site", isOn: $zoomRemember)
-                    if siteZooms > 0 {
-                        Button("Reset \(siteZooms) Site Zoom Level\(siteZooms == 1 ? "" : "s")", role: .destructive) {
-                            UserDefaults.standard.removeObject(forKey: "zoomSites")
-                            siteZooms = 0
-                        }
-                    }
-                } header: {
-                    Text("Page Zoom")
-                } footer: {
-                    Text("Change a page's zoom from ⋯ in the address bar. The default applies to every site you haven't zoomed yourself.")
-                }
-                Section {
-                    Picker("Translate To", selection: $translateTo) {
-                        ForEach(Translate.languages, id: \.code) { Text($0.name).tag($0.code) }
-                    }
-                    Toggle("Offer to Translate", isOn: $offerTranslate)
-                } header: {
-                    Text("Translation")
-                } footer: {
-                    Text("When most of a page is in another language, a translate button appears in the address bar. You can always translate from ⋯. Runs on this iPhone with Apple Translate; iOS may ask to download a language the first time.")
-                }
-                Section {
-                    NavigationLink("Import from Safari or Chrome") {
-                        ImportContent(history: history, vault: vault).navigationTitle("Import Browsing Data")
-                    }
-                    Button("Clear Cached Files") {
-                        WKWebsiteDataStore.default().removeData(
-                            ofTypes: [WKWebsiteDataTypeDiskCache, WKWebsiteDataTypeMemoryCache, WKWebsiteDataTypeFetchCache],
-                            modifiedSince: .distantPast) {}
-                        FaviconCache.shared.clear()
-                        URLCache.shared.removeAllCachedResponses()
-                    }
-                    Button("Default Browser") {
-                        if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
-                    }
-                } header: {
-                    Text("Browsing Data")
-                } footer: {
-                    Text("iOS only offers apps with Apple's browser entitlement as the default browser. That needs a paid developer account and App Store review, which this test build doesn't have yet, so SplitDeck can't be chosen there for now. Meanwhile, other apps and Shortcuts can open any link here with splitdeck://open?url= followed by the address.")
-                }
-                Section {
-                    Button("Show Welcome Tour") {
-                        dismiss()
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { onboarded = false }
-                    }
-                }
-                Section {
-                    Toggle("Battery Saver", isOn: $saver)
-                } footer: {
-                    Text("Switches the app to dark mode, turns off every animation, keeps the address bar full size, caps page animations at 30 fps and keeps only 2 tabs awake.")
-                }
-                Section {
-                    Button("Passwords and Cards") { openVault() }
-                } header: {
-                    Text("Passwords")
-                } footer: {
-                    Text("Logins on websites are filled by your iPhone's own AutoFill: tap a login field and pick a password above the keyboard (turn it on in Settings › General › AutoFill & Passwords). The vault keeps the passwords you add or import here, behind Face ID. Changing a username or password, or deleting a login, needs a fresh Face ID scan.")
-                }
+                if q.isEmpty { header }
+                if show(Keys.passwords) { passwordsSection }
+                if show(Keys.search) { searchSection }
+                if show(Keys.appearance) { appearanceSection }
+                if show(Keys.addressBar) { addressBarSection }
+                if show(Keys.split) { splitSection }
+                if show(Keys.home) { homeSection }
+                if show(Keys.media) { MediaSection() }
+                if show(Keys.privacy) { privacySection }
+                if show(Keys.translation) { translationSection }
+                if show(Keys.zoom) { zoomSection }
+                if show(Keys.battery) { batterySection }
+                if show(Keys.data) { dataSection }
+                if show(Keys.about) { aboutSection }
             }
+            .overlay {
+                if nothingFound { ContentUnavailableView.search(text: q) }
+            }
+            .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Search Settings")
             .navigationTitle("Settings")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { Button("Done") { dismiss() } }
+        }
+    }
+
+    // MARK: Sections
+
+    private var header: some View {
+        Section {
+            VStack(spacing: 10) {
+                BrandMark(size: 72)
+                Text("SplitDeck")
+                    .font(.system(.title2, design: .rounded).weight(.bold))
+                Text(version).font(.footnote).foregroundStyle(.secondary)
+                Label("Shields, a Face ID vault and private tabs, all on this iPhone", systemImage: "checkmark.seal.fill")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 6)
+            .listRowBackground(Color.clear)
+        }
+    }
+
+    private var passwordsSection: some View {
+        Section {
+            Button { openVault() } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: "key.fill")
+                        .font(.system(size: 15, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .frame(width: 32, height: 32)
+                        .background(LinearGradient(colors: [.cyan, .blue], startPoint: .top, endPoint: .bottom),
+                                    in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Passwords and Cards").foregroundStyle(.primary)
+                        Text("\(vault.logins.count) logins · protected by Face ID").font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Image(systemName: "chevron.right").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
+                }
+            }
+        } header: {
+            Text("Passwords")
+        } footer: {
+            Text("Website logins are filled by your iPhone's AutoFill: tap a login field and pick a password above the keyboard. The vault keeps passwords you add or import here; changing or deleting one needs a fresh Face ID scan.")
+        }
+    }
+
+    private var searchSection: some View {
+        Section {
+            Picker("Search with", selection: $engine) {
+                ForEach(Engines.names, id: \.self) { Text($0).tag($0) }
+            }
+            Toggle("Search Suggestions", isOn: $liveSuggest)
+        } header: {
+            Text("Search")
+        } footer: {
+            Text(liveSuggest
+                 ? "As you type, suggestions come from \(engine) as well as your history and bookmarks. Private tabs never send what you type."
+                 : "Suggestions come only from your history and bookmarks.")
+        }
+    }
+
+    private var appearanceSection: some View {
+        Section {
+            Picker("Appearance", selection: $themes.appearance) {
+                Text("System").tag("System")
+                Text("Light").tag("Light")
+                Text("Dark").tag("Dark")
+            }
+            .pickerStyle(.segmented)
+            .disabled(saver)
+            NavigationLink {
+                ThemeSettings(themes: themes)
+            } label: {
+                LabeledContent("Themes", value: themes.homeImage != nil && themes.matchPhoto ? "Photo" : themes.current.name)
+            }
+            Picker("Bar Style", selection: $barStyle) {
+                Text("Glass").tag(0)
+                Text("Solid").tag(1)
+            }
+            .pickerStyle(.segmented)
+            if barStyle == 1 { swatches(BarColors.names, selected: barColor, fill: { BarColors.swatch($0) }) { barColor = $0 } }
+            Toggle("Adapt Text to Page", isOn: $adaptiveText)
+            if !adaptiveText { swatches(TextColors.names, selected: textColor, fill: { TextColors.color($0) ?? Color(.label) }) { textColor = $0 } }
+        } header: {
+            Text("Appearance")
+        } footer: {
+            Text((saver ? "Battery Saver keeps SplitDeck dark. " : "Light and Dark keep your theme's colours, in lighter or darker shades. ")
+                 + (barStyle == 1 && barColor == "System" ? "System bars follow the page's light or dark look. " : "")
+                 + (adaptiveText
+                    ? "Icons and text switch between light and dark to stay readable on each page."
+                    : "Icons and text use \(textColor == "System" ? "your phone's light or dark mode" : textColor.lowercased()), with the bar shaded to keep it readable."))
+        }
+    }
+
+    private func swatches(_ names: [String], selected: String, fill: @escaping (String) -> Color, pick: @escaping (String) -> Void) -> some View {
+        HStack(spacing: 10) {
+            ForEach(names, id: \.self) { n in
+                Circle()
+                    .fill(fill(n))
+                    .frame(width: 28, height: 28)
+                    .overlay(Circle().stroke(Color.primary.opacity(0.18), lineWidth: 0.5))
+                    .overlay(Circle().stroke(Color.accentColor, lineWidth: selected == n ? 2.5 : 0).padding(-4))
+                    .contentShape(Circle())
+                    .onTapGesture { pick(n) }
+                    .accessibilityLabel(n)
+            }
+        }
+        .padding(.vertical, 6)
+    }
+
+    private var addressBarSection: some View {
+        Section {
+            BarLayoutPicker(layout: $barLayout, position: $barPosition, accent: themes.active(systemDark: envScheme == .dark).accent)
+            Toggle("Minimal Address Bar", isOn: $minimalBar)
+        } header: {
+            Text("Address Bar")
+        } footer: {
+            Text("Layout and position apply in full screen; split view keeps its slim bars."
+                 + (minimalBar ? " The bar settles into a small pill showing the site, giving the page more room. Tap the pill, or scroll up, to bring the full bar back." : ""))
+        }
+    }
+
+    private var splitSection: some View {
+        Section {
+            Toggle("Split View", isOn: $splitEnabled)
+            Toggle("Show Floating Island", isOn: $showIsland)
+        } header: {
+            Text("Split View")
+        } footer: {
+            Text((splitEnabled ? "Split View lets you show two pages at once. " : "Split View is off: SplitDeck always shows one page. ")
+                 + (showIsland
+                    ? "The floating island holds tabs, last-tab switching" + (splitEnabled ? " and split view" : "") + ". Drag it to either side or the top. Fling it at the edge, or tap its chevron, to tuck it away. Press and hold the tab count for new tabs."
+                    : "With the island hidden, its buttons sit in the address bar and the ⋯ menu."))
+        }
+    }
+
+    private var homeSection: some View {
+        Section("Home Page") {
+            Picker("Show", selection: $homeMode) {
+                Text("Frequently Visited").tag(0)
+                Text("My Sites").tag(1)
+            }
+            .pickerStyle(.segmented)
+            NavigationLink("Edit My Sites") { MySitesEditor(sites: sites) }
+            Button("Clear Visit History", role: .destructive) { sites.clearVisits() }
+        }
+    }
+
+    private var privacySection: some View {
+        Section {
+            NavigationLink("Shields") { ShieldsSettings(shields: shields) }
+            Button("VPN") { openVPN() }
+            Toggle("Lock Private Tabs", isOn: $lockPrivate)
+            Toggle("Lock SplitDeck", isOn: Binding(get: { appLock }, set: { on in
+                // Turning it on (or off) needs the same check it will ask for later.
+                Task {
+                    if await Vault.confirm(on ? "Turn on app lock" : "Turn off app lock") { appLock = on }
+                }
+            }))
+            if appLock {
+                Picker("Require", selection: $appLockDelay) {
+                    Text("Immediately").tag(0)
+                    Text("After 1 Minute").tag(60)
+                    Text("After 5 Minutes").tag(300)
+                    Text("After 15 Minutes").tag(900)
+                }
+            }
+        } header: {
+            Text("Privacy & Security")
+        } footer: {
+            Text("Private tabs hide behind Face ID when you leave the app. Lock SplitDeck asks for \(Biometry.kind.name) (or your passcode) whenever it opens. VPN connects only to a provider you set up yourself: SplitDeck doesn't host VPN servers, as we don't yet have the resources to run them securely.")
+        }
+    }
+
+    private var translationSection: some View {
+        Section {
+            Picker("Translate To", selection: $translateTo) {
+                ForEach(Translate.languages, id: \.code) { Text($0.name).tag($0.code) }
+            }
+            Toggle("Offer to Translate", isOn: $offerTranslate)
+        } header: {
+            Text("Translation")
+        } footer: {
+            Text("When most of a page is in another language, a translate button appears in the address bar. You can always translate from ⋯. Runs on this iPhone with Apple Translate; iOS may ask to download a language the first time.")
+        }
+    }
+
+    private var zoomSection: some View {
+        Section {
+            Picker("Default Zoom", selection: $zoomDefault) {
+                ForEach(Zoom.steps, id: \.self) { Text(Zoom.label($0)).tag($0) }
+            }
+            Toggle("Remember Zoom for Each Site", isOn: $zoomRemember)
+            if siteZooms > 0 {
+                Button("Reset \(siteZooms) Site Zoom Level\(siteZooms == 1 ? "" : "s")", role: .destructive) {
+                    UserDefaults.standard.removeObject(forKey: "zoomSites")
+                    siteZooms = 0
+                }
+            }
+        } header: {
+            Text("Page Zoom")
+        } footer: {
+            Text("Change a page's zoom from ⋯ in the address bar. The default applies to every site you haven't zoomed yourself.")
+        }
+    }
+
+    private var batterySection: some View {
+        Section {
+            Toggle("Battery Saver", isOn: $saver)
+        } header: {
+            Text("Battery")
+        } footer: {
+            Text("Switches the app to dark mode, turns off every animation, keeps the address bar full size, caps page animations at 30 fps and keeps only 2 tabs awake.")
+        }
+    }
+
+    private var dataSection: some View {
+        Section {
+            NavigationLink("Import from Safari or Chrome") {
+                ImportContent(history: history, vault: vault).navigationTitle("Import Browsing Data")
+            }
+            Button("Clear Cached Files") {
+                WKWebsiteDataStore.default().removeData(
+                    ofTypes: [WKWebsiteDataTypeDiskCache, WKWebsiteDataTypeMemoryCache, WKWebsiteDataTypeFetchCache],
+                    modifiedSince: .distantPast) {}
+                FaviconCache.shared.clear()
+                URLCache.shared.removeAllCachedResponses()
+            }
+            Button("Default Browser") {
+                if let u = URL(string: UIApplication.openSettingsURLString) { UIApplication.shared.open(u) }
+            }
+        } header: {
+            Text("Browsing Data")
+        } footer: {
+            Text("iOS only offers apps with Apple's browser entitlement as the default browser. That needs a paid developer account and App Store review, which this test build doesn't have yet. Meanwhile, other apps and Shortcuts can open any link here with splitdeck://open?url= followed by the address.")
+        }
+    }
+
+    private var aboutSection: some View {
+        Section {
+            Button("Show Welcome Tour") {
+                dismiss()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { onboarded = false }
+            }
+            LabeledContent("Version", value: version.replacingOccurrences(of: "Version ", with: ""))
+        } header: {
+            Text("About")
         }
     }
 }
@@ -6528,19 +6758,28 @@ final class NetworkWatch {
 // Video quality and YouTube clean-up, applied by a small script on youtube.com.
 enum YouTubeMedia {
     enum Quality: String, CaseIterable, Identifiable {
-        case best, auto, saver
+        case best, high, auto, saver
         var id: String { rawValue }
         var title: String {
             switch self {
             case .best: return "Best Available"
+            case .high: return "High (1440p)"
             case .auto: return "Auto"
-            case .saver: return "Data Saver"
+            case .saver: return "Data Saver (480p)"
+            }
+        }
+        var short: String {
+            switch self {
+            case .best: return "Best"
+            case .high: return "1440p"
+            case .auto: return "Auto"
+            case .saver: return "480p"
             }
         }
     }
 
     private static var d: UserDefaults { .standard }
-    static var wifi: Quality { Quality(rawValue: d.string(forKey: "ytQualityWifi") ?? "") ?? .best }
+    static var wifi: Quality { Quality(rawValue: d.string(forKey: "ytQualityWifi") ?? "") ?? .high }
     static var cellular: Quality { Quality(rawValue: d.string(forKey: "ytQualityCell") ?? "") ?? .auto }
     static var blockRecs: Bool { d.bool(forKey: "ytBlockRecs") }
     static var blockDistract: Bool { d.bool(forKey: "ytBlockDistract") }
@@ -6584,7 +6823,7 @@ enum YouTubeMedia {
         try {
           var m = mode();
           if (m === 'auto') { localStorage.removeItem('yt-player-quality'); return; }
-          var q = m === 'best' ? 4320 : 480;
+          var q = m === 'best' ? 4320 : (m === 'high' ? 1440 : 480);
           localStorage.setItem('yt-player-quality', JSON.stringify({
             data: JSON.stringify({ quality: q, previousQuality: q }),
             expiration: Date.now() + 2592000000, creation: Date.now() }));
@@ -6597,7 +6836,13 @@ enum YouTubeMedia {
         if (!p || !p.getAvailableQualityLevels) return;
         var lv = (p.getAvailableQualityLevels() || []).filter(function (x) { return x !== 'auto'; });
         if (!lv.length) return;
-        var q = m === 'best' ? lv[0] : (lv.indexOf('large') >= 0 ? 'large' : (lv.indexOf('medium') >= 0 ? 'medium' : lv[lv.length - 1]));
+        var order = ['highres', 'hd2880', 'hd2160', 'hd1440', 'hd1080', 'hd720', 'large', 'medium', 'small', 'tiny'];
+        function capped(top) {
+          var cap = order.indexOf(top);
+          for (var i = 0; i < lv.length; i++) { if (order.indexOf(lv[i]) >= cap) return lv[i]; }
+          return lv[lv.length - 1];
+        }
+        var q = m === 'best' ? lv[0] : (m === 'high' ? capped('hd1440') : capped('large'));
         try {
           if (p.getPlaybackQuality && p.getPlaybackQuality() === q) return;
           if (p.setPlaybackQualityRange) p.setPlaybackQualityRange(q, q);
@@ -6616,7 +6861,7 @@ enum YouTubeMedia {
 }
 
 struct MediaQualitySettings: View {
-    @AppStorage("ytQualityWifi") private var wifi = YouTubeMedia.Quality.best.rawValue
+    @AppStorage("ytQualityWifi") private var wifi = YouTubeMedia.Quality.high.rawValue
     @AppStorage("ytQualityCell") private var cell = YouTubeMedia.Quality.auto.rawValue
 
     var body: some View {
@@ -6629,60 +6874,13 @@ struct MediaQualitySettings: View {
                     ForEach(YouTubeMedia.Quality.allCases) { Text($0.title).tag($0.rawValue) }
                 }
             } footer: {
-                Text("Best Available plays each video at the highest resolution YouTube offers. Auto lets YouTube choose for your connection. Data Saver keeps videos at 480p or lower. A personal hotspot counts as mobile data.")
+                Text("High plays at 1440p, or the next size down when a video doesn't offer it. Best Available uses the highest resolution YouTube has, up to 4K or 8K. Auto lets YouTube choose for your connection. Data Saver keeps videos at 480p or lower. A personal hotspot counts as mobile data.")
             }
         }
         .navigationTitle("Highest Quality Playback")
         .navigationBarTitleDisplayMode(.inline)
         .onChange(of: wifi) { _, _ in YouTubeMedia.changed() }
         .onChange(of: cell) { _, _ in YouTubeMedia.changed() }
-    }
-}
-
-// Settings › Media, laid out like Brave's.
-struct MediaSettings: View {
-    @AppStorage("ytQualityWifi") private var wifi = YouTubeMedia.Quality.best.rawValue
-    @AppStorage("ytQualityCell") private var cell = YouTubeMedia.Quality.auto.rawValue
-    @AppStorage("ytBlockRecs") private var recs = false
-    @AppStorage("ytBlockDistract") private var distract = false
-    @AppStorage("ytBlockShorts") private var shorts = false
-
-    private func row(_ title: String, _ detail: String) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(title)
-            Text(detail).font(.footnote).foregroundStyle(.secondary)
-        }
-        .padding(.vertical, 2)
-    }
-
-    private func label(_ raw: String) -> String { (YouTubeMedia.Quality(rawValue: raw) ?? .auto).title }
-
-    var body: some View {
-        Form {
-            Section {
-                NavigationLink {
-                    MediaQualitySettings()
-                } label: {
-                    row("Highest Quality Playback", "Wi‑Fi: \(label(wifi)) · Mobile data: \(label(cell))")
-                }
-                Toggle(isOn: $recs) {
-                    row("Block YouTube Recommended Content", "Blocks the Up Next and end card elements on youtube.com")
-                }
-                Toggle(isOn: $distract) {
-                    row("Block YouTube Distracting Elements", "Hides comments, live chat, merch shelves and app banners on youtube.com")
-                }
-                Toggle(isOn: $shorts) {
-                    row("Block YouTube Shorts", "Blocks Shorts from the home page, trending page and search results on youtube.com")
-                }
-            } footer: {
-                Text("Changes apply to open YouTube tabs straight away.")
-            }
-        }
-        .navigationTitle("Media")
-        .navigationBarTitleDisplayMode(.inline)
-        .onChange(of: recs) { _, _ in YouTubeMedia.changed() }
-        .onChange(of: distract) { _, _ in YouTubeMedia.changed() }
-        .onChange(of: shorts) { _, _ in YouTubeMedia.changed() }
     }
 }
 
