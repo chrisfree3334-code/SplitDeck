@@ -157,6 +157,31 @@ final class Vault: ObservableObject {
     func lock() { unlocked = false }
     func save() { Store.write("logins", logins); Store.write("cards", cards) }
 
+    // Same site and username: update the password; otherwise add a new login.
+    func upsert(_ l: Login) {
+        let h = Sites.clean(l.site)
+        if let i = logins.firstIndex(where: { Sites.clean($0.site) == h && $0.user == l.user }) {
+            logins[i].pass = l.pass
+        } else {
+            logins.append(l)
+        }
+        save()
+    }
+
+    func update(_ l: Login) {
+        if let i = logins.firstIndex(where: { $0.id == l.id }) { logins[i] = l } else { logins.append(l) }
+        save()
+    }
+
+    func deleteLogin(_ id: UUID) { logins.removeAll { $0.id == id }; save() }
+    func deleteCard(_ id: UUID) { cards.removeAll { $0.id == id }; save() }
+
+    var reusedPasswords: Set<String> {
+        var counts: [String: Int] = [:]
+        for l in logins { counts[l.pass, default: 0] += 1 }
+        return Set(counts.filter { $0.value > 1 }.keys)
+    }
+
     func match(host: String) -> [Login] {
         let h = host.replacingOccurrences(of: "www.", with: "")
         return logins.filter { l in
@@ -633,6 +658,7 @@ final class WeakHandler: NSObject, WKScriptMessageHandler {
 
 final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandler {
     let id: UUID
+    let isPrivate: Bool
     let webView: WKWebView
     @Published var address = ""
     @Published var collapsed = false
@@ -656,6 +682,8 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     private var hiddenSels: [String] = []
     @Published var offerFill = false
     var onLoginField: (() -> Void)?
+    var onPageLoaded: ((URL, String) -> Void)?
+    var onSearch: ((String) -> Void)?
     var editing = false
     var onCredential: ((Login) -> Void)?
     var onVisit: ((String) -> Void)?
@@ -687,9 +715,12 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
 
     static let tintJS = "(function(){function C(c){var m=c&&c.match(/[\\d.]+/g);if(!m||m.length<3)return null;if(m.length>3&&+m[3]<0.5)return null;return [+m[0],+m[1],+m[2]]}function at(x,y){var e=document.elementFromPoint(x,y);while(e){var v=C(getComputedStyle(e).backgroundColor);if(v)return v;e=e.parentElement}return C(getComputedStyle(document.documentElement).backgroundColor)||(document.body&&C(getComputedStyle(document.body).backgroundColor))||[255,255,255]}var w=innerWidth/2;return at(w,3).concat(at(w,innerHeight-3))})()"
 
-    init(id: UUID, start: String?) {
+    init(id: UUID, start: String?, isPrivate: Bool = false) {
         self.id = id
+        self.isPrivate = isPrivate
         let config = WKWebViewConfiguration()
+        // Private tabs share one throwaway, memory-only store: no cookies, cache or site data reach the disk.
+        config.websiteDataStore = isPrivate ? Tabs.privateStore : .default()
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
         config.allowsPictureInPictureMediaPlayback = true
@@ -736,6 +767,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         guard !t.isEmpty else { return }
         let url: URL?
         if t.contains(" ") || !t.contains(".") {
+            if !isPrivate { onSearch?(t) }
             let s = t.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? t
             let name = UserDefaults.standard.string(forKey: "engine") ?? "DuckDuckGo"
             url = URL(string: (Engines.urls[name] ?? Engines.urls["DuckDuckGo"]!) + s)
@@ -912,7 +944,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             canUndoHide = true
             return
         }
-        guard let d = m.body as? [String: String], let p = d["pass"], !p.isEmpty else { return }
+        guard !isPrivate, let d = m.body as? [String: String], let p = d["pass"], !p.isEmpty else { return }
         onCredential?(Login(site: d["site"] ?? "", user: d["user"] ?? "", pass: p))
     }
 
@@ -967,7 +999,10 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         refreshMeta()
         detectTint()
-        if !host.isEmpty { onVisit?(host) }
+        if !host.isEmpty && !isPrivate {
+            onVisit?(host)
+            if let u = webView.url { onPageLoaded?(u, webView.title ?? "") }
+        }
         onChange?()
         webView.evaluateJavaScript("((document.querySelector('input[type=password]')?1:0)+(document.querySelector('[autocomplete=cc-number]')?2:0))") { [weak self] r, _ in
             guard let self else { return }
@@ -1010,6 +1045,8 @@ struct TabInfo: Identifiable, Codable {
     var id = UUID()
     var url = ""
     var title = ""
+    var priv: Bool?
+    var isPrivate: Bool { priv ?? false }
 }
 
 final class Tabs: ObservableObject {
@@ -1022,6 +1059,16 @@ final class Tabs: ObservableObject {
     private var used: [UUID: Date] = [:]
     var maxLive = 4
     var configure: ((Pane) -> Void)?
+
+    // One shared private session; replaced with a fresh one when the last private tab closes.
+    static var privateStore = WKWebsiteDataStore.nonPersistent()
+
+    var privateCount: Int { list.filter(\.isPrivate).count }
+    var normalCount: Int { list.count - privateCount }
+
+    func closeAllPrivate() {
+        for t in list where t.isPrivate { close(t.id) }
+    }
     @Published var thumbs: [UUID: UIImage] = [:]
 
     static let thumbDir: URL = {
@@ -1046,6 +1093,7 @@ final class Tabs: ObservableObject {
                 img.draw(in: CGRect(x: 0, y: 0, width: w, height: img.size.height * w / img.size.width))
             }
             self.thumbs[p.id] = small
+            guard !p.isPrivate else { return }   // private previews stay in memory only
             if let d = small.jpegData(compressionQuality: 0.7) { try? d.write(to: Tabs.thumbURL(p.id)) }
         }
     }
@@ -1091,7 +1139,7 @@ final class Tabs: ObservableObject {
         used[id] = Date()
         if let p = live[id] { return p }
         let info = list.first { $0.id == id }
-        let p = Pane(id: id, start: info?.url)
+        let p = Pane(id: id, start: info?.url, isPrivate: info?.isPrivate ?? false)
         p.title = info?.title ?? ""
         p.onChange = { [weak self, weak p] in
             if let self, let p { self.sync(p) }
@@ -1162,16 +1210,18 @@ final class Tabs: ObservableObject {
         DispatchQueue.main.async { self.trim() }
     }
 
-    func newTab(slot: Int) {
-        let t = TabInfo()
+    func newTab(slot: Int, isPrivate: Bool = false) {
+        let t = TabInfo(priv: isPrivate ? true : nil)
         list.append(t)
         show(t.id, slot: slot)
     }
 
     func close(_ id: UUID) {
+        let wasPrivate = info(id)?.isPrivate ?? false
         sleep(id)
         dropThumb(id)
         list.removeAll { $0.id == id }
+        if wasPrivate && privateCount == 0 { Tabs.privateStore = WKWebsiteDataStore.nonPersistent() }
         if previous == id { previous = nil }
         if list.isEmpty {
             let t = TabInfo()
@@ -1237,8 +1287,146 @@ final class Tabs: ObservableObject {
     }
 
     func save() {
-        if let d = try? JSONEncoder().encode(list) { UserDefaults.standard.set(d, forKey: "tabs") }
-        UserDefaults.standard.set(left.uuidString, forKey: "leftTab")
+        let keep = list.filter { !$0.isPrivate }
+        if let d = try? JSONEncoder().encode(keep) { UserDefaults.standard.set(d, forKey: "tabs") }
+        let first = keep.contains { $0.id == left } ? left : keep.first?.id
+        UserDefaults.standard.set(first?.uuidString, forKey: "leftTab")
+    }
+}
+
+// MARK: History
+
+struct HistoryItem: Identifiable, Codable, Equatable {
+    var id = UUID()
+    var isSearch: Bool
+    var text: String     // the address for a visit, the words for a search
+    var title: String
+    var date: Date
+
+    var host: String {
+        let h = URL(string: text)?.host ?? ""
+        return h.hasPrefix("www.") ? String(h.dropFirst(4)) : h
+    }
+}
+
+final class HistoryStore: ObservableObject {
+    @Published private(set) var items: [HistoryItem] = []   // newest first
+    private var saveWork: DispatchWorkItem?
+    static let cap = 5000
+
+    static let fileURL: URL = {
+        let d = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d.appendingPathComponent("history.json")
+    }()
+
+    init() {
+        if let d = try? Data(contentsOf: HistoryStore.fileURL),
+           let list = try? JSONDecoder().decode([HistoryItem].self, from: d) { items = list }
+    }
+
+    func addVisit(_ url: URL, title: String) {
+        let text = url.absoluteString
+        // Reloads and quick revisits update the existing entry instead of piling up.
+        if let i = items.prefix(30).firstIndex(where: { !$0.isSearch && $0.text == text }),
+           Date().timeIntervalSince(items[i].date) < 1800 {
+            var it = items.remove(at: i)
+            it.date = Date()
+            if !title.isEmpty { it.title = title }
+            items.insert(it, at: 0)
+        } else {
+            items.insert(HistoryItem(isSearch: false, text: text, title: title, date: Date()), at: 0)
+        }
+        trimAndSave()
+    }
+
+    func addSearch(_ query: String) {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return }
+        items.removeAll { $0.isSearch && $0.text.caseInsensitiveCompare(q) == .orderedSame && Date().timeIntervalSince($0.date) < 600 }
+        items.insert(HistoryItem(isSearch: true, text: q, title: q, date: Date()), at: 0)
+        trimAndSave()
+    }
+
+    func remove(_ ids: Set<UUID>) {
+        items.removeAll { ids.contains($0.id) }
+        trimAndSave()
+    }
+
+    // since == nil clears everything.
+    func clear(since: Date?) {
+        if let since { items.removeAll { $0.date >= since } } else { items.removeAll() }
+        trimAndSave()
+    }
+
+    var recentSearches: [String] {
+        var seen = Set<String>()
+        var out: [String] = []
+        for it in items where it.isSearch {
+            let k = it.text.lowercased()
+            if seen.insert(k).inserted { out.append(it.text) }
+            if out.count == 30 { break }
+        }
+        return out
+    }
+
+    private func trimAndSave() {
+        if items.count > HistoryStore.cap { items.removeLast(items.count - HistoryStore.cap) }
+        saveWork?.cancel()
+        let snapshot = items
+        let w = DispatchWorkItem {
+            if let d = try? JSONEncoder().encode(snapshot) { try? d.write(to: HistoryStore.fileURL, options: .atomic) }
+        }
+        saveWork = w
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1, execute: w)
+    }
+}
+
+struct Suggestion: Identifiable {
+    enum Kind { case search, recent, site }
+    let id = UUID()
+    let kind: Kind
+    let title: String
+    let subtitle: String
+    let value: String    // what gets loaded
+}
+
+enum Suggest {
+    static func make(query raw: String, history: HistoryStore, sites: Sites, limit: Int) -> [Suggestion] {
+        let q = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var out: [Suggestion] = []
+        var seen = Set<String>()
+        func add(_ s: Suggestion) {
+            guard out.count < limit, seen.insert(s.value.lowercased()).inserted else { return }
+            out.append(s)
+        }
+        if q.isEmpty {
+            for r in history.recentSearches.prefix(4) {
+                add(Suggestion(kind: .recent, title: r, subtitle: "Recent search", value: r))
+            }
+            for h in sites.frequent.prefix(3) {
+                add(Suggestion(kind: .site, title: h, subtitle: "Frequently visited", value: h))
+            }
+            return out
+        }
+        add(Suggestion(kind: .search, title: raw.trimmingCharacters(in: .whitespaces), subtitle: "Search", value: raw))
+        for r in history.recentSearches where r.lowercased().contains(q) {
+            add(Suggestion(kind: .recent, title: r, subtitle: "Recent search", value: r))
+            if out.count >= 3 { break }
+        }
+        // Sites: address starting with what you typed first, then title or address containing it.
+        let visits = history.items.lazy.filter { !$0.isSearch }
+        var starts: [HistoryItem] = [], contains: [HistoryItem] = []
+        for v in visits.prefix(1500) {
+            let host = v.host.lowercased()
+            if host.hasPrefix(q) { starts.append(v) }
+            else if host.contains(q) || v.title.lowercased().contains(q) { contains.append(v) }
+            if starts.count >= 6 && contains.count >= 6 { break }
+        }
+        for v in starts + contains {
+            add(Suggestion(kind: .site, title: v.title.isEmpty ? v.host : v.title, subtitle: v.host, value: v.text))
+        }
+        return out
     }
 }
 
@@ -1898,11 +2086,16 @@ struct PaneActions {
     var shields: () -> Void
     var shieldsUp: Bool
     var totalBlocked: Int
+    var newPrivateTab: () -> Void
+    var history: () -> Void
+    var privateLocked: Bool
+    var unlockPrivate: () -> Void
 }
 
 struct PaneView: View {
     @ObservedObject var pane: Pane
     @ObservedObject var sites: Sites
+    @ObservedObject var history: HistoryStore
     var actions: PaneActions
     var compact = false            // slim bar used in split view
     var atTop = false              // bar sits in a strip above the page (top pane in portrait split)
@@ -1914,18 +2107,24 @@ struct PaneView: View {
     @AppStorage("adaptiveText") private var adaptiveText = true
     @AppStorage("textColor") private var textColor = "System"
     @Environment(\.sdTheme) private var theme
+    @Environment(\.scenePhase) private var phase
     @State private var desktop = false
     @FocusState private var focused: Bool
 
-    private var ink: AnyShapeStyle { TextColors.ink(adaptive: adaptiveText, name: textColor) }
+    private var ink: AnyShapeStyle {
+        if adaptiveText || TextColors.color(textColor) == nil { return AnyShapeStyle(dark ? Color.white : Color.black) }
+        return TextColors.ink(adaptive: adaptiveText, name: textColor)
+    }
     private var mini: Bool { pane.collapsed && !focused && !pane.isHome }
     // The bottom strip takes the page's own colour so it blends in; the top strip matches the status bar.
     private var stripColor: Color {
-        pane.isHome || atTop ? theme.strip : (pane.bottomColor ?? theme.strip)
+        if pane.isPrivate { return Color(red: 0.14, green: 0.10, blue: 0.23) }
+        return pane.isHome || atTop ? theme.strip : (pane.bottomColor ?? theme.strip)
     }
     // Whether the bar surface is dark. Adaptive: follows the page so text stays readable.
     // Fixed colour: the surface contrasts with the colour you picked.
     private var dark: Bool {
+        if pane.isPrivate { return true }
         if !adaptiveText { return TextColors.isLight(textColor) ?? (sys == .dark) }
         if pane.isHome || atTop { return sys == .dark }
         return pane.pageDark ?? (sys == .dark)
@@ -1944,6 +2143,51 @@ struct PaneView: View {
         )
     }
 
+    private var suggestions: [Suggestion] {
+        guard focused, !pane.isPrivate else { return [] }
+        let typed = pane.address == pane.webView.url?.absoluteString ? "" : pane.address
+        return Suggest.make(query: typed, history: history, sites: sites, limit: compact ? 4 : 6)
+    }
+
+    private var suggestionList: some View {
+        VStack(spacing: 0) {
+            ForEach(Array(suggestions.enumerated()), id: \.element.id) { i, s in
+                if i > 0 { Divider().padding(.leading, 48) }
+                Button {
+                    focused = false
+                    pane.load(s.value)
+                } label: {
+                    HStack(spacing: 12) {
+                        Group {
+                            switch s.kind {
+                            case .search: Image(systemName: "magnifyingglass")
+                            case .recent: Image(systemName: "clock.arrow.circlepath")
+                            case .site: Image(systemName: "globe")
+                            }
+                        }
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 24)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(s.title).font(.subheadline).foregroundStyle(ink).lineLimit(1)
+                            Text(s.subtitle).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                        Image(systemName: atTop ? "arrow.down.left" : "arrow.up.left")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 12)
+                    .frame(height: compact ? 42 : 48)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .sdGlass(RoundedRectangle(cornerRadius: 18, style: .continuous), dark: dark)
+        .transition(.opacity.combined(with: .move(edge: atTop ? .top : .bottom)))
+    }
+
     private var bottomPad: CGFloat {
         if focused { return 8 }
         if mini { return max(bottomInset - 14, 6) }
@@ -1958,7 +2202,11 @@ struct PaneView: View {
                 WebHost(webView: pane.webView)
                     .opacity(pane.isHome ? 0 : 1)
                 if pane.isHome {
-                    StartPage(sites: sites, blocked: actions.totalBlocked) { pane.load($0) }
+                    if pane.isPrivate {
+                        PrivateStartPage()
+                    } else {
+                        StartPage(sites: sites, blocked: actions.totalBlocked) { pane.load($0) }
+                    }
                 }
                 if focused {
                     Color.black.opacity(0.001)
@@ -1972,10 +2220,17 @@ struct PaneView: View {
             .clipped()
             if !atTop { bottomRow }
         }
+        .overlay {
+            // Private tabs are hidden when locked, and in the app switcher.
+            if pane.isPrivate && (actions.privateLocked || phase != .active) {
+                PrivateCover(locked: actions.privateLocked, unlock: actions.unlockPrivate)
+            }
+        }
         .animation(smooth, value: mini)
         .animation(spring, value: focused)
         .animation(spring, value: pane.hiding)
         .animation(spring, value: showBanner)
+        .animation(spring, value: suggestions.count)
         .onChange(of: focused) { _, f in pane.editing = f }
     }
 
@@ -1983,10 +2238,11 @@ struct PaneView: View {
         VStack(spacing: 6) {
             bar.frame(height: barH)
             if showBanner { fillBanner }
+            if !suggestions.isEmpty { suggestionList }
         }
         .environment(\.colorScheme, dark ? .dark : .light)
         .padding(.leading, 12)
-        .padding(.trailing, 12 + trailingRoom)
+        .padding(.trailing, 12)
         .padding(.top, safeTop + 4)
         .padding(.bottom, 4)
         .frame(maxWidth: .infinity)
@@ -1995,6 +2251,7 @@ struct PaneView: View {
 
     private var bottomRow: some View {
         VStack(spacing: 8) {
+            if !suggestions.isEmpty { suggestionList }
             if showBanner { fillBanner }
             bar
         }
@@ -2022,29 +2279,6 @@ struct PaneView: View {
                 .contentShape(Rectangle())
         }
         .accessibilityLabel(pane.loading ? "Stop loading" : "Reload")
-    }
-
-    private func navButton(_ icon: String, _ enabled: Bool, _ action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 17, weight: .semibold))
-                .foregroundStyle(ink)
-                .frame(width: 44, height: 48)
-                .contentShape(Rectangle())
-        }
-        .opacity(enabled ? 1 : 0.35)
-        .disabled(!enabled)
-    }
-
-    private var navPair: some View {
-        HStack(spacing: 0) {
-            navButton("chevron.left", pane.backEnabled) { pane.back() }
-            navButton("chevron.right", pane.forwardEnabled) { pane.forward() }
-        }
-        .padding(.horizontal, 2)
-        .frame(height: 48)
-        .sdGlass(Capsule(), dark: dark)
-        .transition(.opacity.combined(with: .scale(scale: 0.9, anchor: .leading)))
     }
 
     private func icon(_ name: String, enabled: Bool = true, _ action: @escaping () -> Void) -> some View {
@@ -2092,7 +2326,7 @@ struct PaneView: View {
     private var showBanner: Bool { pane.offerFill && !focused && !pane.hiding && !pane.isHome }
 
     private var field: some View {
-        TextField("Search or enter site", text: addressText)
+        TextField(pane.isPrivate ? "Search privately" : "Search or enter site", text: addressText)
             .textFieldStyle(.plain)
             .font(compact ? .subheadline : .body)
             .foregroundStyle(ink)
@@ -2140,14 +2374,21 @@ struct PaneView: View {
             .sdGlass(Capsule(), dark: dark)
             .matchedGeometryEffect(id: "bar", in: ns)
             .transition(.opacity)
-        } else if compact {
-            // One slim capsule: back, forward, address, extras, menu.
+        } else {
+            // One capsule: back and forward built in, then the address, extras and menu.
             HStack(spacing: 0) {
                 if !focused {
                     icon("chevron.left", enabled: pane.backEnabled) { pane.back() }
                     icon("chevron.right", enabled: pane.forwardEnabled) { pane.forward() }
+                    if pane.isPrivate {
+                        Image(systemName: "eye.slash.fill")
+                            .font(.system(size: compact ? 11 : 12, weight: .semibold))
+                            .foregroundStyle(ink)
+                            .opacity(0.8)
+                            .accessibilityLabel("Private tab")
+                    }
                 }
-                field.padding(.leading, focused ? 14 : 2)
+                field.padding(.leading, focused ? (compact ? 14 : 18) : 4)
                 if focused {
                     if !pane.address.isEmpty { icon("xmark.circle.fill") { pane.address = "" } }
                 } else {
@@ -2162,27 +2403,6 @@ struct PaneView: View {
             .sdGlass(Capsule(), dark: dark)
             .matchedGeometryEffect(id: "bar", in: ns)
             .transition(.opacity)
-        } else {
-            HStack(spacing: 8) {
-                if !focused { navPair }
-                HStack(spacing: 0) {
-                    field.padding(.leading, 16)
-                    if focused {
-                        if !pane.address.isEmpty { icon("xmark.circle.fill") { pane.address = "" } }
-                    } else {
-                        if !pane.isHome && pane.hasLogin { icon("key.fill") { actions.autofill() } }
-                        if !pane.isHome && pane.hasCard { icon("creditcard.fill") { actions.autofill() } }
-                        if !pane.isHome { reloadButton }
-                        menu
-                    }
-                }
-                .padding(.leading, 2)
-                .padding(.trailing, 4)
-                .frame(height: barH)
-                .sdGlass(Capsule(), dark: dark)
-            }
-            .matchedGeometryEffect(id: "bar", in: ns)
-            .transition(.opacity)
         }
     }
 
@@ -2190,6 +2410,13 @@ struct PaneView: View {
         Menu {
             Button { pane.goHome() } label: { Label("Home", systemImage: "house") }
             Button { actions.newTab() } label: { Label("New Tab", systemImage: "plus.square.on.square") }
+            Button { actions.newPrivateTab() } label: { Label("New Private Tab", systemImage: "eye.slash") }
+            Button { actions.history() } label: { Label("History", systemImage: "clock") }
+            if !pane.isHome, let url = pane.webView.url {
+                ShareLink(item: url, subject: Text(pane.title)) {
+                    Label("Share", systemImage: "square.and.arrow.up")
+                }
+            }
             if !pane.isHome {
                 Button { desktop.toggle(); pane.setDesktop(desktop) } label: {
                     Label(desktop ? "Mobile Site" : "Desktop Site", systemImage: desktop ? "iphone" : "desktopcomputer")
@@ -2216,81 +2443,315 @@ struct PaneView: View {
                 .frame(width: iconW, height: barH)
                 .contentShape(Rectangle())
         }
+        .environment(\.colorScheme, sys)
     }
 }
 
-// MARK: Top controls
+// MARK: Private mode screens
 
-struct TopBar: View {
-    @ObservedObject var tabs: Tabs
-    var saver: Bool
-    var openTabs: () -> Void
-    @AppStorage("adaptiveText") private var adaptiveText = true
-    @AppStorage("textColor") private var textColor = "System"
-
-    private var ink: AnyShapeStyle { TextColors.ink(adaptive: adaptiveText, name: textColor) }
-
-    private func button<L: View>(_ action: @escaping () -> Void, @ViewBuilder label: () -> L) -> some View {
-        Button(action: action) {
-            label()
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(ink)
-                .frame(minWidth: 40, minHeight: 36)
-                .contentShape(Rectangle())
+struct PrivateStartPage: View {
+    private func row(_ icon: String, _ text: String) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: icon).frame(width: 22).foregroundStyle(.white.opacity(0.75))
+            Text(text).foregroundStyle(.white.opacity(0.85))
         }
+        .font(.subheadline)
     }
 
     var body: some View {
-        HStack(spacing: 0) {
-            button(openTabs) {
-                Text("\(tabs.list.count)")
+        ScrollView {
+            VStack(alignment: .leading, spacing: 22) {
+                Image(systemName: "eye.slash.circle.fill")
+                    .font(.system(size: 52))
+                    .foregroundStyle(.white.opacity(0.9))
+                Text("Private Tab")
+                    .font(.largeTitle.bold())
+                    .foregroundStyle(.white)
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("SplitDeck won't save").font(.headline).foregroundStyle(.white)
+                    row("clock", "Your browsing and search history")
+                    row("externaldrive", "Cookies, site data and cache (all erased when you close your last private tab)")
+                    row("key", "New passwords you type")
+                    row("photo", "Tab previews to storage")
+                }
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Still on").font(.headline).foregroundStyle(.white)
+                    row("shield.lefthalf.filled", "Shields: ads and trackers are blocked")
+                    row("lock", "Private tabs lock with Face ID when you leave the app (Settings › Privacy)")
+                }
+                Text("Your activity may still be visible to the websites you visit, your network or internet provider, and your employer or school.")
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 32)
+            .frame(maxWidth: 560, alignment: .leading)
+            .frame(maxWidth: .infinity)
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .background(LinearGradient(colors: [Color(red: 0.20, green: 0.13, blue: 0.34), Color(red: 0.07, green: 0.05, blue: 0.12)],
+                                   startPoint: .top, endPoint: .bottom))
+    }
+}
+
+struct PrivateCover: View {
+    var locked: Bool
+    var unlock: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color(red: 0.10, green: 0.07, blue: 0.17)
+            VStack(spacing: 14) {
+                Image(systemName: "lock.fill").font(.system(size: 34)).foregroundStyle(.white)
+                Text("Private tabs are locked").font(.headline).foregroundStyle(.white)
+                if locked {
+                    Button("Unlock", action: unlock)
+                        .buttonStyle(.borderedProminent)
+                        .tint(.white)
+                        .foregroundStyle(.black)
+                }
+            }
+        }
+    }
+}
+
+// MARK: Edge dock
+
+// Tabs, last-tab switch and split view, docked on the right edge. Swipe it right (or tap the chevron)
+// to tuck it away as a thin tab; tap or swipe that tab to bring it back. Drag up or down to move it.
+struct EdgeDock: View {
+    @ObservedObject var tabs: Tabs
+    var saver: Bool
+    var privateMode: Bool
+    var openTabs: () -> Void
+    @AppStorage("dockTucked") private var tucked = false
+    @AppStorage("dockY") private var dockY = 0.45
+    @AppStorage("adaptiveText") private var adaptiveText = true
+    @AppStorage("textColor") private var textColor = "System"
+    @State private var dragY: CGFloat = 0
+    @State private var dragX: CGFloat = 0
+
+    private var ink: AnyShapeStyle {
+        privateMode ? AnyShapeStyle(Color.white) : TextColors.ink(adaptive: adaptiveText, name: textColor)
+    }
+    private var anim: Animation? { saver ? nil : .spring(response: 0.35, dampingFraction: 0.8) }
+
+    private func button<L: View>(_ label: String, _ action: @escaping () -> Void, @ViewBuilder content: () -> L) -> some View {
+        Button(action: action) {
+            content()
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(ink)
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .accessibilityLabel(label)
+    }
+
+    private var panel: some View {
+        VStack(spacing: 0) {
+            button("Tabs", openTabs) {
+                Text("\(privateMode ? tabs.privateCount : tabs.normalCount)")
                     .font(.caption.weight(.bold))
                     .monospacedDigit()
                     .frame(minWidth: 20, minHeight: 20)
                     .padding(.horizontal, 2)
                     .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous).stroke(ink, lineWidth: 1.6))
             }
-            button({ withAnimation(saver ? nil : .snappy) { tabs.swap() } }) {
+            button("Switch to last tab", { withAnimation(anim) { tabs.swap() } }) {
                 Image(systemName: "arrow.left.arrow.right")
             }
             .disabled(!tabs.canSwap)
             .opacity(tabs.canSwap ? 1 : 0.4)
-            button({ withAnimation(saver ? nil : .snappy) { tabs.toggleSplit() } }) {
+            button(tabs.split ? "Close split view" : "Split view", { withAnimation(anim) { tabs.toggleSplit() } }) {
                 Image(systemName: tabs.split ? "rectangle.split.1x2.fill" : "rectangle.split.1x2")
             }
+            button("Tuck away", { withAnimation(anim) { tucked = true } }) {
+                Image(systemName: "chevron.compact.right").font(.system(size: 14, weight: .bold))
+            }
+            .opacity(0.6)
         }
-        .padding(.horizontal, 4)
-        .frame(height: 36)
-        .sdGlass(Capsule(), dark: adaptiveText ? nil : TextColors.isLight(textColor))
+        .padding(.vertical, 4)
+        .sdGlass(RoundedRectangle(cornerRadius: 24, style: .continuous), dark: privateMode ? true : nil)
+    }
+
+    private var handle: some View {
+        Capsule()
+            .fill(privateMode ? Color.white.opacity(0.7) : Color.primary.opacity(0.35))
+            .frame(width: 5, height: 56)
+            .frame(width: 30, height: 90, alignment: .trailing)
+            .contentShape(Rectangle())
+            .onTapGesture { withAnimation(anim) { tucked = false } }
+            .accessibilityLabel("Show tab controls")
+            .accessibilityAddTraits(.isButton)
+    }
+
+    var body: some View {
+        GeometryReader { g in
+            let h = g.size.height
+            let y = min(max(dockY * h + dragY, 110), max(h - 110, 110))
+            Group {
+                if tucked { handle } else { panel }
+            }
+            .offset(x: dragX)
+            .gesture(
+                DragGesture(minimumDistance: 10)
+                    .onChanged { v in
+                        if abs(v.translation.height) > abs(v.translation.width) {
+                            dragY = v.translation.height
+                        } else if !tucked {
+                            dragX = max(0, v.translation.width)
+                        } else {
+                            dragX = min(0, v.translation.width) / 3
+                        }
+                    }
+                    .onEnded { v in
+                        if abs(v.translation.height) > abs(v.translation.width) {
+                            dockY = Double(min(max(dockY * h + v.translation.height, 110), max(h - 110, 110)) / max(h, 1))
+                        } else if !tucked && v.translation.width > 40 {
+                            withAnimation(anim) { tucked = true }
+                        } else if tucked && v.translation.width < -20 {
+                            withAnimation(anim) { tucked = false }
+                        }
+                        dragY = 0
+                        withAnimation(anim) { dragX = 0 }
+                    }
+            )
+            .position(x: g.size.width - (tucked ? 15 : 30), y: y)
+        }
     }
 }
 
-// The strip across the top: status bar area plus the tab pill. The pill row tucks away while you scroll down.
+// The strip behind the status bar. Matches the theme, or the private colour in a private tab.
 struct TopStrip: View {
     @ObservedObject var pane: Pane
-    @ObservedObject var tabs: Tabs
-    var saver: Bool
     var safeTop: CGFloat
-    var openTabs: () -> Void
     @Environment(\.sdTheme) private var theme
 
     var body: some View {
-        let shown = !pane.collapsed || pane.isHome
-        VStack(spacing: 0) {
-            Color.clear.frame(height: safeTop)
-            if shown {
-                HStack {
-                    Spacer()
-                    TopBar(tabs: tabs, saver: saver, openTabs: openTabs)
+        Color.clear
+            .frame(height: safeTop)
+            .frame(maxWidth: .infinity)
+            .background(pane.isPrivate ? Color(red: 0.14, green: 0.10, blue: 0.23) : theme.strip)
+    }
+}
+
+// MARK: History screen
+
+struct HistoryView: View {
+    @ObservedObject var history: HistoryStore
+    @ObservedObject var sites: Sites
+    var open: (String) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+    @State private var filter = 0      // 0 all, 1 sites, 2 searches
+    @State private var askClear = false
+
+    private var shown: [HistoryItem] {
+        let q = query.lowercased()
+        return history.items.filter { it in
+            (filter == 0 || (filter == 1) != it.isSearch)
+                && (q.isEmpty || it.text.lowercased().contains(q) || it.title.lowercased().contains(q))
+        }
+    }
+
+    struct DayGroup: Identifiable {
+        let day: Date
+        let items: [HistoryItem]
+        var id: Date { day }
+    }
+
+    private var days: [DayGroup] {
+        let cal = Calendar.current
+        var order: [Date] = []
+        var groups: [Date: [HistoryItem]] = [:]
+        for it in shown {
+            let d = cal.startOfDay(for: it.date)
+            if groups[d] == nil { order.append(d) }
+            groups[d, default: []].append(it)
+        }
+        return order.map { DayGroup(day: $0, items: groups[$0] ?? []) }
+    }
+
+    private func label(_ d: Date) -> String {
+        let cal = Calendar.current
+        if cal.isDateInToday(d) { return "Today" }
+        if cal.isDateInYesterday(d) { return "Yesterday" }
+        return d.formatted(.dateTime.weekday(.wide).day().month(.wide).year())
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Picker("Show", selection: $filter) {
+                    Text("All").tag(0)
+                    Text("Sites").tag(1)
+                    Text("Searches").tag(2)
                 }
-                .padding(.horizontal, 12)
-                .padding(.bottom, 6)
-                .transition(.opacity)
+                .pickerStyle(.segmented)
+                .listRowBackground(Color.clear)
+                if shown.isEmpty {
+                    Text(query.isEmpty ? "No history yet." : "No matches.")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(days) { group in
+                    Section {
+                        ForEach(group.items) { it in
+                            Button {
+                                open(it.text)
+                                dismiss()
+                            } label: {
+                                HStack(spacing: 12) {
+                                    if it.isSearch {
+                                        Image(systemName: "magnifyingglass")
+                                            .font(.system(size: 14, weight: .semibold))
+                                            .foregroundStyle(.secondary)
+                                            .frame(width: 28, height: 28)
+                                    } else {
+                                        SiteIcon(host: it.host, size: 28)
+                                    }
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(it.title.isEmpty ? it.host : it.title).lineLimit(1)
+                                        Text(it.isSearch ? "Search" : it.host)
+                                            .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                    }
+                                    Spacer(minLength: 8)
+                                    Text(it.date.formatted(date: .omitted, time: .shortened))
+                                        .font(.caption).foregroundStyle(.secondary).monospacedDigit()
+                                }
+                            }
+                            .foregroundStyle(.primary)
+                        }
+                        .onDelete { idx in history.remove(Set(idx.map { group.items[$0].id })) }
+                    } header: {
+                        Text("\(label(group.day)) · \(group.items.count)")
+                    }
+                }
+            }
+            .searchable(text: $query, prompt: "Search history")
+            .navigationTitle("History")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("Clear") { askClear = true }.disabled(history.items.isEmpty)
+                }
+            }
+            .confirmationDialog("Clear history", isPresented: $askClear, titleVisibility: .visible) {
+                Button("Last Hour", role: .destructive) { history.clear(since: Date().addingTimeInterval(-3600)) }
+                Button("Today", role: .destructive) { history.clear(since: Calendar.current.startOfDay(for: Date())) }
+                Button("Today and Yesterday", role: .destructive) {
+                    let start = Calendar.current.date(byAdding: .day, value: -1, to: Calendar.current.startOfDay(for: Date()))
+                    history.clear(since: start)
+                }
+                Button("All Time", role: .destructive) {
+                    history.clear(since: nil)
+                    sites.clearVisits()
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Clearing All Time also resets your Frequently Visited sites.")
             }
         }
-        .frame(maxWidth: .infinity)
-        .background(theme.strip)
-        .animation(saver ? nil : .smooth(duration: 0.4), value: shown)
     }
 }
 
@@ -2298,8 +2759,14 @@ struct TopStrip: View {
 
 struct TabsView: View {
     @ObservedObject var tabs: Tabs
+    var startPrivate: Bool
+    var privateLocked: Bool
+    var unlock: () -> Void
     @Environment(\.dismiss) private var dismiss
     @State private var slot = 0
+    @State private var privateSection: Bool?
+
+    private var showingPrivate: Bool { privateSection ?? startPrivate }
 
     private let columns = [GridItem(.flexible(), spacing: 14), GridItem(.flexible(), spacing: 14)]
 
@@ -2307,6 +2774,11 @@ struct TabsView: View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
+                    Picker("Tabs", selection: Binding(get: { showingPrivate }, set: { privateSection = $0 })) {
+                        Text("Tabs (\(tabs.normalCount))").tag(false)
+                        Text("Private (\(tabs.privateCount))").tag(true)
+                    }
+                    .pickerStyle(.segmented)
                     if tabs.split {
                         Picker("Open in", selection: $slot) {
                             Text("First Pane").tag(0)
@@ -2314,8 +2786,26 @@ struct TabsView: View {
                         }
                         .pickerStyle(.segmented)
                     }
+                    if showingPrivate && privateLocked && tabs.privateCount > 0 {
+                        VStack(spacing: 12) {
+                            Image(systemName: "lock.fill").font(.system(size: 30))
+                            Text("Private tabs are locked").font(.headline)
+                            Button("Unlock", action: unlock).buttonStyle(.borderedProminent)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 60)
+                    } else if showingPrivate && tabs.privateCount == 0 {
+                        VStack(spacing: 10) {
+                            Image(systemName: "eye.slash").font(.system(size: 30)).foregroundStyle(.secondary)
+                            Text("No private tabs").font(.headline)
+                            Text("Private tabs don't save history, cookies or site data.")
+                                .font(.footnote).foregroundStyle(.secondary).multilineTextAlignment(.center)
+                        }
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 60)
+                    }
                     LazyVGrid(columns: columns, spacing: 18) {
-                        ForEach(tabs.list) { t in
+                        ForEach(tabs.list.filter { $0.isPrivate == showingPrivate && !(showingPrivate && privateLocked) }) { t in
                             TabCard(t: t, tabs: tabs) {
                                 tabs.show(t.id, slot: tabs.split ? slot : 0)
                                 dismiss()
@@ -2331,15 +2821,32 @@ struct TabsView: View {
                 .padding(16)
             }
             .background(Color(.systemGroupedBackground))
-            .navigationTitle(tabs.list.count == 1 ? "1 Tab" : "\(tabs.list.count) Tabs")
+            .navigationTitle(showingPrivate ? "Private Tabs" : "Tabs")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                if showingPrivate && tabs.privateCount > 0 && !privateLocked {
+                    ToolbarItem(placement: .bottomBar) {
+                        Button("Close All Private Tabs", role: .destructive) {
+                            withAnimation(.snappy) { tabs.closeAllPrivate() }
+                        }
+                    }
+                }
                 ToolbarItem(placement: .primaryAction) {
-                    Button {
-                        tabs.newTab(slot: tabs.split ? slot : 0)
+                    Menu {
+                        Button { tabs.newTab(slot: tabs.split ? slot : 0); dismiss() } label: {
+                            Label("New Tab", systemImage: "plus.square.on.square")
+                        }
+                        Button { tabs.newTab(slot: tabs.split ? slot : 0, isPrivate: true); dismiss() } label: {
+                            Label("New Private Tab", systemImage: "eye.slash")
+                        }
+                    } label: {
+                        Image(systemName: "plus")
+                    } primaryAction: {
+                        tabs.newTab(slot: tabs.split ? slot : 0, isPrivate: showingPrivate)
                         dismiss()
-                    } label: { Image(systemName: "plus") }
+                    }
+                    .accessibilityLabel(showingPrivate ? "New private tab" : "New tab")
                 }
             }
         }
@@ -2544,6 +3051,8 @@ struct SettingsView: View {
     @AppStorage("barColor") private var barColor = "System"
     @AppStorage("adaptiveText") private var adaptiveText = true
     @AppStorage("textColor") private var textColor = "System"
+    @AppStorage("lockPrivate") private var lockPrivate = true
+    @AppStorage("autoSavePasswords") private var autoSave = false
     var openVault: () -> Void
     var openVPN: () -> Void
     @Environment(\.dismiss) private var dismiss
@@ -2617,22 +3126,28 @@ struct SettingsView: View {
                     NavigationLink("Edit My Sites") { MySitesEditor(sites: sites) }
                     Button("Clear Visit History", role: .destructive) { sites.clearVisits() }
                 }
-                Section("Privacy") {
+                Section {
                     NavigationLink("Shields") { ShieldsSettings(shields: shields) }
                     Button("VPN") { openVPN() }
+                    Toggle("Lock Private Tabs", isOn: $lockPrivate)
+                } header: {
+                    Text("Privacy")
+                } footer: {
+                    Text("Private tabs are hidden behind Face ID when you leave the app, and covered in the app switcher.")
                 }
                 Section {
                     Toggle("Extreme Battery Saver", isOn: $saver)
                 } footer: {
-                    Text("Turns off app animations, caps page animations at 30 fps and keeps only 2 tabs awake. Scrolling smoothness is controlled by iOS.")
+                    Text("Switches the app to dark mode, turns off every animation, caps page animations at 30 fps and keeps only 2 tabs awake.")
                 }
                 Section {
+                    Toggle("Save Passwords Automatically", isOn: $autoSave)
                     Toggle("Offer to Fill Saved Passwords", isOn: $autoPrompt)
                     Button("Passwords and Cards") { openVault() }
                 } header: {
                     Text("Passwords")
                 } footer: {
-                    Text("When a sign-in form appears on a site you have a saved login for, a prompt offers to fill it after Face ID.")
+                    Text("Automatic saving stores new or changed passwords in your vault without asking (never in private tabs). Filling always needs Face ID.")
                 }
             }
             .navigationTitle("Settings")
@@ -2642,81 +3157,493 @@ struct SettingsView: View {
     }
 }
 
+// MARK: Password tools
+
+enum PasswordTools {
+    enum Strength: Int { case weak, fair, strong }
+
+    // Rough entropy: length × log2(size of the character sets used).
+    static func strength(_ p: String) -> Strength {
+        var pool = 0
+        if p.contains(where: { $0.isLowercase }) { pool += 26 }
+        if p.contains(where: { $0.isUppercase }) { pool += 26 }
+        if p.contains(where: { $0.isNumber }) { pool += 10 }
+        if p.contains(where: { !$0.isLetter && !$0.isNumber }) { pool += 33 }
+        let bits = Double(p.count) * log2(Double(max(pool, 1)))
+        if bits >= 70 { return .strong }
+        if bits >= 48 { return .fair }
+        return .weak
+    }
+
+    static func color(_ s: Strength) -> Color {
+        switch s {
+        case .weak: return .red
+        case .fair: return .orange
+        case .strong: return .green
+        }
+    }
+
+    static func label(_ s: Strength) -> String {
+        switch s {
+        case .weak: return "Weak"
+        case .fair: return "Fair"
+        case .strong: return "Strong"
+        }
+    }
+
+    // Unbiased random index from the system's secure random generator.
+    private static func secureIndex(_ n: Int) -> Int {
+        let limit = UInt32.max - UInt32.max % UInt32(n)
+        while true {
+            var r: UInt32 = 0
+            _ = SecRandomCopyBytes(kSecRandomDefault, 4, &r)
+            if r < limit { return Int(r % UInt32(n)) }
+        }
+    }
+
+    // Apple-style: three groups of six (e.g. kwfhum-4teqdo-pazJiv), with one capital and one digit.
+    static func generate() -> String {
+        let chars = Array("abcdefghijkmnopqrstuvwxyz23456789")
+        var g = (0..<18).map { _ in chars[secureIndex(chars.count)] }
+        let upperAt = secureIndex(18)
+        var digitAt = secureIndex(18)
+        while digitAt == upperAt { digitAt = secureIndex(18) }
+        g[upperAt] = Character(String(g[upperAt]).uppercased() == String(g[upperAt]) ? "K" : String(g[upperAt]).uppercased())
+        g[digitAt] = Array("23456789")[secureIndex(8)]
+        let s = String(g)
+        return [s.prefix(6), s.dropFirst(6).prefix(6), s.dropFirst(12)].map(String.init).joined(separator: "-")
+    }
+
+    // Local-only clipboard copy that expires after a minute.
+    static func copy(_ text: String) {
+        UIPasteboard.general.setItems([[UTType.plainText.identifier: text]],
+                                      options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(60)])
+    }
+}
+
 // MARK: Vault screen
 
 struct VaultView: View {
     @ObservedObject var vault: Vault
     var fill: (Login?, Card?) -> Void
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var phase
+    @State private var query = ""
+    @State private var revealed: Set<UUID> = []
+    @State private var copied: UUID?
+    @State private var editing: Login?
+    @State private var addingCard = false
     @State private var importing = false
     @State private var msg = ""
-    @State private var ls = ""
-    @State private var lu = ""
-    @State private var lp = ""
-    @State private var cn = ""
-    @State private var cnum = ""
-    @State private var cexp = ""
-    @State private var ccvc = ""
+    @State private var unlocking = false
+    @State private var spin = false
+    @State private var appeared = false
+
+    private let bg = LinearGradient(colors: [Color(red: 0.05, green: 0.08, blue: 0.16), Color(red: 0.01, green: 0.02, blue: 0.05)],
+                                    startPoint: .top, endPoint: .bottom)
+
+    private func unlock() async {
+        unlocking = true
+        await vault.unlock()
+        unlocking = false
+        if vault.unlocked { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+    }
 
     var body: some View {
         NavigationStack {
-            Group {
-                if vault.unlocked { content }
-                else { Button("Unlock with Face ID") { Task { await vault.unlock() } }.task { await vault.unlock() } }
+            ZStack {
+                bg.ignoresSafeArea()
+                if vault.unlocked {
+                    unlockedView.transition(.opacity.combined(with: .scale(scale: 0.97)))
+                } else {
+                    lockView.transition(.opacity)
+                }
+                if phase != .active {
+                    // Hidden in the app switcher.
+                    ZStack {
+                        Color.black.ignoresSafeArea()
+                        Image(systemName: "lock.fill").font(.system(size: 40)).foregroundStyle(.white)
+                    }
+                }
             }
-            .navigationTitle("Passwords and cards")
-            .toolbar { Button("Done") { dismiss() } }
+            .animation(.spring(response: 0.5, dampingFraction: 0.85), value: vault.unlocked)
+            .navigationTitle(vault.unlocked ? "Vault" : "")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Done") { dismiss() } }
+                if vault.unlocked {
+                    ToolbarItem(placement: .primaryAction) {
+                        Button { withAnimation { vault.lock() } } label: { Image(systemName: "lock") }
+                            .accessibilityLabel("Lock vault")
+                    }
+                }
+            }
+            .sheet(item: $editing) { l in
+                LoginEditor(login: l, isNew: !vault.logins.contains { $0.id == l.id }) { saved in
+                    vault.update(saved)
+                } delete: { id in
+                    vault.deleteLogin(id)
+                }
+            }
+            .sheet(isPresented: $addingCard) { CardEditor { vault.cards.append($0); vault.save() } }
+            .fileImporter(isPresented: $importing, allowedContentTypes: [.commaSeparatedText, .plainText]) { r in
+                if case .success(let url) = r, url.startAccessingSecurityScopedResource() {
+                    defer { url.stopAccessingSecurityScopedResource() }
+                    if let t = try? String(contentsOf: url, encoding: .utf8) {
+                        msg = "Imported \(vault.importCSV(t)) logins. Delete the CSV file now."
+                    }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+        .task { if !vault.unlocked { await unlock() } }
+    }
+
+    // MARK: Locked
+
+    private var lockView: some View {
+        VStack(spacing: 22) {
+            ZStack {
+                Circle()
+                    .stroke(AngularGradient(colors: [.cyan, .blue, .purple, .cyan], center: .center), lineWidth: 3)
+                    .frame(width: 150, height: 150)
+                    .rotationEffect(.degrees(spin ? 360 : 0))
+                    .animation(.linear(duration: 5).repeatForever(autoreverses: false), value: spin)
+                Circle()
+                    .fill(.ultraThinMaterial)
+                    .frame(width: 118, height: 118)
+                Image(systemName: unlocking ? "faceid" : "lock.fill")
+                    .font(.system(size: 46, weight: .semibold))
+                    .foregroundStyle(LinearGradient(colors: [.cyan, .blue], startPoint: .top, endPoint: .bottom))
+                    .contentTransition(.symbolEffect(.replace))
+                    .symbolEffect(.pulse, isActive: unlocking)
+            }
+            VStack(spacing: 6) {
+                Text("Vault Locked").font(.title2.bold()).foregroundStyle(.white)
+                Text("Protected by Face ID and the iPhone Keychain")
+                    .font(.subheadline).foregroundStyle(.white.opacity(0.6))
+            }
+            Button { Task { await unlock() } } label: {
+                Label("Unlock with Face ID", systemImage: "faceid")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity, minHeight: 50)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.blue)
+            .padding(.horizontal, 40)
+        }
+        .onAppear { spin = true }
+    }
+
+    // MARK: Unlocked
+
+    private var filteredLogins: [Login] {
+        let q = query.lowercased()
+        let list = vault.logins.sorted { $0.site.lowercased() < $1.site.lowercased() }
+        return q.isEmpty ? list : list.filter { $0.site.lowercased().contains(q) || $0.user.lowercased().contains(q) }
+    }
+
+    private var unlockedView: some View {
+        let weak = vault.logins.filter { PasswordTools.strength($0.pass) == .weak }.count
+        let reusedSet = vault.reusedPasswords
+        let reused = vault.logins.filter { reusedSet.contains($0.pass) }.count
+        return ScrollView {
+            VStack(spacing: 18) {
+                statusCard(weak: weak, reused: reused)
+                HStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass").foregroundStyle(.white.opacity(0.5))
+                    TextField("Search vault", text: $query)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .foregroundStyle(.white)
+                }
+                .padding(12)
+                .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                HStack(spacing: 10) {
+                    actionButton("Add Login", "plus") {
+                        editing = Login(site: "", user: "", pass: PasswordTools.generate())
+                    }
+                    actionButton("Add Card", "creditcard") { addingCard = true }
+                    actionButton("Import", "square.and.arrow.down") { importing = true }
+                }
+                if !msg.isEmpty {
+                    Text(msg).font(.footnote).foregroundStyle(.white.opacity(0.7))
+                }
+
+                sectionTitle("Logins", count: vault.logins.count)
+                if filteredLogins.isEmpty {
+                    Text(vault.logins.isEmpty ? "No saved logins yet." : "No matches.")
+                        .font(.subheadline).foregroundStyle(.white.opacity(0.5))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                ForEach(Array(filteredLogins.enumerated()), id: \.element.id) { i, l in
+                    loginRow(l, reused: reusedSet.contains(l.pass))
+                        .opacity(appeared ? 1 : 0)
+                        .offset(y: appeared ? 0 : 12)
+                        .animation(.spring(response: 0.45, dampingFraction: 0.85).delay(Double(min(i, 12)) * 0.03), value: appeared)
+                }
+
+                sectionTitle("Cards", count: vault.cards.count)
+                ForEach(vault.cards) { c in cardView(c) }
+                if vault.cards.isEmpty {
+                    Text("No saved cards.").font(.subheadline).foregroundStyle(.white.opacity(0.5))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .padding(16)
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .onAppear { appeared = true }
+    }
+
+    private func statusCard(weak: Int, reused: Int) -> some View {
+        let healthy = weak == 0 && reused == 0
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 14) {
+                ZStack {
+                    Circle().fill(LinearGradient(colors: healthy ? [.green, .teal] : [.orange, .red],
+                                                 startPoint: .topLeading, endPoint: .bottomTrailing))
+                        .frame(width: 52, height: 52)
+                    Image(systemName: healthy ? "checkmark.shield.fill" : "exclamationmark.shield.fill")
+                        .font(.system(size: 24, weight: .semibold))
+                        .foregroundStyle(.white)
+                        .symbolEffect(.bounce, value: vault.unlocked)
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(healthy ? "Vault secured" : "Some passwords need attention")
+                        .font(.headline).foregroundStyle(.white)
+                    Text("Encrypted in the iPhone Keychain · never leaves this device · locks when you leave the app")
+                        .font(.caption).foregroundStyle(.white.opacity(0.6))
+                }
+            }
+            HStack(spacing: 8) {
+                chip("\(vault.logins.count)", "Logins", .blue)
+                chip("\(weak)", "Weak", weak > 0 ? .red : .green)
+                chip("\(reused)", "Reused", reused > 0 ? .orange : .green)
+            }
+        }
+        .padding(16)
+        .background(
+            RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(.white.opacity(0.06))
+                .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(LinearGradient(colors: [.cyan.opacity(0.6), .purple.opacity(0.4)], startPoint: .topLeading, endPoint: .bottomTrailing), lineWidth: 1))
+        )
+    }
+
+    private func chip(_ value: String, _ label: String, _ color: Color) -> some View {
+        VStack(spacing: 2) {
+            Text(value).font(.title3.bold()).foregroundStyle(color).contentTransition(.numericText())
+            Text(label).font(.caption2).foregroundStyle(.white.opacity(0.6))
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private func actionButton(_ title: String, _ icon: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            VStack(spacing: 6) {
+                Image(systemName: icon).font(.system(size: 17, weight: .semibold))
+                Text(title).font(.caption.weight(.medium))
+            }
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity, minHeight: 64)
+            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 14, style: .continuous))
         }
     }
 
-    private var content: some View {
-        List {
-            Section("Logins (tap to fill)") {
-                ForEach(vault.logins) { l in
-                    Button { fill(l, nil); dismiss() } label: {
-                        VStack(alignment: .leading) {
-                            Text(l.site).lineLimit(1)
-                            Text(l.user).font(.caption).foregroundStyle(.secondary)
-                        }
+    private func sectionTitle(_ t: String, count: Int) -> some View {
+        HStack {
+            Text(t).font(.headline).foregroundStyle(.white)
+            Text("\(count)").font(.subheadline).foregroundStyle(.white.opacity(0.5)).contentTransition(.numericText())
+            Spacer()
+        }
+        .padding(.top, 6)
+    }
+
+    private func loginRow(_ l: Login, reused: Bool) -> some View {
+        let shown = revealed.contains(l.id)
+        let st = PasswordTools.strength(l.pass)
+        let host = Sites.clean(l.site)
+        return HStack(spacing: 12) {
+            SiteIcon(host: host.isEmpty ? l.site : host, size: 40)
+            VStack(alignment: .leading, spacing: 4) {
+                Text(host.isEmpty ? l.site : host).font(.subheadline.weight(.semibold)).foregroundStyle(.white).lineLimit(1)
+                Text(l.user.isEmpty ? "No username" : l.user).font(.caption).foregroundStyle(.white.opacity(0.6)).lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(shown ? l.pass : String(repeating: "•", count: min(max(l.pass.count, 8), 14)))
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .lineLimit(1)
+                        .contentTransition(.interpolate)
+                    Capsule().fill(PasswordTools.color(st)).frame(width: 6, height: 6)
+                    if reused {
+                        Text("Reused").font(.caption2.weight(.semibold)).foregroundStyle(.orange)
                     }
-                }.onDelete { vault.logins.remove(atOffsets: $0); vault.save() }
-                Button("Import CSV") { importing = true }
-                if !msg.isEmpty { Text(msg).font(.caption) }
-            }
-            Section("Add a login") {
-                TextField("Website, e.g. example.com", text: $ls)
-                    .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
-                TextField("Username or email", text: $lu)
-                    .textInputAutocapitalization(.never).autocorrectionDisabled()
-                SecureField("Password", text: $lp)
-                Button("Save login") {
-                    guard !ls.isEmpty, !lp.isEmpty else { return }
-                    vault.logins.append(Login(site: ls, user: lu, pass: lp))
-                    vault.save()
-                    ls = ""; lu = ""; lp = ""
                 }
             }
-            Section("Cards (tap to fill)") {
-                ForEach(vault.cards) { c in
-                    Button { fill(nil, c); dismiss() } label: { Text("\(c.name) ending \(c.number.suffix(4))") }
-                }.onDelete { vault.cards.remove(atOffsets: $0); vault.save() }
-                TextField("Name on card", text: $cn)
-                TextField("Card number", text: $cnum).keyboardType(.numberPad)
-                TextField("MM/YY", text: $cexp)
-                SecureField("CVC", text: $ccvc).keyboardType(.numberPad)
-                Button("Save card") {
-                    guard !cnum.isEmpty else { return }
-                    vault.cards.append(Card(name: cn, number: cnum, exp: cexp, cvc: ccvc))
-                    vault.save()
-                    cn = ""; cnum = ""; cexp = ""; ccvc = ""
+            Spacer(minLength: 4)
+            iconButton(shown ? "eye.slash" : "eye", shown ? "Hide password" : "Show password") {
+                withAnimation(.snappy) {
+                    if shown { revealed.remove(l.id) } else { revealed.insert(l.id) }
+                }
+            }
+            iconButton(copied == l.id ? "checkmark" : "doc.on.doc", "Copy password") {
+                PasswordTools.copy(l.pass)
+                withAnimation(.snappy) { copied = l.id }
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { if copied == l.id { withAnimation { copied = nil } } }
+            }
+        }
+        .padding(12)
+        .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .contentShape(Rectangle())
+        .onTapGesture { fill(l, nil); dismiss() }
+        .contextMenu {
+            Button { fill(l, nil); dismiss() } label: { Label("Fill on Page", systemImage: "arrow.up.forward.app") }
+            Button { editing = l } label: { Label("Edit", systemImage: "pencil") }
+            Button { PasswordTools.copy(l.user) } label: { Label("Copy Username", systemImage: "person") }
+            Button(role: .destructive) { withAnimation { vault.deleteLogin(l.id) } } label: { Label("Delete", systemImage: "trash") }
+        }
+    }
+
+    private func iconButton(_ icon: String, _ label: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.85))
+                .frame(width: 38, height: 38)
+                .background(.white.opacity(0.08), in: Circle())
+                .contentTransition(.symbolEffect(.replace))
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel(label)
+    }
+
+    private func cardView(_ c: Card) -> some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack {
+                Image(systemName: "creditcard.fill").font(.title3)
+                Spacer()
+                Text(c.exp).font(.caption.monospaced())
+            }
+            Text("••••  ••••  ••••  \(String(c.number.suffix(4)))")
+                .font(.system(.title3, design: .monospaced).weight(.semibold))
+            Text(c.name.isEmpty ? "Card" : c.name.uppercased()).font(.caption.weight(.semibold))
+        }
+        .foregroundStyle(.white)
+        .padding(18)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(LinearGradient(colors: [Color(red: 0.2, green: 0.25, blue: 0.75), Color(red: 0.45, green: 0.2, blue: 0.7)],
+                                     startPoint: .topLeading, endPoint: .bottomTrailing))
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { fill(nil, c); dismiss() }
+        .contextMenu {
+            Button { fill(nil, c); dismiss() } label: { Label("Fill on Page", systemImage: "arrow.up.forward.app") }
+            Button(role: .destructive) { withAnimation { vault.deleteCard(c.id) } } label: { Label("Delete", systemImage: "trash") }
+        }
+    }
+}
+
+struct LoginEditor: View {
+    @State var login: Login
+    var isNew: Bool
+    var save: (Login) -> Void
+    var delete: (UUID) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var show = false
+
+    var body: some View {
+        let st = PasswordTools.strength(login.pass)
+        NavigationStack {
+            Form {
+                Section("Site") {
+                    TextField("example.com", text: $login.site)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+                    TextField("Username or email", text: $login.user)
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                }
+                Section {
+                    HStack {
+                        Group {
+                            if show { TextField("Password", text: $login.pass) } else { SecureField("Password", text: $login.pass) }
+                        }
+                        .font(.body.monospaced())
+                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                        Button { show.toggle() } label: { Image(systemName: show ? "eye.slash" : "eye") }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel(show ? "Hide password" : "Show password")
+                    }
+                    HStack(spacing: 10) {
+                        GeometryReader { g in
+                            ZStack(alignment: .leading) {
+                                Capsule().fill(Color.secondary.opacity(0.2))
+                                Capsule().fill(PasswordTools.color(st))
+                                    .frame(width: g.size.width * CGFloat(st.rawValue + 1) / 3)
+                            }
+                        }
+                        .frame(height: 6)
+                        Text(PasswordTools.label(st)).font(.caption.weight(.semibold)).foregroundStyle(PasswordTools.color(st))
+                    }
+                    .animation(.spring(response: 0.35, dampingFraction: 0.8), value: st)
+                    Button {
+                        withAnimation(.snappy) { login.pass = PasswordTools.generate(); show = true }
+                    } label: {
+                        Label("Generate Strong Password", systemImage: "wand.and.stars")
+                    }
+                } header: {
+                    Text("Password")
+                }
+                if !isNew {
+                    Section {
+                        Button("Delete Login", role: .destructive) { delete(login.id); dismiss() }
+                    }
+                }
+            }
+            .navigationTitle(isNew ? "New Login" : "Edit Login")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") { save(login); dismiss() }
+                        .disabled(login.site.isEmpty || login.pass.isEmpty)
                 }
             }
         }
-        .fileImporter(isPresented: $importing, allowedContentTypes: [.commaSeparatedText, .plainText]) { r in
-            if case .success(let url) = r, url.startAccessingSecurityScopedResource() {
-                defer { url.stopAccessingSecurityScopedResource() }
-                if let t = try? String(contentsOf: url, encoding: .utf8) {
-                    msg = "Imported \(vault.importCSV(t)) logins. Delete the CSV file now."
+    }
+}
+
+struct CardEditor: View {
+    var save: (Card) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var number = ""
+    @State private var exp = ""
+    @State private var cvc = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("Name on card", text: $name)
+                TextField("Card number", text: $number).keyboardType(.numberPad)
+                TextField("MM/YY", text: $exp).keyboardType(.numbersAndPunctuation)
+                SecureField("Security code", text: $cvc).keyboardType(.numberPad)
+            }
+            .navigationTitle("New Card")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        save(Card(name: name, number: number.filter(\.isNumber), exp: exp, cvc: cvc))
+                        dismiss()
+                    }
+                    .disabled(number.filter(\.isNumber).count < 12)
                 }
             }
         }
@@ -2726,9 +3653,10 @@ struct VaultView: View {
 // MARK: Main screen
 
 enum Sheet: Identifiable {
-    case vault, settings, calendar, vpn, tabs, shields
+    case vault, settings, calendar, vpn, tabs, shields, history
     var id: Int {
         switch self {
+        case .history: return 6
         case .vault: return 0
         case .settings: return 1
         case .calendar: return 2
@@ -2746,7 +3674,11 @@ struct ContentView: View {
     @StateObject private var vpnService = VPNService()
     @StateObject private var shields = Shields()
     @StateObject private var themes = ThemeStore()
+    @StateObject private var history = HistoryStore()
     @Environment(\.scenePhase) private var phase
+    @AppStorage("lockPrivate") private var lockPrivate = true
+    @State private var privateLocked = false
+    @State private var historyPane: Pane?
     @AppStorage("block") private var blockOn = true
     @AppStorage("saver") private var saver = false
     @AppStorage("engine") private var engine = "DuckDuckGo"
@@ -2761,33 +3693,63 @@ struct ContentView: View {
     @State private var choosePane: Pane?
     @State private var chooseList: [Login] = []
     @AppStorage("autoFillPrompt") private var autoPrompt = true
+    @AppStorage("autoSavePasswords") private var autoSave = false
+    @State private var toast: String?
+
+    // Battery saver: dark only. Private tab on top: dark. Otherwise the theme decides.
+    private var appScheme: ColorScheme? {
+        if saver || leftIsPrivate { return .dark }
+        return themes.current.scheme
+    }
+
+    private func showToast(_ text: String) {
+        withAnimation(anim(.spring(response: 0.35, dampingFraction: 0.8))) { toast = text }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) {
+            withAnimation(anim(.easeOut(duration: 0.3))) { if toast == text { toast = nil } }
+        }
+    }
 
     var body: some View {
         GeometryReader { root in
             let safe = ContentView.windowInsets()
             let portrait = root.size.height >= root.size.width
-            let sharedRow = tabs.split && portrait   // tab pill shares the top pane's bar row
+            let topOwnStrip = tabs.split && portrait   // the top pane draws its own strip under the status bar
             VStack(spacing: 0) {
-                if !sharedRow {
-                    TopStrip(pane: tabs.pane(tabs.left), tabs: tabs, saver: saver, safeTop: safe.top, openTabs: openTabs)
+                if !topOwnStrip {
+                    TopStrip(pane: tabs.pane(tabs.left), safeTop: safe.top)
                 }
                 deck(portrait: portrait, safe: safe)
             }
-            .overlay(alignment: .topTrailing) {
-                if sharedRow {
-                    TopBar(tabs: tabs, saver: saver, openTabs: openTabs)
-                        .padding(.trailing, 12)
-                        .padding(.top, safe.top + 4)
-                }
-            }
             .ignoresSafeArea(.container, edges: .vertical)
             .background(themes.current.strip.ignoresSafeArea())
+            .overlay {
+                EdgeDock(tabs: tabs, saver: saver, privateMode: leftIsPrivate, openTabs: openTabs)
+            }
+            .overlay(alignment: .top) {
+                if let toast {
+                    Label(toast, systemImage: "key.fill")
+                        .font(.footnote.weight(.semibold))
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 10)
+                        .sdGlass(Capsule())
+                        .padding(.top, safe.top + 8)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
         }
         .environment(\.sdTheme, themes.current)
         .environment(\.sdHomeImage, themes.homeImage)
         .tint(themes.current.accent)
-        .preferredColorScheme(themes.current.scheme)
-        .sheet(item: $sheet) { s in sheetView(s) }
+        .preferredColorScheme(appScheme)
+        .transaction { t in
+            if saver { t.animation = nil; t.disablesAnimations = true }
+        }
+        .sheet(item: $sheet) { s in
+            sheetView(s)
+                .preferredColorScheme(appScheme)
+                .tint(themes.current.accent)
+                .transaction { t in if saver { t.animation = nil; t.disablesAnimations = true } }
+        }
         .alert("Save password?", isPresented: Binding(get: { pending != nil }, set: { if !$0 { pending = nil } })) {
             Button("Save") { if let p = pending { vault.logins.append(p); vault.save() }; pending = nil }
             Button("Not now", role: .cancel) { pending = nil }
@@ -2815,8 +3777,12 @@ struct ContentView: View {
         .onChange(of: shields.version) { _, _ in applyShields() }
         .onChange(of: blockOn) { _, _ in shields.masterChanged() }
         .onChange(of: saver) { _, _ in applySaver() }
+        .onChange(of: themes.current) { _, _ in tabs.allLive.forEach { $0.objectWillChange.send() } }
         .onChange(of: engine) { _, _ in tabs.visible.forEach { tabs.pane($0).goHome() } }
-        .onChange(of: phase) { _, p in if p != .active { vault.lock() } }
+        .onChange(of: phase) { _, p in
+            if p != .active { vault.lock() }
+            if p == .background && lockPrivate && tabs.privateCount > 0 { privateLocked = true }
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
             tabs.sleepHidden()
         }
@@ -2830,9 +3796,18 @@ struct ContentView: View {
         return scenes.first?.keyWindow?.safeAreaInsets ?? .zero
     }
 
+    private var leftIsPrivate: Bool { tabs.info(tabs.left)?.isPrivate ?? false }
+
     private func openTabs() {
         tabs.snapshotVisible()
         sheet = .tabs
+    }
+
+    private func unlockPrivate() {
+        Task {
+            let ok = try? await LAContext().evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Unlock your private tabs")
+            if ok == true { await MainActor.run { privateLocked = false } }
+        }
     }
 
     private func deck(portrait: Bool, safe: UIEdgeInsets) -> some View {
@@ -2932,6 +3907,7 @@ struct ContentView: View {
         return PaneView(
             pane: p,
             sites: sites,
+            history: history,
             actions: PaneActions(
                 autofill: { autofill(p) },
                 calendar: { calTitle = p.title.isEmpty ? p.host : p.title; calURL = p.address; sheet = .calendar },
@@ -2941,13 +3917,17 @@ struct ContentView: View {
                 newTab: { withAnimation(anim(.snappy)) { tabs.newTab(slot: slot) } },
                 shields: { shieldsPane = p; sheet = .shields },
                 shieldsUp: blockOn && shields.isUp(p.host),
-                totalBlocked: shields.totalBlocked
+                totalBlocked: shields.totalBlocked,
+                newPrivateTab: { withAnimation(anim(.snappy)) { tabs.newTab(slot: slot, isPrivate: true) } },
+                history: { historyPane = p; sheet = .history },
+                privateLocked: privateLocked,
+                unlockPrivate: unlockPrivate
             ),
             compact: compact,
             atTop: atTop,
             safeTop: safeTop,
             bottomInset: bottomInset,
-            trailingRoom: atTop ? 136 : 0
+            trailingRoom: 0
         )
         .id(id)
     }
@@ -2958,7 +3938,9 @@ struct ContentView: View {
         case .settings: SettingsView(sites: sites, shields: shields, themes: themes, openVault: { sheet = .vault }, openVPN: { sheet = .vpn })
         case .calendar: EventEditor(title: calTitle, url: calURL).ignoresSafeArea()
         case .vpn: VPNView(vpn: vpnService)
-        case .tabs: TabsView(tabs: tabs)
+        case .tabs: TabsView(tabs: tabs, startPrivate: leftIsPrivate, privateLocked: privateLocked, unlock: unlockPrivate)
+        case .history:
+            HistoryView(history: history, sites: sites) { text in historyPane?.load(text) }
         case .shields:
             if let p = shieldsPane {
                 ShieldsView(shields: shields, pane: p).presentationDetents([.medium, .large])
@@ -2969,8 +3951,17 @@ struct ContentView: View {
     // MARK: Behaviour
 
     private func configure(_ p: Pane) {
-        p.onCredential = { pending = $0 }
+        p.onCredential = { login in
+            if autoSave {
+                vault.upsert(login)
+                showToast("Password saved for \(Sites.clean(login.site))")
+            } else {
+                pending = login
+            }
+        }
         p.onVisit = { sites.record($0) }
+        p.onPageLoaded = { url, title in history.addVisit(url, title: title) }
+        p.onSearch = { history.addSearch($0) }
         p.onLoginField = { [weak p] in
             guard let p, autoPrompt, !vault.match(host: p.host).isEmpty else { return }
             p.offerFill = true
@@ -3004,6 +3995,7 @@ struct ContentView: View {
     }
 
     private func applySaver() {
+        UIView.setAnimationsEnabled(!saver)   // also stops UIKit animations: sheets, menus, scrolling bounces
         Pane.fps = saver ? 30 : 0
         tabs.maxLive = saver ? 2 : 4
         tabs.allLive.forEach { $0.applyFPS() }
