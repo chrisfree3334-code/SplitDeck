@@ -230,25 +230,29 @@ enum Orientation {
 // but once you turn the phone the screen follows it (portrait and both landscapes).
 final class FullVideo: ObservableObject {
     static let shared = FullVideo()
-    @Published private(set) var pane: UUID?
+    @Published private(set) var pane: UUID?      // overlay fullscreen: the app hides its bars for this tab
+    private(set) var active: UUID?                // any fullscreen video (also WebKit's own)
     private var wasPortrait = true
     private let motion = CMMotionManager()
     private var shown: UIInterfaceOrientationMask = .portrait
     private var first: UIInterfaceOrientationMask?   // how the phone was held when the video went fullscreen
     private var following = false
 
-    func changed(_ p: Pane, on: Bool, portraitVideo: Bool) {
+    func changed(_ p: Pane, on: Bool, portraitVideo: Bool, covers: Bool) {
         if on {
-            if pane == nil {
+            if active == nil {
                 wasPortrait = Orientation.isPortrait
                 first = nil
                 following = false
                 turn(portraitVideo || !Orientation.isPortrait ? Orientation.currentMask : .landscapeRight)
                 startMotion()
             }
-            pane = p.id
-        } else if pane == p.id {
-            pane = nil
+            active = p.id
+            let shownPane: UUID? = covers ? p.id : nil
+            if pane != shownPane { pane = shownPane }
+        } else if active == p.id {
+            active = nil
+            if pane != nil { pane = nil }
             motion.stopAccelerometerUpdates()
             Orientation.set(.allButUpsideDown, turnTo: wasPortrait ? .portrait : nil)
         }
@@ -263,7 +267,7 @@ final class FullVideo: ObservableObject {
         guard motion.isAccelerometerAvailable, !motion.isAccelerometerActive else { return }
         motion.accelerometerUpdateInterval = 0.1
         motion.startAccelerometerUpdates(to: .main) { [weak self] data, _ in
-            guard let self, self.pane != nil, let a = data?.acceleration,
+            guard let self, self.active != nil, let a = data?.acceleration,
                   UIApplication.shared.applicationState == .active else { return }
             // Gravity along the phone's sides: clearly landscape one way or the other, or clearly upright.
             // Flat on a table or in between: leave the screen as it is.
@@ -294,7 +298,7 @@ enum VideoFull {
         let d = UserDefaults.standard
         let on = d.object(forKey: "videoFull") as? Bool ?? true
         let glow = (d.object(forKey: "videoGlow") as? Bool ?? true) && !d.bool(forKey: "saver")
-        return "{\"on\":\(on),\"glow\":\(glow)}"
+        return "{\"on\":\(on),\"glow\":\(glow),\"el\":true}"
     }
     static var configJS: String { "window.__sdfsCfg&&window.__sdfsCfg(\(configJSON))" }
     static func script() -> String { source.replacingOccurrences(of: "__CFG__", with: configJSON) }
@@ -311,16 +315,18 @@ if(oSPM)P.webkitSetPresentationMode=function(m){if(this.ownerDocument===T.docume
 }catch(e){}
 return}
 var cfg=__CFG__;
-var cur=null,box=null,over=[],chain=[],back=null,cv=null,timer=0,y0=0,st=null,lastTap=0,auto=false,pipV=null;
+var cur=null,box=null,mode='',over=[],chain=[],back=null,cv=null,timer=0,y0=0,st=null,dyn=null,lastTap=0,auto=false,pipV=null,diagT=0;
 function post(m){try{webkit.messageHandlers.sdfs.postMessage(m)}catch(e){}}
 var FILL='position:fixed!important;inset:0!important;width:auto!important;height:auto!important;max-width:none!important;max-height:none!important;min-width:0!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;border-radius:0!important;transform:none!important;';
 function css(){if(st&&st.isConnected)return;st=document.createElement('style');st.textContent=
 '[data-sdfs-back]{'+FILL+'overflow:hidden!important;background:#000!important;z-index:2147483646!important;pointer-events:none!important;display:block!important}'+
-'[data-sdfs-back] canvas{position:absolute;left:-12%;top:-12%;width:124%;height:124%;filter:blur(40px) saturate(1.5);opacity:0;transition:opacity .8s ease}'+
+'[data-sdfs-glow]{position:absolute!important;left:-12%!important;top:-12%!important;width:124%!important;height:124%!important;max-width:none!important;max-height:none!important;margin:0!important;z-index:-1!important;pointer-events:none!important;filter:blur(40px) saturate(1.5);opacity:0;transition:opacity .8s ease;display:block!important}'+
 '[data-sdfs-box]{'+FILL+'overflow:hidden!important;background:transparent!important;z-index:2147483647!important;touch-action:manipulation!important}'+
+'[data-sdfs-el]{background:transparent!important;overflow:hidden!important;transform:none!important}'+
+'[data-sdfs-el]::backdrop{background:#000!important}'+
 '[data-sdfs-over]{'+FILL+'background:transparent!important;z-index:2147483647!important}'+
 '[data-sdfs-chain]{position:absolute!important;inset:0!important;width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;margin:0!important;padding:0!important;transform:none!important;background:transparent!important;border-radius:0!important}'+
-'video[data-sdfs-chain],video[data-sdfs-box]{object-fit:contain!important;background:transparent!important}';
+'video[data-sdfs-v]{object-fit:contain!important;background:transparent!important}';
 (document.head||document.documentElement).appendChild(st)}
 function rect(e){return e.getBoundingClientRect()}
 function pick(v){var r=rect(v),b=v,e=v,p;
@@ -337,47 +343,74 @@ return out}
 function lift(e){try{if(e.showPopover&&!e.hasAttribute('popover')){e.setAttribute('popover','manual');e.__sdp=1;e.showPopover()}}catch(x){}}
 function drop(e){try{if(e.__sdp){if(e.matches(':popover-open'))e.hidePopover();e.removeAttribute('popover');delete e.__sdp}}catch(x){}}
 function tap(){var n=Date.now();if(n-lastTap>250){lastTap=n;post({tap:1})}}
-function pm(){if(cur&&!auto&&cur.webkitPresentationMode==='picture-in-picture')exit()}
+function pm(){if(cur&&!auto&&mode==='pop'&&cur.webkitPresentationMode==='picture-in-picture')exit()}
 function fire(v,n){try{v.dispatchEvent(new Event(n))}catch(e){}}
 function resize(){try{dispatchEvent(new Event('resize'))}catch(e){}}
-function glow(v){
-cv=document.createElement('canvas');cv.width=48;cv.height=27;back.appendChild(cv);
+function fit(){if(!cur||!dyn)return;var v=cur,W=innerWidth,H=innerHeight,vw=v.videoWidth,vh=v.videoHeight;
+if(!vw||!vh||!W||!H){dyn.textContent='';return}
+var s=Math.min(W/vw,H/vh),w=Math.round(vw*s),h=Math.round(vh*s);
+dyn.textContent='video[data-sdfs-v]{position:'+(box===v?'fixed':'absolute')+'!important;inset:auto!important;left:'+Math.round((W-w)/2)+'px!important;top:'+Math.round((H-h)/2)+'px!important;width:'+w+'px!important;height:'+h+'px!important;max-width:none!important;max-height:none!important;margin:0!important;transform:none!important}'}
+function glow(v,host){unglow();
+cv=document.createElement('canvas');cv.width=48;cv.height=27;cv.setAttribute('data-sdfs-glow','');cv.setAttribute('aria-hidden','true');host.insertBefore(cv,host.firstChild);
 var c=cv.getContext('2d'),first=true;
 function draw(){if(!cur||!cv||v.readyState<2)return;try{c.globalAlpha=first?1:0.2;c.drawImage(v,0,0,48,27);if(first){first=false;cv.style.opacity='0.85'}}catch(e){}}
 timer=setInterval(function(){if(first||!v.paused)draw()},90);draw()}
 function unglow(){if(timer)clearInterval(timer);timer=0;if(cv&&cv.parentNode)cv.parentNode.removeChild(cv);cv=null}
-function enter(v){
-if(!cfg.on||cur)return false;
-var r=rect(v);if(r.width<2||r.height<2)return false;
-css();cur=v;box=pick(v);y0=scrollY;chain=[];
+function diag(v){clearTimeout(diagT);diagT=setTimeout(function(){if(cur!==v)return;var g='off';
+if(cv){try{var d=cv.getContext('2d').getImageData(0,0,48,27).data,s=0;for(var i=0;i<d.length;i+=4)s+=d[i]+d[i+1]+d[i+2];g=s/(d.length/4*3)<4?(v.paused?'paused':'black'):'ok'}catch(e){g='protected'}}
+post({diag:mode+'|'+g+'|'+v.videoWidth+'x'+v.videoHeight})},3000)}
+function begin(v){
+css();cur=v;y0=scrollY;chain=[];
 for(var e=v;e&&e!==box;e=e.parentElement){chain.push(e);e.setAttribute('data-sdfs-chain','')}
-over=box===v?[]:overlays(box);
+v.setAttribute('data-sdfs-v','');
+dyn=document.createElement('style');(document.head||document.documentElement).appendChild(dyn);
+try{Object.defineProperty(v,'webkitDisplayingFullscreen',{configurable:true,get:function(){return cur===v}})}catch(x){}
+v.addEventListener('webkitpresentationmodechanged',pm);v.addEventListener('resize',fit);v.addEventListener('loadedmetadata',fit);addEventListener('resize',fit);
+box.addEventListener('touchstart',tap,{passive:true,capture:true})}
+function announce(v){var r=rect(v),w=v.videoWidth||r.width,h=v.videoHeight||r.height;
+post({on:1,portrait:h>w,mode:mode});fit();
+fire(v,'webkitbeginfullscreen');resize();setTimeout(function(){fit();resize()},150);setTimeout(function(){fit();resize()},600);diag(v)}
+function layOver(v){
+mode='pop';over=box===v?[]:overlays(box);
 back=document.createElement('div');back.setAttribute('data-sdfs-back','');back.setAttribute('aria-hidden','true');
 (document.body||document.documentElement).appendChild(back);lift(back);
-if(cfg.glow)glow(v);
+if(cfg.glow)glow(v,back);
 box.setAttribute('data-sdfs-box','');
 if(box===v){v.__sdc=v.controls;v.controls=true}
 lift(box);
-over.forEach(function(o){o.setAttribute('data-sdfs-over','');lift(o);o.addEventListener('touchstart',tap,{passive:true,capture:true})});
-try{Object.defineProperty(v,'webkitDisplayingFullscreen',{configurable:true,get:function(){return cur===v}})}catch(x){}
-box.addEventListener('touchstart',tap,{passive:true,capture:true});
-v.addEventListener('webkitpresentationmodechanged',pm);
-var w=v.videoWidth||r.width,h=v.videoHeight||r.height;
-post({on:1,portrait:h>w});
-fire(v,'webkitbeginfullscreen');resize();setTimeout(resize,150);setTimeout(resize,600);
+over.forEach(function(o){o.setAttribute('data-sdfs-over','');lift(o);o.addEventListener('touchstart',tap,{passive:true,capture:true})})}
+function enter(v){
+if(!cfg.on||cur)return false;
+var r=rect(v);if(r.width<2||r.height<2)return false;
+box=pick(v);begin(v);
+if(cfg.el&&box!==v&&box.requestFullscreen&&document.fullscreenEnabled){
+mode='el';box.setAttribute('data-sdfs-el','');if(cfg.glow)glow(v,box);
+var fail=function(){if(cur===v&&mode==='el'&&document.fullscreenElement!==box){box.removeAttribute('data-sdfs-el');unglow();layOver(v);announce(v)}};
+try{var pr=box.requestFullscreen();if(pr&&pr.catch)pr.catch(fail)}catch(x){fail();return true}
+}else layOver(v);
+announce(v);
 return true}
-function exit(){
-if(!cur)return;var v=cur,b=box,o=over;cur=null;box=null;over=[];auto=false;
+function relayer(){if(!cur||mode!=='pop')return;
+[back,box].concat(over).forEach(function(e){if(e){drop(e);lift(e)}});fit();resize()}
+function exit(fromFS){
+if(!cur)return;var v=cur,b=box,o=over,m=mode;cur=null;box=null;over=[];mode='';auto=false;clearTimeout(diagT);
 unglow();
-o.forEach(function(e){drop(e);e.removeAttribute('data-sdfs-over');e.removeEventListener('touchstart',tap,true)});
-drop(b);b.removeAttribute('data-sdfs-box');b.removeEventListener('touchstart',tap,true);
+if(m==='el'){b.removeAttribute('data-sdfs-el');if(!fromFS&&document.fullscreenElement){try{document.exitFullscreen()}catch(x){}}}
+else{o.forEach(function(e){drop(e);e.removeAttribute('data-sdfs-over');e.removeEventListener('touchstart',tap,true)});
+drop(b);b.removeAttribute('data-sdfs-box');
 if(back){drop(back);if(back.parentNode)back.parentNode.removeChild(back);back=null}
+if(b===v)v.controls=!!v.__sdc}
+b.removeEventListener('touchstart',tap,true);
 chain.forEach(function(e){e.removeAttribute('data-sdfs-chain')});chain=[];
-if(b===v)v.controls=!!v.__sdc;
-v.removeEventListener('webkitpresentationmodechanged',pm);
+v.removeAttribute('data-sdfs-v');if(dyn&&dyn.parentNode)dyn.parentNode.removeChild(dyn);dyn=null;
+v.removeEventListener('webkitpresentationmodechanged',pm);v.removeEventListener('resize',fit);v.removeEventListener('loadedmetadata',fit);removeEventListener('resize',fit);
 try{delete v.webkitDisplayingFullscreen}catch(x){}
 post({on:0});fire(v,'webkitendfullscreen');
-setTimeout(function(){resize();scrollTo(0,y0)},80)}
+setTimeout(function(){resize();if(m!=='el')scrollTo(0,y0)},80)}
+document.addEventListener('fullscreenchange',function(){var f=document.fullscreenElement;
+if(cur&&mode==='el'){if(f!==box)exit(true);return}
+if(!cur&&f&&cfg.on&&f.tagName!=='VIDEO'){var v=f.querySelector('video');
+if(v){box=f;begin(v);mode='el';box.setAttribute('data-sdfs-el','');if(cfg.glow)glow(v,box);announce(v)}}},true);
 P.webkitEnterFullscreen=P.webkitEnterFullScreen=function(){
 if(cur){if(cur===this)exit();return}
 if(enter(this))return;if(oEnter)return oEnter.apply(this,arguments)};
@@ -387,15 +420,16 @@ if(m==='fullscreen'){if(cur===this)return;if(!cur&&enter(this))return}
 else if(m==='inline'&&cur===this&&this.webkitPresentationMode!=='picture-in-picture'){exit();return}
 return oSPM.apply(this,arguments)};
 window.__sdfsFor=function(v,on){if(on){if(cur){if(cur===v)exit();return true}return enter(v)}if(cur===v){exit();return true}return false};
-window.__sdfsCfg=function(c){cfg=c;if(!cfg.on)exit();else if(cur&&!cfg.glow)unglow();else if(cur&&cfg.glow&&!cv&&back)glow(cur)};
-window.__sdfsExit=exit;
+window.__sdfsCfg=function(c){cfg=c;if(!cfg.on)exit();else if(cur&&!cfg.glow)unglow();else if(cur&&cfg.glow&&!cv)glow(cur,mode==='el'?box:back)};
+window.__sdfsExit=function(){exit()};
 function pipOn(){var v=cur||pipV;return !!(v&&v.webkitPresentationMode==='picture-in-picture')}
 window.__sdfsPip=function(a){var v=cur||document.querySelector('video');
 if(!oSPM||!v||!v.webkitSupportsPresentationMode||!v.webkitSupportsPresentationMode('picture-in-picture'))return false;
 if(a&&(!cur||v.paused))return false;
 auto=!!a;pipV=v;oSPM.call(v,'picture-in-picture');return true};
-window.__sdfsBack=function(){var v=pipV;if(!auto||!v)return;auto=false;pipV=null;
-if(v.webkitPresentationMode==='picture-in-picture'){try{oSPM.call(v,'inline')}catch(e){}}};
+window.__sdfsBack=function(){var v=pipV;
+if(auto&&v){auto=false;pipV=null;if(v.webkitPresentationMode==='picture-in-picture'){try{oSPM.call(v,'inline')}catch(e){}}}
+setTimeout(relayer,300)};
 try{
 var dp=Document.prototype,hd=Object.getOwnPropertyDescriptor(dp,'hidden'),vs=Object.getOwnPropertyDescriptor(dp,'visibilityState');
 if(hd&&hd.get)Object.defineProperty(document,'hidden',{configurable:true,get:function(){return pipOn()?false:hd.get.call(document)}});
@@ -1087,6 +1121,15 @@ struct VPNView: View {
 
 // MARK: One browser pane
 
+// Drives the address bar's glide without the display link keeping the tab alive.
+final class BarLinkProxy: NSObject {
+    weak var pane: Pane?
+    init(_ p: Pane) { pane = p }
+    @objc func tick(_ link: CADisplayLink) {
+        if let pane { pane.barTick(link) } else { link.invalidate() }
+    }
+}
+
 final class WeakHandler: NSObject, WKScriptMessageHandler {
     weak var target: WKScriptMessageHandler?
     init(_ t: WKScriptMessageHandler) { target = t }
@@ -1100,27 +1143,28 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     let isPrivate: Bool
     let webView: WKWebView
     @Published var address = ""
-    // How far the address bar has folded into its pill: 0 the full bar, 1 the pill. It follows the page
-    // as you scroll, then settles at one end.
-    @Published var barProgress: CGFloat = 0
-    // Fully folded. Setting it moves the bar there with the bar's own animation.
+    // How far the address bar has folded into its pill: 0 the full bar, 1 the pill. Scrolling sets where
+    // it's heading (barTarget); what you see (barProgress) glides after it, eased and never faster than a
+    // full fold in `foldTime`, so even a quick flick folds the bar at a calm, steady pace.
+    @Published private(set) var barProgress: CGFloat = 0
+    private var barTarget: CGFloat = 0
+    private var barLink: CADisplayLink?
+    private var barLast: CFTimeInterval = 0
+    // Fully folded (or heading there). Setting it sends the bar to that end.
     var collapsed: Bool {
-        get { barProgress >= 0.5 }
-        set {
-            let v: CGFloat = newValue ? 1 : 0
-            guard barProgress != v else { return }
-            if Pane.minimizeBars { withAnimation(Pane.barMotion) { barProgress = v } } else { barProgress = v }
-        }
+        get { barTarget >= 0.5 }
+        set { setBarTarget(newValue ? 1 : 0) }
     }
-    // No bounce, a soft finish (Safari-like).
-    static let barMotion = Animation.spring(response: 0.5, dampingFraction: 0.94)
-    // Scrolling this far moves the bar all the way between bar and pill.
-    static let pullDistance: CGFloat = 110
+    // Scrolling this far sends the bar all the way between bar and pill.
+    static let pullDistance: CGFloat = 150
+    // The quickest a full fold (or unfold) can play.
+    static let foldTime: Double = 0.6
     private var lastDir: CGFloat = 1
     private var settleTick = 0
     @Published var tucked = false      // split view bar swiped into a thin pill
     @Published private(set) var videoFull = false   // a video is in SplitDeck's fullscreen
     @Published private(set) var videoTap = 0        // touches on that video (shows the close / PiP buttons)
+    private var elementFull = false                  // a video is in WebKit's own (element) fullscreen
     @Published var canBack = false
     @Published var canForward = false
     @Published var host = ""
@@ -1198,6 +1242,9 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         config.applicationNameForUserAgent = "Version/\(ProcessInfo.processInfo.operatingSystemVersion.majorVersion).0 Mobile/15E148 Safari/604.1"
         Pane.installScripts(config.userContentController, youtube: false)
         WebFrameRate.unlock(config.preferences, on: !UserDefaults.standard.bool(forKey: "saver"))
+        // WebKit's own fullscreen for page elements: SplitDeck Fullscreen puts the site's whole player in it
+        // (controls and all), which also gives proper picture in picture and background handling.
+        config.preferences.isElementFullscreenEnabled = UserDefaults.standard.object(forKey: "videoFull") as? Bool ?? true
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.allowsBackForwardNavigationGestures = true
         wv.scrollView.contentInsetAdjustmentBehavior = .never   // the floating bars set the insets
@@ -1229,13 +1276,13 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
                 // The bar follows your finger: it folds as the page moves up and unfolds as it comes back down.
                 // Near the top of the page it stays open.
                 let room = y > 20 || dy < 0
-                let p = room ? min(1, max(0, self.barProgress + dy / Pane.pullDistance)) : self.barProgress
-                if abs(p - self.barProgress) > 0.002 || (p != self.barProgress && (p == 0 || p == 1)) {
-                    self.barProgress = p
+                if room {
+                    let t = min(1, max(0, self.barTarget + dy / Pane.pullDistance))
+                    if t != self.barTarget { self.setBarTarget(t) }
+                    if t > 0 && t < 1 { self.scheduleSettle() }
                 }
-                if p > 0 && p < 1 { self.scheduleSettle() }
             }
-            if y <= 0 && self.barProgress > 0 && unlocked && !sv.isDecelerating { self.collapsed = false }
+            if y <= 0 && self.barTarget > 0 && unlocked && !sv.isDecelerating { self.collapsed = false }
         }
         loadObs = wv.observe(\.isLoading, options: [.new]) { [weak self] w, _ in
             DispatchQueue.main.async { self?.loading = w.isLoading }
@@ -1267,7 +1314,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
 
     func goHome() {
         if hiding { stopHiding() }
-        if videoFull { exitVideoFull() }
+        if videoFull || elementFull { exitVideoFull() }
         webView.evaluateJavaScript("document.querySelectorAll('video,audio').forEach(function(m){m.pause()})")
         isHome = true
         collapsed = false
@@ -1303,7 +1350,8 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     func applyFPS() { webView.evaluateJavaScript("window.__sdFps=\(Pane.fps)") }
 
     func sleep() {
-        if videoFull { setVideoFull(false) }
+        stopBarLink()
+        if videoFull || elementFull { setVideoFull(false) }
         webView.stopLoading()
         webView.configuration.userContentController.removeAllScriptMessageHandlers()
         webView.removeFromSuperview()
@@ -1353,6 +1401,42 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         canForward = webView.canGoForward
     }
 
+    private func setBarTarget(_ t: CGFloat) {
+        let t = min(1, max(0, t))
+        barTarget = t
+        guard Pane.minimizeBars else {
+            stopBarLink()
+            if barProgress != t { barProgress = t }
+            return
+        }
+        guard barProgress != t, barLink == nil else { return }
+        let link = CADisplayLink(target: BarLinkProxy(self), selector: #selector(BarLinkProxy.tick(_:)))
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 120, preferred: 120)
+        link.add(to: .main, forMode: .common)
+        barLink = link
+        barLast = 0
+    }
+    private func stopBarLink() {
+        barLink?.invalidate()
+        barLink = nil
+        barLast = 0
+    }
+    // One frame of the glide: ease towards the target, capped in speed.
+    func barTick(_ link: CADisplayLink) {
+        let now = link.timestamp
+        let dt = barLast == 0 ? 1.0 / 120 : min(1.0 / 30, now - barLast)
+        barLast = now
+        let diff = barTarget - barProgress
+        if abs(diff) < 0.002 {
+            barProgress = barTarget
+            stopBarLink()
+            return
+        }
+        let cap = CGFloat(dt / Pane.foldTime)
+        let step = max(-cap, min(cap, diff * CGFloat(min(1, dt * 7))))
+        barProgress += step
+    }
+
     // Let go part-way through a pull: the bar finishes the move in the direction you were scrolling
     // (if it had gone more than a quarter of the way), so it never rests half folded.
     private func scheduleSettle() {
@@ -1361,7 +1445,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { [weak self] in
             guard let self, t == self.settleTick else { return }
             if self.webView.scrollView.isTracking { self.scheduleSettle(); return }
-            let p = self.barProgress
+            let p = self.barTarget
             guard p > 0 && p < 1 else { return }
             self.collapsed = self.lastDir > 0 ? p > 0.25 : p > 0.75
             self.barLockUntil = CACurrentMediaTime() + 0.3
@@ -1476,7 +1560,12 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
         if m.name == "sdfs", let d = m.body as? [String: Any] {
             if d["tap"] != nil { videoTap &+= 1; return }
-            setVideoFull((d["on"] as? Int ?? 0) == 1, portrait: (d["portrait"] as? Bool) ?? false)
+            if let diag = d["diag"] as? String {
+                UserDefaults.standard.set("\(host)|\(diag)", forKey: "fsDiag")
+                return
+            }
+            setVideoFull((d["on"] as? Int ?? 0) == 1, portrait: (d["portrait"] as? Bool) ?? false,
+                         covers: (d["mode"] as? String) != "el")
             return
         }
         if m.name == "hide" {
@@ -1527,7 +1616,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-        if videoFull { setVideoFull(false) }
+        if videoFull || elementFull { setVideoFull(false) }
         webView.evaluateJavaScript("window.__sdFps=\(Pane.fps)")
         if translated || foreignLanguage != nil || translating { translated = false; foreignLanguage = nil; translating = false }
         let committed = webView.url?.host ?? ""
@@ -1573,14 +1662,20 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
 
     // MARK: Fullscreen video
 
-    private func setVideoFull(_ on: Bool, portrait: Bool = false) {
-        guard on != videoFull else { return }
-        videoFull = on
-        // The page behind the video stays put: no scrolling, no back / forward swipes.
-        webView.scrollView.isScrollEnabled = !on
-        webView.allowsBackForwardNavigationGestures = !on
-        if on { collapsed = false }
-        FullVideo.shared.changed(self, on: on, portraitVideo: portrait)
+    // covers: SplitDeck's overlay fullscreen (the app hides its own bars). WebKit's fullscreen (covers false)
+    // has its own window over everything, so only the rotation is ours to handle.
+    private func setVideoFull(_ on: Bool, portrait: Bool = false, covers: Bool = true) {
+        let was = videoFull || elementFull
+        let overlay = on && covers
+        if overlay != videoFull {
+            videoFull = overlay
+            // The page behind the video stays put: no scrolling, no back / forward swipes.
+            webView.scrollView.isScrollEnabled = !overlay
+            webView.allowsBackForwardNavigationGestures = !overlay
+            if overlay { collapsed = false }
+        }
+        elementFull = on && !covers
+        if on || was { FullVideo.shared.changed(self, on: on, portraitVideo: portrait, covers: covers) }
     }
     func exitVideoFull() {
         webView.evaluateJavaScript("window.__sdfsExit&&window.__sdfsExit()")
@@ -3546,28 +3641,33 @@ struct PaneView: View {
     }
 
     // Split view toggle, always in the bar (the edge island has its own too).
-    private var splitButton: some View {
+    // Bottom toolbar row: buttons a size up, sharing the width evenly.
+    private var toolH: CGFloat { 50 }
+
+    private func splitButton(big: Bool = false) -> some View {
         Button { actions.toggleSplit() } label: {
             Image(systemName: actions.splitOn ? "rectangle.split.1x2.fill" : "rectangle.split.1x2")
-                .font(.system(size: compact ? 12 : 15, weight: .semibold))
+                .font(.system(size: big ? 20 : (compact ? 12 : 15), weight: .semibold))
                 .foregroundStyle(ink)
-                .frame(width: compact ? 32 : 42, height: barH)
+                .frame(maxWidth: big ? .infinity : nil)
+                .frame(width: big ? nil : (compact ? 32 : 42), height: big ? toolH : barH)
                 .contentShape(Rectangle())
         }
         .accessibilityLabel(actions.splitOn ? "Close split view" : "Split view")
     }
 
     // Tab count in the full-screen bar (split view keeps it in the edge dock to save room).
-    private var tabsButton: some View {
+    private func tabsButton(big: Bool = false) -> some View {
         Button { actions.openTabs() } label: {
             Text("\(actions.tabCount)")
-                .font(.system(size: 12, weight: .bold))
+                .font(.system(size: big ? 14 : 12, weight: .bold))
                 .monospacedDigit()
                 .foregroundStyle(ink)
-                .frame(minWidth: 19, minHeight: 19)
+                .frame(minWidth: big ? 23 : 19, minHeight: big ? 23 : 19)
                 .padding(.horizontal, 1)
-                .overlay(RoundedRectangle(cornerRadius: 5, style: .continuous).stroke(ink, lineWidth: 1.5))
-                .frame(width: 34, height: barH)
+                .overlay(RoundedRectangle(cornerRadius: big ? 6 : 5, style: .continuous).stroke(ink, lineWidth: big ? 1.8 : 1.5))
+                .frame(maxWidth: big ? .infinity : nil)
+                .frame(width: big ? nil : 34, height: big ? toolH : barH)
                 .contentShape(Rectangle())
         }
         .accessibilityLabel("\(actions.tabCount) tabs")
@@ -3600,16 +3700,16 @@ struct PaneView: View {
     }
 
     // Toolbar layout: the buttons get their own row, spread out like Safari's classic bar.
+    // Back and forward live in the address bar; the rest share this row, a size up.
     private var toolbar: some View {
         HStack(spacing: 0) {
-            icon("chevron.left", enabled: pane.backEnabled) { pane.back() }.frame(maxWidth: .infinity)
-            icon("chevron.right", enabled: pane.forwardEnabled) { pane.forward() }.frame(maxWidth: .infinity)
-            shareButton.frame(maxWidth: .infinity)
-            tabsButton.frame(maxWidth: .infinity)
-            AnyView(menu).frame(maxWidth: .infinity)
-            if actions.splitEnabled { splitButton.frame(maxWidth: .infinity) }
+            shareButton
+            tabsButton(big: true)
+            AnyView(menu(big: true))
+            if actions.splitEnabled { splitButton(big: true) }
         }
-        .frame(height: 46)
+        .padding(.horizontal, 6)
+        .frame(height: toolH)
         .simultaneousGesture(TapGesture().onEnded { touched() })
     }
 
@@ -3618,17 +3718,19 @@ struct PaneView: View {
             if let url = pane.webView.url, !pane.isHome {
                 ShareLink(item: url, subject: Text(pane.title)) {
                     Image(systemName: "square.and.arrow.up")
-                        .font(.system(size: 18, weight: .semibold))
+                        .font(.system(size: 21, weight: .semibold))
                         .foregroundStyle(ink)
-                        .frame(width: iconW, height: 46)
+                        .frame(maxWidth: .infinity)
+                        .frame(height: toolH)
                         .contentShape(Rectangle())
                 }
             } else {
                 Image(systemName: "square.and.arrow.up")
-                    .font(.system(size: 18, weight: .semibold))
+                    .font(.system(size: 21, weight: .semibold))
                     .foregroundStyle(ink)
                     .opacity(0.35)
-                    .frame(width: iconW, height: 46)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: toolH)
             }
         }
         .accessibilityLabel("Share")
@@ -3658,7 +3760,7 @@ struct PaneView: View {
                     .padding(.top, 8)
                     .opacity(Double(max(0, 1 - p * 2.2)))
                     .offset(y: 26 * p)
-                    .frame(height: 54 * (1 - p), alignment: .top)
+                    .frame(height: (toolH + 8) * (1 - p), alignment: .top)
                     .allowsHitTesting(p < 0.3)
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
@@ -3807,10 +3909,10 @@ struct PaneView: View {
                     icon("arrow.left.arrow.right") { actions.swapTabs() }
                         .accessibilityLabel("Switch to last tab")
                 }
-                if !compact || !actions.islandShown { tabsButton }
-                AnyView(menu)
+                if !compact || !actions.islandShown { tabsButton() }
+                AnyView(menu())
                 // Last, so it sits bottom right in full screen and in split view alike.
-                if actions.splitEnabled && splitHere { splitButton }
+                if actions.splitEnabled && splitHere { splitButton() }
             }
         }
         .frame(height: max(0, barH + (pillH - barH) * p - 6))
@@ -3851,21 +3953,11 @@ struct PaneView: View {
     // One capsule that changes shape between the full bar and the small pill, following the pull.
     // The capsule never cross-fades: it narrows around the name while the buttons fade into it, and
     // grows back out when you tap it, even while the page is still moving.
-    private var fieldInset: CGFloat { focused || toolbarLayout ? (compact ? 14 : 18) : 8 }
+    private var fieldInset: CGFloat { focused ? (compact ? 14 : 18) : 8 }
 
     private var mainBar: some View {
         AnyView(BarRow(p: p, pillPad: compact ? 7 : 10, labelScale: labelScale, fieldInset: fieldInset, gap: compact ? 3 : 4) {
-            if showEnds && toolbarLayout && pane.isPrivate {
-                Image(systemName: "eye.slash.fill")
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundStyle(ink)
-                    .opacity(0.8 * endFade)
-                    .padding(.leading, 16)
-                    .accessibilityLabel("Private tab")
-                    .transition(.opacity)
-                    .layoutValue(key: BarRow.RoleKey.self, value: .leading)
-            }
-            if showEnds && !toolbarLayout {
+            if showEnds {
                 leadingEnd
                     .opacity(endFade)
                     .allowsHitTesting(p < 0.3)
@@ -3931,7 +4023,7 @@ struct PaneView: View {
         .transition(.opacity)
     }
 
-    private var menu: some View {
+    private func menu(big: Bool = false) -> some View {
         Menu {
             ControlGroup {
                 Button { actions.settings() } label: { Label("Settings", systemImage: "gearshape") }
@@ -4005,9 +4097,10 @@ struct PaneView: View {
             }
         } label: {
             Image(systemName: "ellipsis")
-                .font(.system(size: compact ? 14 : 16, weight: .semibold))
+                .font(.system(size: big ? 21 : (compact ? 14 : 16), weight: .semibold))
                 .foregroundStyle(ink)
-                .frame(width: iconW, height: barH)
+                .frame(maxWidth: big ? .infinity : nil)
+                .frame(width: big ? nil : iconW, height: big ? toolH : barH)
                 .contentShape(Rectangle())
         }
         .environment(\.colorScheme, sys)
@@ -5333,6 +5426,24 @@ struct MediaSection: View {
     @AppStorage("videoFull") private var videoFull = true
     @AppStorage("videoGlow") private var videoGlow = true
     @AppStorage("saver") private var saver = false
+    @AppStorage("fsDiag") private var fsDiag = ""
+
+    // The last fullscreen video: which fullscreen it used and whether the glow could copy it.
+    private var diagText: String? {
+        let parts = fsDiag.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count >= 3 else { return nil }
+        let how = parts[1] == "el" ? "WebKit fullscreen" : "SplitDeck overlay"
+        let glow: String
+        switch parts[2] {
+        case "ok": glow = "glow working"
+        case "black": glow = "glow got a black picture from this video"
+        case "protected": glow = "glow can't read this video"
+        case "paused": glow = "video was paused"
+        default: glow = "glow off"
+        }
+        let site = parts[0].replacingOccurrences(of: "www.", with: "")
+        return "Last fullscreen video\(site.isEmpty ? "" : " (\(site))"): \(how), \(glow)."
+    }
 
     private func row(_ title: String, _ detail: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {
@@ -5377,7 +5488,7 @@ struct MediaSection: View {
         } header: {
             Text("Media")
         } footer: {
-            Text("Changes apply to open tabs straight away.")
+            Text("Changes apply to open tabs straight away." + (diagText.map { "\n\n" + $0 } ?? ""))
         }
     }
 }
@@ -7440,7 +7551,7 @@ struct ContentView: View {
         // Swiping home with a video playing fullscreen pops it out into picture in picture. This is the
         // earliest moment the app hears about it, while iOS still lets picture in picture start.
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
-            videoPane?.startPiP(auto: true)
+            if let id = FullVideo.shared.active, tabs.visible.contains(id) { tabs.pane(id).startPiP(auto: true) }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
             tabs.sleepHidden()
