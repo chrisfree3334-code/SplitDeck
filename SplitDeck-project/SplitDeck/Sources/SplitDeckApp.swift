@@ -12,11 +12,9 @@ import EventKitUI
 import NetworkExtension
 import Network
 import PhotosUI
-import CoreMotion
 
 @main
 struct SplitDeckApp: App {
-    @UIApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     init() {
         // Defaults applied once on upgrade; your own changes after that are kept.
         // 1.2: split view button in the bar (island off). 1.3: transparent (glass) bars.
@@ -29,10 +27,11 @@ struct SplitDeckApp: App {
             d.set(0, forKey: "barStyle")
             d.set(true, forKey: "defaults-1.3")
         }
-        // 1.3.1: buttons in a row under the address bar, like Safari.
-        if !d.bool(forKey: "defaults-1.3.1") {
-            d.set("toolbar", forKey: "barLayout")
+        // 1.3.2: one two-tone bar with every button in it.
+        if !d.bool(forKey: "defaults-1.3.2") {
+            d.set("twoTone", forKey: "barLayout")
             d.set(true, forKey: "defaults-1.3.1")
+            d.set(true, forKey: "defaults-1.3.2")
         }
     }
     var body: some Scene { WindowGroup { ContentView() } }
@@ -191,300 +190,6 @@ enum WebFrameRate {
                 set(prefs, setSel, !on, f)
             }
         }
-    }
-}
-
-// MARK: Fullscreen video
-
-// Lets fullscreen video hold the screen in landscape, whatever the rotation lock says.
-final class AppDelegate: NSObject, UIApplicationDelegate {
-    static var mask: UIInterfaceOrientationMask = .allButUpsideDown
-    func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
-        AppDelegate.mask
-    }
-}
-
-enum Orientation {
-    private static var scene: UIWindowScene? {
-        UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
-    }
-    static var isPortrait: Bool { scene?.effectiveGeometry.interfaceOrientation.isPortrait ?? true }
-    static var currentMask: UIInterfaceOrientationMask {
-        switch scene?.effectiveGeometry.interfaceOrientation {
-        case .landscapeLeft: return .landscapeLeft
-        case .landscapeRight: return .landscapeRight
-        default: return .portrait
-        }
-    }
-    static func set(_ mask: UIInterfaceOrientationMask, turnTo: UIInterfaceOrientationMask?) {
-        AppDelegate.mask = mask
-        guard let s = scene else { return }
-        s.keyWindow?.rootViewController?.setNeedsUpdateOfSupportedInterfaceOrientations()
-        if let turnTo { s.requestGeometryUpdate(.iOS(interfaceOrientations: turnTo)) { _ in } }
-    }
-}
-
-// Which tab is showing a video in SplitDeck's fullscreen. The screen hides its bars and turns with the
-// phone, like the YouTube app: the accelerometer says which way up it's held, so it works with rotation
-// lock on. Landscape videos start in landscape; holding the phone upright doesn't turn them straight back,
-// but once you turn the phone the screen follows it (portrait and both landscapes).
-final class FullVideo: ObservableObject {
-    static let shared = FullVideo()
-    @Published private(set) var pane: UUID?      // overlay fullscreen: the app hides its bars for this tab
-    private(set) var active: UUID?                // any fullscreen video (also WebKit's own)
-    private var wasPortrait = true
-    private let motion = CMMotionManager()
-    private var shown: UIInterfaceOrientationMask = .portrait
-    private var first: UIInterfaceOrientationMask?   // how the phone was held when the video went fullscreen
-    private var following = false
-
-    func changed(_ p: Pane, on: Bool, portraitVideo: Bool, covers: Bool) {
-        if on {
-            if active == nil {
-                wasPortrait = Orientation.isPortrait
-                first = nil
-                following = false
-                turn(portraitVideo || !Orientation.isPortrait ? Orientation.currentMask : .landscapeRight)
-                startMotion()
-            }
-            active = p.id
-            let shownPane: UUID? = covers ? p.id : nil
-            if pane != shownPane { pane = shownPane }
-        } else if active == p.id {
-            active = nil
-            if pane != nil { pane = nil }
-            motion.stopAccelerometerUpdates()
-            Orientation.set(.allButUpsideDown, turnTo: wasPortrait ? .portrait : nil)
-        }
-    }
-
-    private func turn(_ m: UIInterfaceOrientationMask) {
-        shown = m
-        Orientation.set(m, turnTo: m)
-    }
-
-    private func startMotion() {
-        guard motion.isAccelerometerAvailable, !motion.isAccelerometerActive else { return }
-        motion.accelerometerUpdateInterval = 0.1
-        motion.startAccelerometerUpdates(to: .main) { [weak self] data, _ in
-            guard let self, self.active != nil, let a = data?.acceleration,
-                  UIApplication.shared.applicationState == .active else { return }
-            // Gravity along the phone's sides: clearly landscape one way or the other, or clearly upright.
-            // Flat on a table or in between: leave the screen as it is.
-            let held: UIInterfaceOrientationMask
-            if abs(a.x) > 0.6 && abs(a.x) > abs(a.y) * 1.4 {
-                held = a.x < 0 ? .landscapeRight : .landscapeLeft
-            } else if a.y < -0.6 && abs(a.y) > abs(a.x) * 1.4 {
-                held = .portrait
-            } else { return }
-            if !self.following {
-                if self.first == nil { self.first = held }
-                // Still held upright as when you tapped fullscreen: keep the landscape video landscape.
-                if held == .portrait && self.first == .portrait && self.shown != .portrait { return }
-                self.following = true
-            }
-            if held != self.shown { self.turn(held) }
-        }
-    }
-}
-
-// SplitDeck's own fullscreen for videos on every site. The site keeps its player and controls: the
-// player is lifted above the page (the browser's top layer) and stretched over the whole screen, and the
-// iPhone player is used only when that isn't possible (videos inside embedded frames) or it's switched off.
-// Ambient glow: a tiny copy of the current frame, redrawn about ten times a second and heavily blurred,
-// fills the space around the video. Videos that can't be copied (protected ones) simply get black bars.
-enum VideoFull {
-    static var configJSON: String {
-        let d = UserDefaults.standard
-        let on = d.object(forKey: "videoFull") as? Bool ?? true
-        let glow = (d.object(forKey: "videoGlow") as? Bool ?? true) && !d.bool(forKey: "saver")
-        return "{\"on\":\(on),\"glow\":\(glow),\"el\":true}"
-    }
-    static var configJS: String { "window.__sdfsCfg&&window.__sdfsCfg(\(configJSON))" }
-    static func script() -> String { source.replacingOccurrences(of: "__CFG__", with: configJSON) }
-
-    static let source = #"""
-(function(){
-if(window.__sdfsCfg)return;
-var P=HTMLVideoElement.prototype,oEnter=P.webkitEnterFullscreen,oExit=P.webkitExitFullscreen,oSPM=P.webkitSetPresentationMode;
-if(window.top!==window){
-try{var T=window.top;if(!T.__sdfsFor)return;
-P.webkitEnterFullscreen=P.webkitEnterFullScreen=function(){if(this.ownerDocument===T.document&&T.__sdfsFor(this,1))return;if(oEnter)return oEnter.apply(this,arguments)};
-P.webkitExitFullscreen=P.webkitExitFullScreen=function(){if(this.ownerDocument===T.document&&T.__sdfsFor(this,0))return;if(oExit)return oExit.apply(this,arguments)};
-if(oSPM)P.webkitSetPresentationMode=function(m){if(this.ownerDocument===T.document&&(m==='fullscreen'||m==='inline')&&T.__sdfsFor(this,m==='fullscreen'?1:0))return;return oSPM.apply(this,arguments)};
-}catch(e){}
-return}
-var cfg=__CFG__;
-var cur=null,box=null,mode='',over=[],chain=[],back=null,cv=null,timer=0,y0=0,st=null,dyn=null,lastTap=0,auto=false,pipV=null,diagT=0;
-function post(m){try{webkit.messageHandlers.sdfs.postMessage(m)}catch(e){}}
-var FILL='position:fixed!important;inset:0!important;width:auto!important;height:auto!important;max-width:none!important;max-height:none!important;min-width:0!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;border-radius:0!important;transform:none!important;';
-function css(){if(st&&st.isConnected)return;st=document.createElement('style');st.textContent=
-'[data-sdfs-back]{'+FILL+'overflow:hidden!important;background:#000!important;z-index:2147483646!important;pointer-events:none!important;display:block!important}'+
-'[data-sdfs-glow]{position:absolute!important;left:-12%!important;top:-12%!important;width:124%!important;height:124%!important;max-width:none!important;max-height:none!important;margin:0!important;z-index:-1!important;pointer-events:none!important;filter:blur(40px) saturate(1.5);opacity:0;transition:opacity .8s ease;display:block!important}'+
-'[data-sdfs-box]{'+FILL+'overflow:hidden!important;background:transparent!important;z-index:2147483647!important;touch-action:manipulation!important}'+
-'[data-sdfs-el]{background:transparent!important;overflow:hidden!important;transform:none!important}'+
-'[data-sdfs-el]::backdrop{background:#000!important}'+
-'[data-sdfs-over]{'+FILL+'background:transparent!important;z-index:2147483647!important}'+
-'[data-sdfs-chain]{position:absolute!important;inset:0!important;width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;margin:0!important;padding:0!important;transform:none!important;background:transparent!important;border-radius:0!important}'+
-'video[data-sdfs-v]{object-fit:contain!important;background:transparent!important}';
-(document.head||document.documentElement).appendChild(st)}
-function rect(e){return e.getBoundingClientRect()}
-function pick(v){var r=rect(v),b=v,e=v,p;
-while((p=e.parentElement)&&p!==document.body&&p!==document.documentElement){var q=rect(p);
-if(q.width>r.width*1.2+40||q.height>r.height*1.2+80)break;b=p;e=p}
-return b}
-function overlays(b){var p=b.parentElement,out=[];if(!p||p===document.documentElement)return out;
-var r=rect(b),A=r.width*r.height;
-for(var c=p.firstElementChild;c;c=c.nextElementSibling){
-if(c===b||/^(SCRIPT|STYLE|LINK|TEMPLATE)$/.test(c.tagName))continue;var q=rect(c);if(q.width<2||q.height<2)continue;
-var ix=Math.max(0,Math.min(r.right,q.right)-Math.max(r.left,q.left)),iy=Math.max(0,Math.min(r.bottom,q.bottom)-Math.max(r.top,q.top));
-if(ix*iy>=0.7*A&&q.width*q.height<=A*1.6)out.push(c)}
-return out}
-function lift(e){try{if(e.showPopover&&!e.hasAttribute('popover')){e.setAttribute('popover','manual');e.__sdp=1;e.showPopover()}}catch(x){}}
-function drop(e){try{if(e.__sdp){if(e.matches(':popover-open'))e.hidePopover();e.removeAttribute('popover');delete e.__sdp}}catch(x){}}
-function tap(){var n=Date.now();if(n-lastTap>250){lastTap=n;post({tap:1})}}
-function pm(){if(cur&&!auto&&mode==='pop'&&cur.webkitPresentationMode==='picture-in-picture')exit()}
-function fire(v,n){try{v.dispatchEvent(new Event(n))}catch(e){}}
-function resize(){try{dispatchEvent(new Event('resize'))}catch(e){}}
-function fit(){if(!cur||!dyn)return;var v=cur,W=innerWidth,H=innerHeight,vw=v.videoWidth,vh=v.videoHeight;
-if(!vw||!vh||!W||!H){dyn.textContent='';return}
-var s=Math.min(W/vw,H/vh),w=Math.round(vw*s),h=Math.round(vh*s);
-dyn.textContent='video[data-sdfs-v]{position:'+(box===v?'fixed':'absolute')+'!important;inset:auto!important;left:'+Math.round((W-w)/2)+'px!important;top:'+Math.round((H-h)/2)+'px!important;width:'+w+'px!important;height:'+h+'px!important;max-width:none!important;max-height:none!important;margin:0!important;transform:none!important}'}
-function glow(v,host){unglow();
-cv=document.createElement('canvas');cv.width=48;cv.height=27;cv.setAttribute('data-sdfs-glow','');cv.setAttribute('aria-hidden','true');host.insertBefore(cv,host.firstChild);
-var c=cv.getContext('2d'),first=true;
-function draw(){if(!cur||!cv||v.readyState<2)return;try{c.globalAlpha=first?1:0.2;c.drawImage(v,0,0,48,27);if(first){first=false;cv.style.opacity='0.85'}}catch(e){}}
-timer=setInterval(function(){if(first||!v.paused)draw()},90);draw()}
-function unglow(){if(timer)clearInterval(timer);timer=0;if(cv&&cv.parentNode)cv.parentNode.removeChild(cv);cv=null}
-function diag(v){clearTimeout(diagT);diagT=setTimeout(function(){if(cur!==v)return;var g='off';
-if(cv){try{var d=cv.getContext('2d').getImageData(0,0,48,27).data,s=0;for(var i=0;i<d.length;i+=4)s+=d[i]+d[i+1]+d[i+2];g=s/(d.length/4*3)<4?(v.paused?'paused':'black'):'ok'}catch(e){g='protected'}}
-post({diag:mode+'|'+g+'|'+v.videoWidth+'x'+v.videoHeight})},3000)}
-function begin(v){
-css();cur=v;y0=scrollY;chain=[];
-for(var e=v;e&&e!==box;e=e.parentElement){chain.push(e);e.setAttribute('data-sdfs-chain','')}
-v.setAttribute('data-sdfs-v','');
-dyn=document.createElement('style');(document.head||document.documentElement).appendChild(dyn);
-try{Object.defineProperty(v,'webkitDisplayingFullscreen',{configurable:true,get:function(){return cur===v}})}catch(x){}
-v.addEventListener('webkitpresentationmodechanged',pm);v.addEventListener('resize',fit);v.addEventListener('loadedmetadata',fit);addEventListener('resize',fit);
-box.addEventListener('touchstart',tap,{passive:true,capture:true})}
-function announce(v){var r=rect(v),w=v.videoWidth||r.width,h=v.videoHeight||r.height;
-post({on:1,portrait:h>w,mode:mode});fit();
-fire(v,'webkitbeginfullscreen');resize();setTimeout(function(){fit();resize()},150);setTimeout(function(){fit();resize()},600);diag(v)}
-function layOver(v){
-mode='pop';over=box===v?[]:overlays(box);
-back=document.createElement('div');back.setAttribute('data-sdfs-back','');back.setAttribute('aria-hidden','true');
-(document.body||document.documentElement).appendChild(back);lift(back);
-if(cfg.glow)glow(v,back);
-box.setAttribute('data-sdfs-box','');
-if(box===v){v.__sdc=v.controls;v.controls=true}
-lift(box);
-over.forEach(function(o){o.setAttribute('data-sdfs-over','');lift(o);o.addEventListener('touchstart',tap,{passive:true,capture:true})})}
-function enter(v){
-if(!cfg.on||cur)return false;
-var r=rect(v);if(r.width<2||r.height<2)return false;
-box=pick(v);begin(v);
-if(cfg.el&&box!==v&&box.requestFullscreen&&document.fullscreenEnabled){
-mode='el';box.setAttribute('data-sdfs-el','');if(cfg.glow)glow(v,box);
-var fail=function(){if(cur===v&&mode==='el'&&document.fullscreenElement!==box){box.removeAttribute('data-sdfs-el');unglow();layOver(v);announce(v)}};
-try{var pr=box.requestFullscreen();if(pr&&pr.catch)pr.catch(fail)}catch(x){fail();return true}
-}else layOver(v);
-announce(v);
-return true}
-function relayer(){if(!cur||mode!=='pop')return;
-[back,box].concat(over).forEach(function(e){if(e){drop(e);lift(e)}});fit();resize()}
-function exit(fromFS){
-if(!cur)return;var v=cur,b=box,o=over,m=mode;cur=null;box=null;over=[];mode='';auto=false;clearTimeout(diagT);
-unglow();
-if(m==='el'){b.removeAttribute('data-sdfs-el');if(!fromFS&&document.fullscreenElement){try{document.exitFullscreen()}catch(x){}}}
-else{o.forEach(function(e){drop(e);e.removeAttribute('data-sdfs-over');e.removeEventListener('touchstart',tap,true)});
-drop(b);b.removeAttribute('data-sdfs-box');
-if(back){drop(back);if(back.parentNode)back.parentNode.removeChild(back);back=null}
-if(b===v)v.controls=!!v.__sdc}
-b.removeEventListener('touchstart',tap,true);
-chain.forEach(function(e){e.removeAttribute('data-sdfs-chain')});chain=[];
-v.removeAttribute('data-sdfs-v');if(dyn&&dyn.parentNode)dyn.parentNode.removeChild(dyn);dyn=null;
-v.removeEventListener('webkitpresentationmodechanged',pm);v.removeEventListener('resize',fit);v.removeEventListener('loadedmetadata',fit);removeEventListener('resize',fit);
-try{delete v.webkitDisplayingFullscreen}catch(x){}
-post({on:0});fire(v,'webkitendfullscreen');
-setTimeout(function(){resize();if(m!=='el')scrollTo(0,y0)},80)}
-document.addEventListener('fullscreenchange',function(){var f=document.fullscreenElement;
-if(cur&&mode==='el'){if(f!==box)exit(true);return}
-if(!cur&&f&&cfg.on&&f.tagName!=='VIDEO'){var v=f.querySelector('video');
-if(v){box=f;begin(v);mode='el';box.setAttribute('data-sdfs-el','');if(cfg.glow)glow(v,box);announce(v)}}},true);
-P.webkitEnterFullscreen=P.webkitEnterFullScreen=function(){
-if(cur){if(cur===this)exit();return}
-if(enter(this))return;if(oEnter)return oEnter.apply(this,arguments)};
-P.webkitExitFullscreen=P.webkitExitFullScreen=function(){if(cur===this){exit();return}if(oExit)return oExit.apply(this,arguments)};
-if(oSPM)P.webkitSetPresentationMode=function(m){
-if(m==='fullscreen'){if(cur===this)return;if(!cur&&enter(this))return}
-else if(m==='inline'&&cur===this&&this.webkitPresentationMode!=='picture-in-picture'){exit();return}
-return oSPM.apply(this,arguments)};
-window.__sdfsFor=function(v,on){if(on){if(cur){if(cur===v)exit();return true}return enter(v)}if(cur===v){exit();return true}return false};
-window.__sdfsCfg=function(c){cfg=c;if(!cfg.on)exit();else if(cur&&!cfg.glow)unglow();else if(cur&&cfg.glow&&!cv)glow(cur,mode==='el'?box:back)};
-window.__sdfsExit=function(){exit()};
-function pipOn(){var v=cur||pipV;return !!(v&&v.webkitPresentationMode==='picture-in-picture')}
-window.__sdfsPip=function(a){var v=cur||document.querySelector('video');
-if(!oSPM||!v||!v.webkitSupportsPresentationMode||!v.webkitSupportsPresentationMode('picture-in-picture'))return false;
-if(a&&(!cur||v.paused))return false;
-auto=!!a;pipV=v;oSPM.call(v,'picture-in-picture');return true};
-window.__sdfsBack=function(){var v=pipV;
-if(auto&&v){auto=false;pipV=null;if(v.webkitPresentationMode==='picture-in-picture'){try{oSPM.call(v,'inline')}catch(e){}}}
-setTimeout(relayer,300)};
-try{
-var dp=Document.prototype,hd=Object.getOwnPropertyDescriptor(dp,'hidden'),vs=Object.getOwnPropertyDescriptor(dp,'visibilityState');
-if(hd&&hd.get)Object.defineProperty(document,'hidden',{configurable:true,get:function(){return pipOn()?false:hd.get.call(document)}});
-if(vs&&vs.get)Object.defineProperty(document,'visibilityState',{configurable:true,get:function(){return pipOn()?'visible':vs.get.call(document)}});
-var stop=function(e){if(pipOn())e.stopImmediatePropagation()};
-window.addEventListener('visibilitychange',stop,true);document.addEventListener('visibilitychange',stop,true);
-}catch(e){}
-})();
-"""#
-}
-
-// Close and picture-in-picture buttons over a fullscreen video. They show when you touch the video
-// and fade out again after a few seconds, along with the site's own controls.
-struct FullVideoControls: View {
-    @ObservedObject var pane: Pane
-    var safe: UIEdgeInsets
-    @State private var shown = true
-    @State private var token = UUID()
-
-    var body: some View {
-        HStack(spacing: 10) {
-            button("xmark", "Exit fullscreen") { pane.exitVideoFull() }
-            button("pip.enter", "Picture in Picture") { pane.startPiP() }
-        }
-        .padding(.leading, max(safe.left, 16))
-        .padding(.top, max(safe.top, 14))
-        .opacity(shown ? 1 : 0)
-        .allowsHitTesting(shown)
-        .animation(.easeInOut(duration: 0.25), value: shown)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .onAppear { bump() }
-        .onChange(of: pane.videoTap) { _, _ in bump() }
-    }
-
-    private func bump() {
-        shown = true
-        let t = UUID()
-        token = t
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { if token == t { shown = false } }
-    }
-
-    private func button(_ name: String, _ label: String, _ action: @escaping () -> Void) -> some View {
-        Button {
-            action()
-            bump()
-        } label: {
-            Image(systemName: name)
-                .font(.system(size: 15, weight: .semibold))
-                .foregroundStyle(.white)
-                .frame(width: 40, height: 40)
-                .background(Color.black.opacity(0.45), in: Circle())
-                .overlay(Circle().stroke(Color.white.opacity(0.18), lineWidth: 0.5))
-                .contentShape(Circle())
-        }
-        .accessibilityLabel(label)
     }
 }
 
@@ -1143,9 +848,8 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     let isPrivate: Bool
     let webView: WKWebView
     @Published var address = ""
-    // How far the address bar has folded into its pill: 0 the full bar, 1 the pill. Scrolling sets where
-    // it's heading (barTarget); what you see (barProgress) glides after it, eased and never faster than a
-    // full fold in `foldTime`, so even a quick flick folds the bar at a calm, steady pace.
+    // How far the address bar has folded into its pill: 0 the full bar, 1 the pill. While you scroll it
+    // moves with the page; letting go part-way, or a tap, glides it the rest of the way (barTarget).
     @Published private(set) var barProgress: CGFloat = 0
     private var barTarget: CGFloat = 0
     private var barLink: CADisplayLink?
@@ -1155,16 +859,13 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         get { barTarget >= 0.5 }
         set { setBarTarget(newValue ? 1 : 0) }
     }
-    // Scrolling this far sends the bar all the way between bar and pill.
-    static let pullDistance: CGFloat = 150
-    // The quickest a full fold (or unfold) can play.
-    static let foldTime: Double = 0.6
+    // Scrolling this far moves the bar all the way between bar and pill.
+    static let pullDistance: CGFloat = 220
+    // The quickest a settle or tap can play a full fold (or unfold).
+    static let foldTime: Double = 0.4
     private var lastDir: CGFloat = 1
     private var settleTick = 0
     @Published var tucked = false      // split view bar swiped into a thin pill
-    @Published private(set) var videoFull = false   // a video is in SplitDeck's fullscreen
-    @Published private(set) var videoTap = 0        // touches on that video (shows the close / PiP buttons)
-    private var elementFull = false                  // a video is in WebKit's own (element) fullscreen
     @Published var canBack = false
     @Published var canForward = false
     @Published var host = ""
@@ -1208,7 +909,6 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         u.removeAllUserScripts()
         u.addUserScript(WKUserScript(source: Rules.raf, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         u.addUserScript(WKUserScript(source: YouTubeMedia.script(), injectionTime: .atDocumentStart, forMainFrameOnly: true))
-        u.addUserScript(WKUserScript(source: VideoFull.script(), injectionTime: .atDocumentStart, forMainFrameOnly: false))
         if youtube {
             u.addUserScript(WKUserScript(source: Rules.youtube, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
@@ -1242,9 +942,6 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         config.applicationNameForUserAgent = "Version/\(ProcessInfo.processInfo.operatingSystemVersion.majorVersion).0 Mobile/15E148 Safari/604.1"
         Pane.installScripts(config.userContentController, youtube: false)
         WebFrameRate.unlock(config.preferences, on: !UserDefaults.standard.bool(forKey: "saver"))
-        // WebKit's own fullscreen for page elements: SplitDeck Fullscreen puts the site's whole player in it
-        // (controls and all), which also gives proper picture in picture and background handling.
-        config.preferences.isElementFullscreenEnabled = UserDefaults.standard.object(forKey: "videoFull") as? Bool ?? true
         let wv = WKWebView(frame: .zero, configuration: config)
         wv.allowsBackForwardNavigationGestures = true
         wv.scrollView.contentInsetAdjustmentBehavior = .never   // the floating bars set the insets
@@ -1255,7 +952,6 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         wv.navigationDelegate = self
         wv.uiDelegate = self
         config.userContentController.add(WeakHandler(self), name: "hide")
-        config.userContentController.add(WeakHandler(self), name: "sdfs")
         obs = wv.scrollView.observe(\.contentOffset, options: [.new]) { [weak self] sv, _ in
             guard let self else { return }
             self.scheduleTint()
@@ -1271,14 +967,14 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             let scrollable = maxY > 120
             let inBounds = y >= 0 && y <= maxY
             let unlocked = now > self.barLockUntil
-            if (sv.isTracking || sv.isDecelerating) && scrollable && inBounds && unlocked && !self.videoFull {
+            if (sv.isTracking || sv.isDecelerating) && scrollable && inBounds && unlocked {
                 if dy != 0 { self.lastDir = dy > 0 ? 1 : -1 }
                 // The bar follows your finger: it folds as the page moves up and unfolds as it comes back down.
                 // Near the top of the page it stays open.
                 let room = y > 20 || dy < 0
                 if room {
                     let t = min(1, max(0, self.barTarget + dy / Pane.pullDistance))
-                    if t != self.barTarget { self.setBarTarget(t) }
+                    if t != self.barTarget { self.setBarDirect(t) }
                     if t > 0 && t < 1 { self.scheduleSettle() }
                 }
             }
@@ -1314,7 +1010,6 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
 
     func goHome() {
         if hiding { stopHiding() }
-        if videoFull || elementFull { exitVideoFull() }
         webView.evaluateJavaScript("document.querySelectorAll('video,audio').forEach(function(m){m.pause()})")
         isHome = true
         collapsed = false
@@ -1351,7 +1046,6 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
 
     func sleep() {
         stopBarLink()
-        if videoFull || elementFull { setVideoFull(false) }
         webView.stopLoading()
         webView.configuration.userContentController.removeAllScriptMessageHandlers()
         webView.removeFromSuperview()
@@ -1416,6 +1110,13 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         barLink = link
         barLast = 0
     }
+    // While scrolling: the bar sits exactly where the page has put it.
+    private func setBarDirect(_ t: CGFloat) {
+        let t = min(1, max(0, t))
+        barTarget = t
+        stopBarLink()
+        if abs(t - barProgress) > 0.002 || (t != barProgress && (t == 0 || t == 1)) { barProgress = t }
+    }
     private func stopBarLink() {
         barLink?.invalidate()
         barLink = nil
@@ -1433,7 +1134,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             return
         }
         let cap = CGFloat(dt / Pane.foldTime)
-        let step = max(-cap, min(cap, diff * CGFloat(min(1, dt * 7))))
+        let step = max(-cap, min(cap, diff * CGFloat(min(1, dt * 9))))
         barProgress += step
     }
 
@@ -1558,16 +1259,6 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     }
 
     func userContentController(_ c: WKUserContentController, didReceive m: WKScriptMessage) {
-        if m.name == "sdfs", let d = m.body as? [String: Any] {
-            if d["tap"] != nil { videoTap &+= 1; return }
-            if let diag = d["diag"] as? String {
-                UserDefaults.standard.set("\(host)|\(diag)", forKey: "fsDiag")
-                return
-            }
-            setVideoFull((d["on"] as? Int ?? 0) == 1, portrait: (d["portrait"] as? Bool) ?? false,
-                         covers: (d["mode"] as? String) != "el")
-            return
-        }
         if m.name == "hide" {
             guard let sel = m.body as? String, !sel.isEmpty else { return }
             if !hiddenSels.contains(sel) { hiddenSels.append(sel) }
@@ -1616,7 +1307,6 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
-        if videoFull || elementFull { setVideoFull(false) }
         webView.evaluateJavaScript("window.__sdFps=\(Pane.fps)")
         if translated || foreignLanguage != nil || translating { translated = false; foreignLanguage = nil; translating = false }
         let committed = webView.url?.host ?? ""
@@ -1655,39 +1345,8 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     func refreshMedia() {
         let youtubeAds = appliedRules?.contains("youtube-script") ?? false
         Pane.installScripts(webView.configuration.userContentController, youtube: youtubeAds)
-        webView.evaluateJavaScript(VideoFull.configJS)
         guard isYouTube else { return }
         webView.evaluateJavaScript("window.__sdNet='\(NetworkWatch.shared.name)';window.__sdYTSet&&window.__sdYTSet(\(YouTubeMedia.prefsJSON))")
-    }
-
-    // MARK: Fullscreen video
-
-    // covers: SplitDeck's overlay fullscreen (the app hides its own bars). WebKit's fullscreen (covers false)
-    // has its own window over everything, so only the rotation is ours to handle.
-    private func setVideoFull(_ on: Bool, portrait: Bool = false, covers: Bool = true) {
-        let was = videoFull || elementFull
-        let overlay = on && covers
-        if overlay != videoFull {
-            videoFull = overlay
-            // The page behind the video stays put: no scrolling, no back / forward swipes.
-            webView.scrollView.isScrollEnabled = !overlay
-            webView.allowsBackForwardNavigationGestures = !overlay
-            if overlay { collapsed = false }
-        }
-        elementFull = on && !covers
-        if on || was { FullVideo.shared.changed(self, on: on, portraitVideo: portrait, covers: covers) }
-    }
-    func exitVideoFull() {
-        webView.evaluateJavaScript("window.__sdfsExit&&window.__sdfsExit()")
-        setVideoFull(false)
-    }
-    // From the PiP button (auto: false), or when you leave the app with a video playing fullscreen (auto: true).
-    func startPiP(auto: Bool = false) {
-        webView.evaluateJavaScript("window.__sdfsPip&&window.__sdfsPip(\(auto))")
-    }
-    // Back in the app after a PiP that started on its own: the video returns to fullscreen.
-    func backFromPiP() {
-        webView.evaluateJavaScript("window.__sdfsBack&&window.__sdfsBack()")
     }
 
     // MARK: Zoom
@@ -3394,7 +3053,7 @@ struct PaneView: View {
     @Environment(\.colorScheme) private var sys
     @AppStorage("saver") private var saver = false
     @AppStorage("minimalBar") private var minimalBar = true
-    @AppStorage("barLayout") private var barLayout = "toolbar"
+    @AppStorage("barLayout") private var barLayout = "twoTone"
     @State private var collapseToken = UUID()
     @State private var touchedAt = Date.distantPast
     @AppStorage("adaptiveText") private var adaptiveText = true
@@ -3419,7 +3078,7 @@ struct PaneView: View {
     private var endFade: Double { Double(max(0, 1 - p * 2.6)) }
     // The site name is drawn as a label (not the text field) whenever you're not typing.
     private var useLabel: Bool { !focused && !pane.isHome && !pane.host.isEmpty }
-    private var labelScale: CGFloat { compact ? 8.0 / 15.0 : 10.0 / 17.0 }
+    private var labelScale: CGFloat { compact ? 8.0 / 15.0 : 10.0 / 13.5 }
     // Split view: the bar swiped away into a thin pill. Stays that way until you touch it.
     private var thin: Bool { compact && pane.tucked && !focused && !pane.isHome && !pane.hiding }
     private var showEnds: Bool { !focused }
@@ -3447,7 +3106,7 @@ struct PaneView: View {
     // The bar folding into its pill: no bounce, a soft finish, like Safari.
     private var shrink: Animation? { saver ? nil : .spring(response: 0.42, dampingFraction: 0.9) }
     @Namespace private var ns
-    private var barH: CGFloat { compact ? 36 : 60 }
+    private var barH: CGFloat { compact ? 36 : 45 }
 
     // Tinted ends of the two-tone bar: the buttons sit on tinted glass, the address on clear glass.
     private var endTint: Color {
@@ -3490,7 +3149,7 @@ struct PaneView: View {
         pane.tucked = false
         expand()
     }
-    private var iconW: CGFloat { compact ? 32 : 46 }
+    private var iconW: CGFloat { compact ? 32 : 35 }
 
     // Shows just the site name until you tap in, then the full address.
     private var addressText: Binding<String> {
@@ -3583,7 +3242,7 @@ struct PaneView: View {
         }
         .clipped()
         .overlay(alignment: atTop ? .top : .bottom) {
-            if floating && !pane.videoFull { AnyView(floatingBar) }
+            if floating { AnyView(floatingBar) }
         }
         // Split view: suggestions sit over the page, just above (or below) the bar; the page keeps its size.
         .overlay(alignment: atTop ? .top : .bottom) {
@@ -3595,7 +3254,7 @@ struct PaneView: View {
             }
         }
         .overlay(alignment: .bottom) {
-            if floating && atTop && showToolbar && !pane.videoFull { floatingToolbar }
+            if floating && atTop && showToolbar { floatingToolbar }
         }
     }
 
@@ -3605,10 +3264,10 @@ struct PaneView: View {
         .onPreferenceChange(BarCoverKey.self) { c in
             // Mid-pull the bar is between sizes: the page keeps its insets until it settles.
             let bp = pane.barProgress
-            guard bp == 0 || bp == 1 || pane.videoFull || focused else { return }
+            guard bp == 0 || bp == 1 || focused else { return }
             // The page starts below the status bar, then scrolls up underneath it.
             var c = c
-            c.top = pane.videoFull ? 0 : max(c.top, safeTop)
+            c.top = max(c.top, safeTop)
             cover = c
             pane.setCover(c)
         }
@@ -3647,10 +3306,10 @@ struct PaneView: View {
     private func splitButton(big: Bool = false) -> some View {
         Button { actions.toggleSplit() } label: {
             Image(systemName: actions.splitOn ? "rectangle.split.1x2.fill" : "rectangle.split.1x2")
-                .font(.system(size: big ? 20 : (compact ? 12 : 15), weight: .semibold))
+                .font(.system(size: big ? 20 : 12, weight: .semibold))
                 .foregroundStyle(ink)
                 .frame(maxWidth: big ? .infinity : nil)
-                .frame(width: big ? nil : (compact ? 32 : 42), height: big ? toolH : barH)
+                .frame(width: big ? nil : 32, height: big ? toolH : barH)
                 .contentShape(Rectangle())
         }
         .accessibilityLabel(actions.splitOn ? "Close split view" : "Split view")
@@ -3660,14 +3319,14 @@ struct PaneView: View {
     private func tabsButton(big: Bool = false) -> some View {
         Button { actions.openTabs() } label: {
             Text("\(actions.tabCount)")
-                .font(.system(size: big ? 14 : 12, weight: .bold))
+                .font(.system(size: big ? 14 : 11, weight: .bold))
                 .monospacedDigit()
                 .foregroundStyle(ink)
-                .frame(minWidth: big ? 23 : 19, minHeight: big ? 23 : 19)
+                .frame(minWidth: big ? 23 : 17, minHeight: big ? 23 : 17)
                 .padding(.horizontal, 1)
                 .overlay(RoundedRectangle(cornerRadius: big ? 6 : 5, style: .continuous).stroke(ink, lineWidth: big ? 1.8 : 1.5))
                 .frame(maxWidth: big ? .infinity : nil)
-                .frame(width: big ? nil : 34, height: big ? toolH : barH)
+                .frame(width: big ? nil : 30, height: big ? toolH : barH)
                 .contentShape(Rectangle())
         }
         .accessibilityLabel("\(actions.tabCount) tabs")
@@ -3679,9 +3338,9 @@ struct PaneView: View {
             if pane.loading { pane.webView.stopLoading() } else { pane.webView.reload() }
         } label: {
             Image(systemName: pane.loading ? "xmark" : "arrow.clockwise")
-                .font(.system(size: compact ? 12 : 14, weight: .semibold))
+                .font(.system(size: compact ? 12 : 11, weight: .semibold))
                 .foregroundStyle(ink)
-                .frame(width: compact ? 31 : 38, height: barH)
+                .frame(width: compact ? 31 : 29, height: barH)
                 .contentShape(Rectangle())
         }
         .accessibilityLabel(pane.loading ? "Stop loading" : "Reload")
@@ -3690,7 +3349,7 @@ struct PaneView: View {
     private func icon(_ name: String, enabled: Bool = true, _ action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: name)
-                .font(.system(size: compact ? 14 : 18, weight: .semibold))
+                .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(ink)
                 .frame(width: iconW, height: barH)
                 .contentShape(Rectangle())
@@ -3800,7 +3459,7 @@ struct PaneView: View {
     private var field: some View {
         TextField(pane.isPrivate ? "Search privately" : "Search or enter site", text: addressText)
             .textFieldStyle(.plain)
-            .font(compact ? .subheadline : .system(size: 17, weight: .medium))
+            .font(compact ? .subheadline : .system(size: 13.5, weight: .medium))
             // Not typing: the field stays put to take the tap, and the moving label draws the name.
             .foregroundStyle(useLabel ? AnyShapeStyle(Color.clear) : ink)
             .multilineTextAlignment(focused ? .leading : .center)
@@ -3865,7 +3524,7 @@ struct PaneView: View {
             icon("chevron.right", enabled: pane.forwardEnabled) { pane.forward() }
             if pane.isPrivate {
                 Image(systemName: "eye.slash.fill")
-                    .font(.system(size: compact ? 11 : 12, weight: .semibold))
+                    .font(.system(size: compact ? 11 : 10, weight: .semibold))
                     .foregroundStyle(ink)
                     .opacity(0.8)
                     .padding(.trailing, 6)
@@ -3886,11 +3545,11 @@ struct PaneView: View {
                     ProgressView().controlSize(.mini).tint(dark ? .white : .black)
                 } else {
                     Image(systemName: "translate")
-                        .font(.system(size: compact ? 12 : 15, weight: .semibold))
+                        .font(.system(size: 12, weight: .semibold))
                         .foregroundStyle(pane.translated ? AnyShapeStyle(theme.accent) : ink)
                 }
             }
-            .frame(width: compact ? 28 : 34, height: barH)
+            .frame(width: 28, height: barH)
             .contentShape(Rectangle())
         }
         .accessibilityLabel(pane.translated ? "Show original" : "Translate page")
@@ -3924,7 +3583,7 @@ struct PaneView: View {
     // The site name. In the full bar it sits where the text field would draw it; in the pill it's small.
     private var addressLabel: some View {
         Text(pane.host.isEmpty ? "Search" : pane.host.replacingOccurrences(of: "www.", with: ""))
-            .font(compact ? .subheadline : .system(size: 17, weight: .medium))
+            .font(compact ? .subheadline : .system(size: 13.5, weight: .medium))
             .foregroundStyle(ink)
             .lineLimit(1)
             .scaleEffect(1 + (labelScale - 1) * p)
@@ -3953,7 +3612,7 @@ struct PaneView: View {
     // One capsule that changes shape between the full bar and the small pill, following the pull.
     // The capsule never cross-fades: it narrows around the name while the buttons fade into it, and
     // grows back out when you tap it, even while the page is still moving.
-    private var fieldInset: CGFloat { focused ? (compact ? 14 : 18) : 8 }
+    private var fieldInset: CGFloat { focused ? 14 : 8 }
 
     private var mainBar: some View {
         AnyView(BarRow(p: p, pillPad: compact ? 7 : 10, labelScale: labelScale, fieldInset: fieldInset, gap: compact ? 3 : 4) {
@@ -3995,13 +3654,13 @@ struct PaneView: View {
         .gesture(TapGesture().onEnded { expand() }, including: mini ? .all : .subviews)
         .accessibilityAddTraits(mini ? .isButton : [])
         .geometryGroup()
-        .padding(.trailing, focused && !compact ? 78 : 0)
+        .padding(.trailing, focused && !compact ? 66 : 0)
         .overlay(alignment: .trailing) {
             if focused && !compact {
                 Button("Cancel") { focused = false }
-                    .font(.system(size: 17, weight: .regular))
+                    .font(.system(size: 15, weight: .regular))
                     .foregroundStyle(ink)
-                    .frame(width: 70, height: barH)
+                    .frame(width: 60, height: barH)
                     .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
@@ -4013,7 +3672,7 @@ struct PaneView: View {
                     .padding(.horizontal, 14)
                     .padding(.vertical, 7)
                     .sdGlass(Capsule(), dark: dark, rim: true)
-                    .offset(y: atTop ? 42 : -42)
+                    .offset(y: atTop ? 36 : -36)
                     .transition(.opacity.combined(with: .scale(scale: 0.85)))
                     .allowsHitTesting(false)
             }
@@ -4097,7 +3756,7 @@ struct PaneView: View {
             }
         } label: {
             Image(systemName: "ellipsis")
-                .font(.system(size: big ? 21 : (compact ? 14 : 16), weight: .semibold))
+                .font(.system(size: big ? 21 : 13, weight: .semibold))
                 .foregroundStyle(ink)
                 .frame(maxWidth: big ? .infinity : nil)
                 .frame(width: big ? nil : iconW, height: big ? toolH : barH)
@@ -5423,28 +5082,6 @@ struct MediaSection: View {
     @AppStorage("ytBlockRecs") private var recs = false
     @AppStorage("ytBlockDistract") private var distract = false
     @AppStorage("ytBlockShorts") private var shorts = false
-    @AppStorage("videoFull") private var videoFull = true
-    @AppStorage("videoGlow") private var videoGlow = true
-    @AppStorage("saver") private var saver = false
-    @AppStorage("fsDiag") private var fsDiag = ""
-
-    // The last fullscreen video: which fullscreen it used and whether the glow could copy it.
-    private var diagText: String? {
-        let parts = fsDiag.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
-        guard parts.count >= 3 else { return nil }
-        let how = parts[1] == "el" ? "WebKit fullscreen" : "SplitDeck overlay"
-        let glow: String
-        switch parts[2] {
-        case "ok": glow = "glow working"
-        case "black": glow = "glow got a black picture from this video"
-        case "protected": glow = "glow can't read this video"
-        case "paused": glow = "video was paused"
-        default: glow = "glow off"
-        }
-        let site = parts[0].replacingOccurrences(of: "www.", with: "")
-        return "Last fullscreen video\(site.isEmpty ? "" : " (\(site))"): \(how), \(glow)."
-    }
-
     private func row(_ title: String, _ detail: String) -> some View {
         VStack(alignment: .leading, spacing: 3) {
             Text(title)
@@ -5474,21 +5111,10 @@ struct MediaSection: View {
                 row("Block YouTube Shorts", "Blocks Shorts from the home page, trending page and search results on youtube.com")
             }
             .onChange(of: shorts) { _, _ in YouTubeMedia.changed() }
-            Toggle(isOn: $videoFull) {
-                row("SplitDeck Fullscreen", "Videos on every site fill the screen in landscape, with buttons to close or pop out into picture in picture. Off uses the iPhone's player.")
-            }
-            .onChange(of: videoFull) { _, _ in YouTubeMedia.changed() }
-            if videoFull {
-                Toggle(isOn: $videoGlow) {
-                    row("Ambient Glow", saver ? "Paused while Battery Saver is on."
-                        : "Fills the space around fullscreen videos with a soft glow of their colours. Protected videos get black bars instead.")
-                }
-                .onChange(of: videoGlow) { _, _ in YouTubeMedia.changed() }
-            }
         } header: {
             Text("Media")
         } footer: {
-            Text("Changes apply to open tabs straight away." + (diagText.map { "\n\n" + $0 } ?? ""))
+            Text("Changes apply to open YouTube tabs straight away.")
         }
     }
 }
@@ -5519,7 +5145,7 @@ struct SettingsView: View {
     @AppStorage("showIsland") private var showIsland = false
     @AppStorage("splitEnabled") private var splitEnabled = true
     @AppStorage("minimalBar") private var minimalBar = true
-    @AppStorage("barLayout") private var barLayout = "toolbar"
+    @AppStorage("barLayout") private var barLayout = "twoTone"
     @AppStorage("barPosition") private var barPosition = "bottom"
     @State private var query = ""
     var openVault: () -> Void
@@ -5541,7 +5167,7 @@ struct SettingsView: View {
         static let addressBar = ["Address Bar", "Layout", "Position", "Top", "Bottom", "Toolbar", "Minimal", "Pill", "Two-Tone"]
         static let split = ["Split View", "Island", "Floating", "Divider"]
         static let home = ["Home Page", "Frequently Visited", "My Sites", "Visit History", "Start Page"]
-        static let media = ["Media", "YouTube", "Video", "Quality", "1440p", "Playback", "Shorts", "Recommended", "Comments", "Wi-Fi", "Mobile Data", "Fullscreen", "Ambient", "Glow", "Picture in Picture", "PiP"]
+        static let media = ["Media", "YouTube", "Video", "Quality", "1440p", "Playback", "Shorts", "Recommended", "Comments", "Wi-Fi", "Mobile Data"]
         static let privacy = ["Privacy", "Security", "Shields", "Ads", "Trackers", "Cookies", "VPN", "Private Tabs", "App Lock", "Lock", "Passcode", "Face ID"]
         static let translation = ["Translation", "Translate", "Language"]
         static let zoom = ["Page Zoom", "Zoom", "Text Size"]
@@ -7477,7 +7103,6 @@ struct ContentView: View {
     @StateObject private var shields = Shields()
     @StateObject private var themes = ThemeStore()
     @StateObject private var history = HistoryStore()
-    @ObservedObject private var fullVideo = FullVideo.shared
     @Environment(\.scenePhase) private var phase
     @AppStorage("lockPrivate") private var lockPrivate = true
     @State private var privateLocked = false
@@ -7548,25 +7173,12 @@ struct ContentView: View {
         .onChange(of: phase) { _, p in phaseChanged(p) }
         .onChange(of: appLock) { _, on in if !on { appLocked = false } }
         .onOpenURL { openLink($0) }
-        // Swiping home with a video playing fullscreen pops it out into picture in picture. This is the
-        // earliest moment the app hears about it, while iOS still lets picture in picture start.
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
-            if let id = FullVideo.shared.active, tabs.visible.contains(id) { tabs.pane(id).startPiP(auto: true) }
-        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
             tabs.sleepHidden()
         }
     }
 
-    // The tab whose video is in SplitDeck's fullscreen, if it's on screen.
-    private var videoPane: Pane? {
-        guard let id = fullVideo.pane, tabs.visible.contains(id) else { return nil }
-        return tabs.pane(id)
-    }
-
     private func phaseChanged(_ p: ScenePhase) {
-        // Back in the app after an automatic picture in picture: the video returns to fullscreen.
-        if p == .active { tabs.allLive.forEach { $0.backFromPiP() } }
         if p != .active { vault.lock() }
         if p == .background && lockPrivate && tabs.privateCount > 0 { privateLocked = true }
         if p == .background { leftAt = Date() }
@@ -7586,7 +7198,7 @@ struct ContentView: View {
     // Everything that floats over the pages, in one layer: island, toast, tab switcher, welcome tour, app lock.
     @ViewBuilder private func overlayLayer(safe: UIEdgeInsets) -> some View {
         ZStack(alignment: .top) {
-            if showIsland && videoPane == nil {
+            if showIsland {
                 EdgeDock(tabs: tabs, saver: saver, privateMode: leftIsPrivate, safe: safe, openTabs: { openTabs() })
                     .transition(.opacity)
             }
@@ -7670,14 +7282,10 @@ struct ContentView: View {
                 deck(portrait: portrait, safe: safe)
             }
             .onChange(of: root.size) { _, _ in refreshInsets() }
-            // Fullscreen video: edge to edge, round the Dynamic Island too.
-            .ignoresSafeArea(.container, edges: videoPane == nil ? .vertical : .all)
-            .background((videoPane == nil ? activeTheme.strip : Color.black).ignoresSafeArea())
-            .overlay(alignment: .top) { if safe.top > 0 && videoPane == nil { StatusFade(height: safe.top) } }
-            .overlay { if let v = videoPane { FullVideoControls(pane: v, safe: safe).ignoresSafeArea() } }
+            .ignoresSafeArea(.container, edges: .vertical)
+            .background(activeTheme.strip.ignoresSafeArea())
+            .overlay(alignment: .top) { if safe.top > 0 { StatusFade(height: safe.top) } }
             .overlay { AnyView(overlayLayer(safe: safe)) }
-            .statusBarHidden(videoPane != nil)
-            .persistentSystemOverlays(videoPane == nil ? .automatic : .hidden)
         }
         .environment(\.sdTheme, activeTheme)
         .environment(\.sdHomeImage, themes.homeImage)
@@ -7750,10 +7358,8 @@ struct ContentView: View {
         GeometryReader { geo in
             let horizontal = !portrait
             let total = horizontal ? geo.size.width : geo.size.height
-            // A fullscreen video takes the whole screen; the other pane steps aside until it closes.
-            let fsSlot: Int? = fullVideo.pane == nil ? nil : (fullVideo.pane == tabs.left ? 0 : (fullVideo.pane == tabs.right ? 1 : nil))
-            let gap: CGFloat = fsSlot == nil ? 5 : 0
-            let firstSize = fsSlot == 0 ? total : (fsSlot == 1 ? 0 : (total - gap) * split)
+            let gap: CGFloat = 5
+            let firstSize = (total - gap) * split
             ZStack(alignment: .topLeading) {
                 if tabs.split {
                     let layout = horizontal ? AnyLayout(HStackLayout(spacing: gap)) : AnyLayout(VStackLayout(spacing: gap))
@@ -7763,13 +7369,9 @@ struct ContentView: View {
                         paneView(tabs.left, slot: 0, compact: true, atTop: portrait, safeTop: safe.top,
                                  bottomInset: horizontal ? safe.bottom : 0)
                             .frame(width: horizontal ? firstSize : nil, height: horizontal ? nil : firstSize)
-                            .opacity(fsSlot == 1 ? 0 : 1)
                         paneView(tabs.right, slot: 1, compact: true, safeTop: horizontal ? safe.top : 0, bottomInset: safe.bottom)
-                            .opacity(fsSlot == 0 ? 0 : 1)
                     }
-                    if fsSlot == nil {
-                        handle(horizontal: horizontal, total: total, pos: firstSize + gap / 2, size: geo.size)
-                    }
+                    handle(horizontal: horizontal, total: total, pos: firstSize + gap / 2, size: geo.size)
                 } else {
                     paneView(tabs.left, slot: 0, atTop: barPosition == "top", safeTop: safe.top, bottomInset: safe.bottom)
                         .frame(width: geo.size.width, height: geo.size.height)
@@ -7935,7 +7537,6 @@ struct ContentView: View {
         Pane.fps = saver ? 30 : 0
         tabs.maxLive = saver ? 2 : 4
         tabs.allLive.forEach { $0.applyFPS() }
-        tabs.allLive.forEach { $0.webView.evaluateJavaScript(VideoFull.configJS) }   // ambient glow pauses in Battery Saver
         tabs.trim()
     }
 
