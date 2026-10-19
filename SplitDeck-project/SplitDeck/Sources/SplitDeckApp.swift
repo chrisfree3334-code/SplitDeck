@@ -1011,7 +1011,24 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     let isPrivate: Bool
     let webView: WKWebView
     @Published var address = ""
-    @Published var collapsed = false
+    // How far the address bar has folded into its pill: 0 the full bar, 1 the pill. It follows the page
+    // as you scroll, then settles at one end.
+    @Published var barProgress: CGFloat = 0
+    // Fully folded. Setting it moves the bar there with the bar's own animation.
+    var collapsed: Bool {
+        get { barProgress >= 0.5 }
+        set {
+            let v: CGFloat = newValue ? 1 : 0
+            guard barProgress != v else { return }
+            if Pane.minimizeBars { withAnimation(Pane.barMotion) { barProgress = v } } else { barProgress = v }
+        }
+    }
+    // No bounce, a soft finish (Safari-like).
+    static let barMotion = Animation.spring(response: 0.36, dampingFraction: 0.92)
+    // Scrolling this far moves the bar all the way between bar and pill.
+    static let pullDistance: CGFloat = 46
+    private var lastDir: CGFloat = 1
+    private var settleTick = 0
     @Published var tucked = false      // split view bar swiped into a thin pill
     @Published private(set) var videoFull = false   // a video is in SplitDeck's fullscreen
     @Published private(set) var videoTap = 0        // touches on that video (shows the close / PiP buttons)
@@ -1067,7 +1084,6 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
     static var onBlocked: (() -> Void)?
     private var obs: NSKeyValueObservation?
     private var lastY: CGFloat = 0
-    private var scrollRun: CGFloat = 0
     private var barLockUntil: CFTimeInterval = 0
     private var lastScrollAt: CFTimeInterval = 0
     private var tintPending = false
@@ -1119,20 +1135,18 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
             let scrollable = maxY > 120
             let inBounds = y >= 0 && y <= maxY
             let unlocked = now > self.barLockUntil
-            if (sv.isTracking || sv.isDecelerating) && scrollable && inBounds && unlocked {
-                if (dy > 0) != (self.scrollRun > 0) { self.scrollRun = 0 }
-                self.scrollRun += dy
-                if self.scrollRun > 28 && y > 60 && !self.collapsed {
-                    self.collapsed = true
-                    self.barLockUntil = now + 0.5
-                    self.scrollRun = 0
-                } else if self.scrollRun < -28 && self.collapsed {
-                    self.collapsed = false
-                    self.barLockUntil = now + 0.5
-                    self.scrollRun = 0
+            if (sv.isTracking || sv.isDecelerating) && scrollable && inBounds && unlocked && !self.videoFull {
+                if dy != 0 { self.lastDir = dy > 0 ? 1 : -1 }
+                // The bar follows your finger: it folds as the page moves up and unfolds as it comes back down.
+                // Near the top of the page it stays open.
+                let room = y > 20 || dy < 0
+                let p = room ? min(1, max(0, self.barProgress + dy / Pane.pullDistance)) : self.barProgress
+                if abs(p - self.barProgress) > 0.002 || (p != self.barProgress && (p == 0 || p == 1)) {
+                    self.barProgress = p
                 }
+                if p > 0 && p < 1 { self.scheduleSettle() }
             }
-            if y <= 0 && self.collapsed && unlocked && !sv.isDecelerating { self.collapsed = false }
+            if y <= 0 && self.barProgress > 0 && unlocked && !sv.isDecelerating { self.collapsed = false }
         }
         loadObs = wv.observe(\.isLoading, options: [.new]) { [weak self] w, _ in
             DispatchQueue.main.async { self?.loading = w.isLoading }
@@ -1250,14 +1264,28 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         canForward = webView.canGoForward
     }
 
+    // Let go part-way through a pull: the bar finishes the move in the direction you were scrolling
+    // (if it had gone more than a quarter of the way), so it never rests half folded.
+    private func scheduleSettle() {
+        settleTick &+= 1
+        let t = settleTick
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { [weak self] in
+            guard let self, t == self.settleTick else { return }
+            if self.webView.scrollView.isTracking { self.scheduleSettle(); return }
+            let p = self.barProgress
+            guard p > 0 && p < 1 else { return }
+            self.collapsed = self.lastDir > 0 ? p > 0.25 : p > 0.75
+            self.barLockUntil = CACurrentMediaTime() + 0.3
+        }
+    }
+
     // Tapping the pill: stop any momentum scroll first, then hold the bar open for a moment,
     // so a still-moving page can't fold it straight back into the pill.
     func expandBar() {
         let sv = webView.scrollView
         if sv.isDecelerating { sv.setContentOffset(sv.contentOffset, animated: false) }
-        scrollRun = 0
         barLockUntil = CACurrentMediaTime() + 1.2
-        if collapsed { collapsed = false }
+        collapsed = false
     }
 
     // Re-reads the page colours once scrolling settles. One timer at a time, no allocation per scroll event.
@@ -3076,6 +3104,70 @@ struct ShieldsSettings: View {
     }
 }
 
+// The address bar's row, from full bar (progress 0) to small pill (progress 1). One layout covers the
+// whole move: the width, the buttons at the ends and the site name all follow the same progress, so the
+// name shrinks and slides into the pill in one motion instead of one label fading into another. Because
+// the progress is animatable, a settle or a tap plays the same path the finger does.
+struct BarRow: Layout {
+    var p: CGFloat
+    var pillPad: CGFloat          // space either side inside the pill
+    var labelScale: CGFloat       // site name size in the pill, relative to the bar
+    var fieldInset: CGFloat       // the text field's own leading padding (to line the name up with it)
+    var gap: CGFloat = 4          // between the lock and the name in the pill
+
+    enum Role { case leading, field, label, icon, trailing }
+    struct RoleKey: LayoutValueKey { static let defaultValue = Role.field }
+
+    var animatableData: CGFloat {
+        get { p }
+        set { p = newValue }
+    }
+
+    private func find(_ s: Subviews, _ r: Role) -> LayoutSubview? { s.first { $0[RoleKey.self] == r } }
+    private func width(_ v: LayoutSubview?) -> CGFloat { v?.sizeThatFits(.unspecified).width ?? 0 }
+
+    private func pillWidth(_ s: Subviews) -> CGFloat {
+        let iconW = width(find(s, .icon))
+        return pillPad * 2 + iconW + (iconW > 0 ? gap : 0) + width(find(s, .label)) * labelScale
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let h = proposal.height ?? 44
+        let full: CGFloat
+        if let w = proposal.width, w.isFinite { full = w } else { full = subviews.reduce(0) { $0 + width($1) } }
+        guard find(subviews, .label) != nil else { return CGSize(width: full, height: h) }
+        let pill = min(pillWidth(subviews), full)
+        return CGSize(width: full + (pill - full) * p, height: h)
+    }
+
+    func placeSubviews(in b: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let lead = find(subviews, .leading), trail = find(subviews, .trailing)
+        let leadW = width(lead), trailW = width(trail)
+        lead?.place(at: CGPoint(x: b.minX, y: b.midY), anchor: .leading, proposal: .unspecified)
+        trail?.place(at: CGPoint(x: b.maxX, y: b.midY), anchor: .trailing, proposal: .unspecified)
+        find(subviews, .field)?.place(at: CGPoint(x: b.minX + leadW, y: b.midY), anchor: .leading,
+                                      proposal: ProposedViewSize(width: max(0, b.width - leadW - trailW), height: b.height))
+        guard let label = find(subviews, .label) else { return }
+        // Where the name sits in the full bar: centred in the space between the ends.
+        let fullW: CGFloat = { if let w = proposal.width, w.isFinite { return w }; return b.width }()
+        let fullMinX = b.midX - fullW / 2
+        let fullField = max(0, fullW - leadW - trailW - fieldInset)
+        let ideal = width(label)
+        let fullLabelW = min(ideal, max(0, fullField - 12))
+        let labelW = fullLabelW + (ideal - fullLabelW) * p
+        let fullCentre = fullMinX + leadW + fieldInset + fullField / 2
+        // Where it sits in the pill: after the lock, the two centred together.
+        let icon = find(subviews, .icon)
+        let iconW = width(icon)
+        let content = iconW + (iconW > 0 ? gap : 0) + labelW * labelScale
+        let pillCentre = b.midX - content / 2 + iconW + (iconW > 0 ? gap : 0) + labelW * labelScale / 2
+        let centre = fullCentre + (pillCentre - fullCentre) * p
+        label.place(at: CGPoint(x: centre, y: b.midY), anchor: .center, proposal: ProposedViewSize(width: labelW, height: nil))
+        let shown = labelW * (1 + (labelScale - 1) * p)
+        icon?.place(at: CGPoint(x: centre - shown / 2 - gap - iconW / 2, y: b.midY), anchor: .center, proposal: .unspecified)
+    }
+}
+
 // MARK: Pane view
 
 struct PaneActions {
@@ -3136,10 +3228,17 @@ struct PaneView: View {
         return TextColors.ink(adaptive: adaptiveText, name: textColor)
     }
     // Never in Battery Saver, and only with the minimal bar switched on.
-    private var mini: Bool { minimalBar && !saver && pane.collapsed && !focused && !pane.isHome }
+    // 0 full bar … 1 pill. Always the full bar while typing, on the start page and in Battery Saver.
+    private var p: CGFloat { minimalBar && !saver && !focused && !pane.isHome && !pane.hiding ? pane.barProgress : 0 }
+    private var mini: Bool { p > 0.5 }
+    // The buttons fade out over the first part of the pull, so by the end only the name is moving.
+    private var endFade: Double { Double(max(0, 1 - p * 2.6)) }
+    // The site name is drawn as a label (not the text field) whenever you're not typing.
+    private var useLabel: Bool { !focused && !pane.isHome && !pane.host.isEmpty }
+    private var labelScale: CGFloat { compact ? 8.0 / 15.0 : 10.0 / 17.0 }
     // Split view: the bar swiped away into a thin pill. Stays that way until you touch it.
     private var thin: Bool { compact && pane.tucked && !focused && !pane.isHome && !pane.hiding }
-    private var showEnds: Bool { !mini && !focused }
+    private var showEnds: Bool { !focused }
     private var pillH: CGFloat { compact ? 15 : 20 }
     // The bar floats over the page instead of sitting in a strip beside it (full screen and split view).
     private var floating: Bool { true }
@@ -3147,7 +3246,7 @@ struct PaneView: View {
     private var layoutStyle: String { compact ? "twoTone" : barLayout }
     private var tinted: Bool { layoutStyle == "twoTone" }
     private var toolbarLayout: Bool { layoutStyle == "toolbar" }
-    private var showToolbar: Bool { toolbarLayout && !mini && !focused && !pane.hiding }
+    private var showToolbar: Bool { toolbarLayout && p < 1 && !focused && !pane.hiding }
     // The full-screen search screen is up: the bar follows the theme, not the page behind it.
     private var searching: Bool { focused && !compact }
     // Whether the bar surface is dark. Adaptive: follows the page so text stays readable.
@@ -3320,6 +3419,9 @@ struct PaneView: View {
     var body: some View {
         AnyView(stack)
         .onPreferenceChange(BarCoverKey.self) { c in
+            // Mid-pull the bar is between sizes: the page keeps its insets until it settles.
+            let bp = pane.barProgress
+            guard bp == 0 || bp == 1 || pane.videoFull || focused else { return }
             // The page starts below the status bar, then scrolls up underneath it.
             var c = c
             c.top = pane.videoFull ? 0 : max(c.top, safeTop)
@@ -3333,7 +3435,6 @@ struct PaneView: View {
                 PrivateCover(locked: actions.privateLocked, unlock: actions.unlockPrivate, leave: actions.exitPrivate)
             }
         }
-        .animation(shrink, value: mini)
         .animation(shrink, value: thin)
         .animation(spring, value: focused)
         .animation(spring, value: pane.hiding)
@@ -3453,16 +3554,24 @@ struct PaneView: View {
     private var floatPad: CGFloat {
         if focused { return 8 }
         if thin { return max(bottomInset - 6, 4) }
-        if mini { return max(bottomInset - 20, 2) }
-        return max(bottomInset - 8, compact ? 8 : 10)
+        let open = max(bottomInset - 8, compact ? 8 : 10), folded = max(bottomInset - 20, 2)
+        return open + (folded - open) * p
     }
 
     // Full screen: the bar (and toolbar) float over the page with the page showing around them.
     private var floatingBar: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 0) {
             bar
             if !atTop && showToolbar {
-                toolbarCapsule.transition(.move(edge: .bottom).combined(with: .opacity))
+                // Folds away with the pull: fades over the first half and gives its height back,
+                // so the address bar above glides down as it goes.
+                toolbarCapsule
+                    .padding(.top, 8)
+                    .opacity(Double(max(0, 1 - p * 2.2)))
+                    .offset(y: 26 * p)
+                    .frame(height: 54 * (1 - p), alignment: .top)
+                    .allowsHitTesting(p < 0.3)
+                    .transition(.move(edge: .bottom).combined(with: .opacity))
             }
         }
         .environment(\.colorScheme, dark ? .dark : .light)
@@ -3501,7 +3610,8 @@ struct PaneView: View {
         TextField(pane.isPrivate ? "Search privately" : "Search or enter site", text: addressText)
             .textFieldStyle(.plain)
             .font(compact ? .subheadline : .system(size: 17, weight: .medium))
-            .foregroundStyle(ink)
+            // Not typing: the field stays put to take the tap, and the moving label draws the name.
+            .foregroundStyle(useLabel ? AnyShapeStyle(Color.clear) : ink)
             .multilineTextAlignment(focused ? .leading : .center)
             .textInputAutocapitalization(.never)
             .autocorrectionDisabled()
@@ -3571,7 +3681,7 @@ struct PaneView: View {
                     .accessibilityLabel("Private tab")
             }
         }
-        .frame(height: barH - 6)
+        .frame(height: max(0, barH + (pillH - barH) * p - 6))
         .background(tinted ? endTint : Color.clear, in: Capsule())
         .simultaneousGesture(TapGesture().onEnded { touched() })
         .padding(.leading, 3)
@@ -3614,15 +3724,26 @@ struct PaneView: View {
                 if actions.splitEnabled && splitHere { splitButton }
             }
         }
-        .frame(height: barH - 6)
+        .frame(height: max(0, barH + (pillH - barH) * p - 6))
         .background(tinted ? endTint : Color.clear, in: Capsule())
         .simultaneousGesture(TapGesture().onEnded { touched() })
         .padding(.trailing, 3)
     }
 
-    // What the pill shows: a lock (or private eye, or a spinner) and the site.
-    private var pillLabel: some View {
-        HStack(spacing: compact ? 3 : 4) {
+    // The site name. In the full bar it sits where the text field would draw it; in the pill it's small.
+    private var addressLabel: some View {
+        Text(pane.host.isEmpty ? "Search" : pane.host.replacingOccurrences(of: "www.", with: ""))
+            .font(compact ? .subheadline : .system(size: 17, weight: .medium))
+            .foregroundStyle(ink)
+            .lineLimit(1)
+            .scaleEffect(1 + (labelScale - 1) * p)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+    }
+
+    // Beside the name in the pill: a lock (or private eye, or a spinner). Fades in over the last half.
+    private var pillIcon: some View {
+        Group {
             if pane.isPrivate {
                 Image(systemName: "eye.slash.fill").font(.system(size: compact ? 6 : 8, weight: .semibold))
             } else if pane.loading {
@@ -3631,53 +3752,64 @@ struct PaneView: View {
             } else {
                 Image(systemName: "lock.fill").font(.system(size: compact ? 5 : 7, weight: .semibold)).opacity(0.6)
             }
-            Text(pane.host.isEmpty ? "Search" : pane.host.replacingOccurrences(of: "www.", with: ""))
-                .font(.system(size: compact ? 8 : 10, weight: .semibold))
-                .lineLimit(1)
         }
         .foregroundStyle(ink)
-        .fixedSize()
+        .opacity(Double(max(0, p * 2 - 1)))
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
-    // One capsule that changes shape between the full bar and the small pill. The capsule itself
-    // never cross-fades: it shrinks around the address while the buttons fold away into it (like Safari),
-    // and grows back out when you tap it, even while the page is still moving.
+    // One capsule that changes shape between the full bar and the small pill, following the pull.
+    // The capsule never cross-fades: it narrows around the name while the buttons fade into it, and
+    // grows back out when you tap it, even while the page is still moving.
+    private var fieldInset: CGFloat { focused || toolbarLayout ? (compact ? 14 : 18) : 8 }
+
     private var mainBar: some View {
-        AnyView(HStack(spacing: 0) {
+        AnyView(BarRow(p: p, pillPad: compact ? 7 : 10, labelScale: labelScale, fieldInset: fieldInset, gap: compact ? 3 : 4) {
             if showEnds && toolbarLayout && pane.isPrivate {
                 Image(systemName: "eye.slash.fill")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(ink)
-                    .opacity(0.8)
+                    .opacity(0.8 * endFade)
                     .padding(.leading, 16)
                     .accessibilityLabel("Private tab")
                     .transition(.opacity)
+                    .layoutValue(key: BarRow.RoleKey.self, value: .leading)
             }
             if showEnds && !toolbarLayout {
-                leadingEnd.transition(.opacity.combined(with: .scale(scale: 0.5, anchor: .leading)))
+                leadingEnd
+                    .opacity(endFade)
+                    .allowsHitTesting(p < 0.3)
+                    .accessibilityHidden(mini)
+                    .transition(.opacity)
+                    .layoutValue(key: BarRow.RoleKey.self, value: .leading)
             }
-            if mini {
-                pillLabel
-                    .matchedGeometryEffect(id: "addr", in: ns)
-                    .transition(.opacity)
-            } else {
-                field
-                    .padding(.leading, focused || toolbarLayout ? (compact ? 14 : 18) : 8)
-                    .matchedGeometryEffect(id: "addr", in: ns)
-                    .transition(.opacity)
+            field
+                .padding(.leading, fieldInset)
+                .allowsHitTesting(!mini)
+                .layoutValue(key: BarRow.RoleKey.self, value: .field)
+            if useLabel {
+                addressLabel.layoutValue(key: BarRow.RoleKey.self, value: .label)
+                pillIcon.layoutValue(key: BarRow.RoleKey.self, value: .icon)
             }
             if focused {
-                if !pane.address.isEmpty { icon("xmark.circle.fill") { pane.address = "" } }
+                if !pane.address.isEmpty {
+                    icon("xmark.circle.fill") { pane.address = "" }
+                        .layoutValue(key: BarRow.RoleKey.self, value: .trailing)
+                }
             } else if showEnds {
-                trailingEnd.transition(.opacity.combined(with: .scale(scale: 0.5, anchor: .trailing)))
+                trailingEnd
+                    .opacity(endFade)
+                    .allowsHitTesting(p < 0.3)
+                    .accessibilityHidden(mini)
+                    .transition(.opacity)
+                    .layoutValue(key: BarRow.RoleKey.self, value: .trailing)
             }
         })
-        .padding(.horizontal, mini ? (compact ? 7 : 10) : 0)
-        .frame(height: mini ? pillH : barH)
-        .frame(maxWidth: mini ? nil : .infinity)
+        .frame(height: barH + (pillH - barH) * p)
         .sdGlass(Capsule(), dark: dark, clear: tinted || floating, rim: true)
         .contentShape(Capsule())
-        .padding(.vertical, mini ? 8 : 0)
+        .padding(.vertical, 8 * p)       // the small pill keeps a comfortable touch area
         .contentShape(Rectangle())
         .gesture(TapGesture().onEnded { expand() }, including: mini ? .all : .subviews)
         .accessibilityAddTraits(mini ? .isButton : [])
@@ -7596,7 +7728,7 @@ struct ContentView: View {
     private func applySaver() {
         UIView.setAnimationsEnabled(!saver)   // also stops UIKit animations: sheets, menus, scrolling bounces
         Pane.minimizeBars = !saver && UserDefaults.standard.object(forKey: "minimalBar") as? Bool ?? true
-        if !Pane.minimizeBars { tabs.allLive.forEach { if $0.collapsed { $0.collapsed = false } } }
+        if !Pane.minimizeBars { tabs.allLive.forEach { $0.collapsed = false } }
         Pane.fps = saver ? 30 : 0
         tabs.maxLive = saver ? 2 : 4
         tabs.allLive.forEach { $0.applyFPS() }
