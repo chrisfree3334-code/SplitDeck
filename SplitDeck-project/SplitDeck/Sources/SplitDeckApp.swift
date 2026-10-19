@@ -12,6 +12,7 @@ import EventKitUI
 import NetworkExtension
 import Network
 import PhotosUI
+import CoreMotion
 
 @main
 struct SplitDeckApp: App {
@@ -208,6 +209,13 @@ enum Orientation {
         UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
     }
     static var isPortrait: Bool { scene?.effectiveGeometry.interfaceOrientation.isPortrait ?? true }
+    static var currentMask: UIInterfaceOrientationMask {
+        switch scene?.effectiveGeometry.interfaceOrientation {
+        case .landscapeLeft: return .landscapeLeft
+        case .landscapeRight: return .landscapeRight
+        default: return .portrait
+        }
+    }
     static func set(_ mask: UIInterfaceOrientationMask, turnTo: UIInterfaceOrientationMask?) {
         AppDelegate.mask = mask
         guard let s = scene else { return }
@@ -216,20 +224,62 @@ enum Orientation {
     }
 }
 
-// Which tab is showing a video in SplitDeck's fullscreen. The screen hides its bars and turns to landscape.
+// Which tab is showing a video in SplitDeck's fullscreen. The screen hides its bars and turns with the
+// phone, like the YouTube app: the accelerometer says which way up it's held, so it works with rotation
+// lock on. Landscape videos start in landscape; holding the phone upright doesn't turn them straight back,
+// but once you turn the phone the screen follows it (portrait and both landscapes).
 final class FullVideo: ObservableObject {
     static let shared = FullVideo()
     @Published private(set) var pane: UUID?
     private var wasPortrait = true
+    private let motion = CMMotionManager()
+    private var shown: UIInterfaceOrientationMask = .portrait
+    private var first: UIInterfaceOrientationMask?   // how the phone was held when the video went fullscreen
+    private var following = false
 
     func changed(_ p: Pane, on: Bool, portraitVideo: Bool) {
         if on {
-            if pane == nil { wasPortrait = Orientation.isPortrait }
+            if pane == nil {
+                wasPortrait = Orientation.isPortrait
+                first = nil
+                following = false
+                turn(portraitVideo || !Orientation.isPortrait ? Orientation.currentMask : .landscapeRight)
+                startMotion()
+            }
             pane = p.id
-            if !portraitVideo { Orientation.set(.landscape, turnTo: .landscape) }
         } else if pane == p.id {
             pane = nil
+            motion.stopAccelerometerUpdates()
             Orientation.set(.allButUpsideDown, turnTo: wasPortrait ? .portrait : nil)
+        }
+    }
+
+    private func turn(_ m: UIInterfaceOrientationMask) {
+        shown = m
+        Orientation.set(m, turnTo: m)
+    }
+
+    private func startMotion() {
+        guard motion.isAccelerometerAvailable, !motion.isAccelerometerActive else { return }
+        motion.accelerometerUpdateInterval = 0.1
+        motion.startAccelerometerUpdates(to: .main) { [weak self] data, _ in
+            guard let self, self.pane != nil, let a = data?.acceleration,
+                  UIApplication.shared.applicationState == .active else { return }
+            // Gravity along the phone's sides: clearly landscape one way or the other, or clearly upright.
+            // Flat on a table or in between: leave the screen as it is.
+            let held: UIInterfaceOrientationMask
+            if abs(a.x) > 0.6 && abs(a.x) > abs(a.y) * 1.4 {
+                held = a.x < 0 ? .landscapeRight : .landscapeLeft
+            } else if a.y < -0.6 && abs(a.y) > abs(a.x) * 1.4 {
+                held = .portrait
+            } else { return }
+            if !self.following {
+                if self.first == nil { self.first = held }
+                // Still held upright as when you tapped fullscreen: keep the landscape video landscape.
+                if held == .portrait && self.first == .portrait && self.shown != .portrait { return }
+                self.following = true
+            }
+            if held != self.shown { self.turn(held) }
         }
     }
 }
@@ -251,41 +301,65 @@ enum VideoFull {
 
     static let source = #"""
 (function(){
-if(window.__sdfsCfg||window.top!==window)return;
+if(window.__sdfsCfg)return;
+var P=HTMLVideoElement.prototype,oEnter=P.webkitEnterFullscreen,oExit=P.webkitExitFullscreen,oSPM=P.webkitSetPresentationMode;
+if(window.top!==window){
+try{var T=window.top;if(!T.__sdfsFor)return;
+P.webkitEnterFullscreen=P.webkitEnterFullScreen=function(){if(this.ownerDocument===T.document&&T.__sdfsFor(this,1))return;if(oEnter)return oEnter.apply(this,arguments)};
+P.webkitExitFullscreen=P.webkitExitFullScreen=function(){if(this.ownerDocument===T.document&&T.__sdfsFor(this,0))return;if(oExit)return oExit.apply(this,arguments)};
+if(oSPM)P.webkitSetPresentationMode=function(m){if(this.ownerDocument===T.document&&(m==='fullscreen'||m==='inline')&&T.__sdfsFor(this,m==='fullscreen'?1:0))return;return oSPM.apply(this,arguments)};
+}catch(e){}
+return}
 var cfg=__CFG__;
-var P=HTMLVideoElement.prototype,oEnter=P.webkitEnterFullscreen,oExit=P.webkitExitFullscreen;
-var cur=null,box=null,chain=[],cv=null,timer=0,y0=0,st=null,lastTap=0,auto=false,pipV=null;
+var cur=null,box=null,over=[],chain=[],back=null,cv=null,timer=0,y0=0,st=null,lastTap=0,auto=false,pipV=null;
 function post(m){try{webkit.messageHandlers.sdfs.postMessage(m)}catch(e){}}
+var FILL='position:fixed!important;inset:0!important;width:auto!important;height:auto!important;max-width:none!important;max-height:none!important;min-width:0!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;border-radius:0!important;transform:none!important;';
 function css(){if(st&&st.isConnected)return;st=document.createElement('style');st.textContent=
-'[data-sdfs-box]{position:fixed!important;inset:0!important;width:auto!important;height:auto!important;max-width:none!important;max-height:none!important;min-width:0!important;min-height:0!important;margin:0!important;padding:0!important;border:0!important;border-radius:0!important;transform:none!important;overflow:hidden!important;background:#000!important;z-index:2147483647!important;touch-action:manipulation!important}'+
+'[data-sdfs-back]{'+FILL+'overflow:hidden!important;background:#000!important;z-index:2147483646!important;pointer-events:none!important;display:block!important}'+
+'[data-sdfs-back] canvas{position:absolute;left:-12%;top:-12%;width:124%;height:124%;filter:blur(40px) saturate(1.5);opacity:0;transition:opacity .8s ease}'+
+'[data-sdfs-box]{'+FILL+'overflow:hidden!important;background:transparent!important;z-index:2147483647!important;touch-action:manipulation!important}'+
+'[data-sdfs-over]{'+FILL+'background:transparent!important;z-index:2147483647!important}'+
 '[data-sdfs-chain]{position:absolute!important;inset:0!important;width:100%!important;height:100%!important;max-width:none!important;max-height:none!important;margin:0!important;padding:0!important;transform:none!important;background:transparent!important;border-radius:0!important}'+
-'video[data-sdfs-chain],video[data-sdfs-box]{object-fit:contain!important}'+
-'[data-sdfs-glow]{position:absolute!important;left:-12%!important;top:-12%!important;width:124%!important;height:124%!important;z-index:-1!important;pointer-events:none!important;filter:blur(40px) saturate(1.5);opacity:0;transition:opacity .8s ease}';
+'video[data-sdfs-chain],video[data-sdfs-box]{object-fit:contain!important;background:transparent!important}';
 (document.head||document.documentElement).appendChild(st)}
-function pick(v){var r=v.getBoundingClientRect(),b=v,e=v,p;
-while((p=e.parentElement)&&p!==document.body&&p!==document.documentElement){var q=p.getBoundingClientRect();
+function rect(e){return e.getBoundingClientRect()}
+function pick(v){var r=rect(v),b=v,e=v,p;
+while((p=e.parentElement)&&p!==document.body&&p!==document.documentElement){var q=rect(p);
 if(q.width>r.width*1.2+40||q.height>r.height*1.2+80)break;b=p;e=p}
 return b}
+function overlays(b){var p=b.parentElement,out=[];if(!p||p===document.documentElement)return out;
+var r=rect(b),A=r.width*r.height;
+for(var c=p.firstElementChild;c;c=c.nextElementSibling){
+if(c===b||/^(SCRIPT|STYLE|LINK|TEMPLATE)$/.test(c.tagName))continue;var q=rect(c);if(q.width<2||q.height<2)continue;
+var ix=Math.max(0,Math.min(r.right,q.right)-Math.max(r.left,q.left)),iy=Math.max(0,Math.min(r.bottom,q.bottom)-Math.max(r.top,q.top));
+if(ix*iy>=0.7*A&&q.width*q.height<=A*1.6)out.push(c)}
+return out}
+function lift(e){try{if(e.showPopover&&!e.hasAttribute('popover')){e.setAttribute('popover','manual');e.__sdp=1;e.showPopover()}}catch(x){}}
+function drop(e){try{if(e.__sdp){if(e.matches(':popover-open'))e.hidePopover();e.removeAttribute('popover');delete e.__sdp}}catch(x){}}
 function tap(){var n=Date.now();if(n-lastTap>250){lastTap=n;post({tap:1})}}
-function pm(){if(cur&&cur.webkitPresentationMode==='picture-in-picture')exit()}
+function pm(){if(cur&&!auto&&cur.webkitPresentationMode==='picture-in-picture')exit()}
 function fire(v,n){try{v.dispatchEvent(new Event(n))}catch(e){}}
 function resize(){try{dispatchEvent(new Event('resize'))}catch(e){}}
 function glow(v){
-cv=document.createElement('canvas');cv.width=48;cv.height=27;cv.setAttribute('data-sdfs-glow','');cv.setAttribute('aria-hidden','true');
-var c=cv.getContext('2d'),first=true;box.insertBefore(cv,box.firstChild);
+cv=document.createElement('canvas');cv.width=48;cv.height=27;back.appendChild(cv);
+var c=cv.getContext('2d'),first=true;
 function draw(){if(!cur||!cv||v.readyState<2)return;try{c.globalAlpha=first?1:0.2;c.drawImage(v,0,0,48,27);if(first){first=false;cv.style.opacity='0.85'}}catch(e){}}
 timer=setInterval(function(){if(first||!v.paused)draw()},90);draw()}
 function unglow(){if(timer)clearInterval(timer);timer=0;if(cv&&cv.parentNode)cv.parentNode.removeChild(cv);cv=null}
 function enter(v){
 if(!cfg.on||cur)return false;
-var r=v.getBoundingClientRect();if(r.width<2||r.height<2)return false;
+var r=rect(v);if(r.width<2||r.height<2)return false;
 css();cur=v;box=pick(v);y0=scrollY;chain=[];
 for(var e=v;e&&e!==box;e=e.parentElement){chain.push(e);e.setAttribute('data-sdfs-chain','')}
+over=box===v?[]:overlays(box);
+back=document.createElement('div');back.setAttribute('data-sdfs-back','');back.setAttribute('aria-hidden','true');
+(document.body||document.documentElement).appendChild(back);lift(back);
+if(cfg.glow)glow(v);
 box.setAttribute('data-sdfs-box','');
 if(box===v){v.__sdc=v.controls;v.controls=true}
-try{if(box.showPopover&&!box.hasAttribute('popover')){box.setAttribute('popover','manual');box.__sdp=1;box.showPopover()}}catch(x){}
+lift(box);
+over.forEach(function(o){o.setAttribute('data-sdfs-over','');lift(o);o.addEventListener('touchstart',tap,{passive:true,capture:true})});
 try{Object.defineProperty(v,'webkitDisplayingFullscreen',{configurable:true,get:function(){return cur===v}})}catch(x){}
-if(cfg.glow&&box!==v)glow(v);
 box.addEventListener('touchstart',tap,{passive:true,capture:true});
 v.addEventListener('webkitpresentationmodechanged',pm);
 var w=v.videoWidth||r.width,h=v.videoHeight||r.height;
@@ -293,12 +367,13 @@ post({on:1,portrait:h>w});
 fire(v,'webkitbeginfullscreen');resize();setTimeout(resize,150);setTimeout(resize,600);
 return true}
 function exit(){
-if(!cur)return;var v=cur,b=box;cur=null;box=null;unglow();
-try{if(b.__sdp){if(b.matches(':popover-open'))b.hidePopover();b.removeAttribute('popover');delete b.__sdp}}catch(x){}
-b.removeAttribute('data-sdfs-box');
+if(!cur)return;var v=cur,b=box,o=over;cur=null;box=null;over=[];auto=false;
+unglow();
+o.forEach(function(e){drop(e);e.removeAttribute('data-sdfs-over');e.removeEventListener('touchstart',tap,true)});
+drop(b);b.removeAttribute('data-sdfs-box');b.removeEventListener('touchstart',tap,true);
+if(back){drop(back);if(back.parentNode)back.parentNode.removeChild(back);back=null}
 chain.forEach(function(e){e.removeAttribute('data-sdfs-chain')});chain=[];
 if(b===v)v.controls=!!v.__sdc;
-b.removeEventListener('touchstart',tap,true);
 v.removeEventListener('webkitpresentationmodechanged',pm);
 try{delete v.webkitDisplayingFullscreen}catch(x){}
 post({on:0});fire(v,'webkitendfullscreen');
@@ -307,15 +382,27 @@ P.webkitEnterFullscreen=P.webkitEnterFullScreen=function(){
 if(cur){if(cur===this)exit();return}
 if(enter(this))return;if(oEnter)return oEnter.apply(this,arguments)};
 P.webkitExitFullscreen=P.webkitExitFullScreen=function(){if(cur===this){exit();return}if(oExit)return oExit.apply(this,arguments)};
-window.__sdfsCfg=function(c){cfg=c;if(!cfg.on)exit();else if(cur&&!cfg.glow)unglow()};
+if(oSPM)P.webkitSetPresentationMode=function(m){
+if(m==='fullscreen'){if(cur===this)return;if(!cur&&enter(this))return}
+else if(m==='inline'&&cur===this&&this.webkitPresentationMode!=='picture-in-picture'){exit();return}
+return oSPM.apply(this,arguments)};
+window.__sdfsFor=function(v,on){if(on){if(cur){if(cur===v)exit();return true}return enter(v)}if(cur===v){exit();return true}return false};
+window.__sdfsCfg=function(c){cfg=c;if(!cfg.on)exit();else if(cur&&!cfg.glow)unglow();else if(cur&&cfg.glow&&!cv&&back)glow(cur)};
 window.__sdfsExit=exit;
+function pipOn(){var v=cur||pipV;return !!(v&&v.webkitPresentationMode==='picture-in-picture')}
 window.__sdfsPip=function(a){var v=cur||document.querySelector('video');
-if(!v||!v.webkitSupportsPresentationMode||!v.webkitSupportsPresentationMode('picture-in-picture'))return false;
+if(!oSPM||!v||!v.webkitSupportsPresentationMode||!v.webkitSupportsPresentationMode('picture-in-picture'))return false;
 if(a&&(!cur||v.paused))return false;
-auto=!!a;pipV=v;v.webkitSetPresentationMode('picture-in-picture');return true};
-window.__sdfsBack=function(){if(!auto||!pipV)return;var v=pipV;auto=false;pipV=null;
-if(v.webkitPresentationMode==='picture-in-picture'){try{v.webkitSetPresentationMode('inline')}catch(e){}}
-setTimeout(function(){if(!cur&&v.isConnected)enter(v)},350)};
+auto=!!a;pipV=v;oSPM.call(v,'picture-in-picture');return true};
+window.__sdfsBack=function(){var v=pipV;if(!auto||!v)return;auto=false;pipV=null;
+if(v.webkitPresentationMode==='picture-in-picture'){try{oSPM.call(v,'inline')}catch(e){}}};
+try{
+var dp=Document.prototype,hd=Object.getOwnPropertyDescriptor(dp,'hidden'),vs=Object.getOwnPropertyDescriptor(dp,'visibilityState');
+if(hd&&hd.get)Object.defineProperty(document,'hidden',{configurable:true,get:function(){return pipOn()?false:hd.get.call(document)}});
+if(vs&&vs.get)Object.defineProperty(document,'visibilityState',{configurable:true,get:function(){return pipOn()?'visible':vs.get.call(document)}});
+var stop=function(e){if(pipOn())e.stopImmediatePropagation()};
+window.addEventListener('visibilitychange',stop,true);document.addEventListener('visibilitychange',stop,true);
+}catch(e){}
 })();
 """#
 }
@@ -1077,7 +1164,7 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         u.removeAllUserScripts()
         u.addUserScript(WKUserScript(source: Rules.raf, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         u.addUserScript(WKUserScript(source: YouTubeMedia.script(), injectionTime: .atDocumentStart, forMainFrameOnly: true))
-        u.addUserScript(WKUserScript(source: VideoFull.script(), injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        u.addUserScript(WKUserScript(source: VideoFull.script(), injectionTime: .atDocumentStart, forMainFrameOnly: false))
         if youtube {
             u.addUserScript(WKUserScript(source: Rules.youtube, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
@@ -7350,6 +7437,11 @@ struct ContentView: View {
         .onChange(of: phase) { _, p in phaseChanged(p) }
         .onChange(of: appLock) { _, on in if !on { appLocked = false } }
         .onOpenURL { openLink($0) }
+        // Swiping home with a video playing fullscreen pops it out into picture in picture. This is the
+        // earliest moment the app hears about it, while iOS still lets picture in picture start.
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+            videoPane?.startPiP(auto: true)
+        }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didReceiveMemoryWarningNotification)) { _ in
             tabs.sleepHidden()
         }
@@ -7362,9 +7454,7 @@ struct ContentView: View {
     }
 
     private func phaseChanged(_ p: ScenePhase) {
-        // Leaving the app with a video playing fullscreen pops it out into picture in picture;
-        // coming back puts it back in fullscreen.
-        if p == .inactive, let v = videoPane { v.startPiP(auto: true) }
+        // Back in the app after an automatic picture in picture: the video returns to fullscreen.
         if p == .active { tabs.allLive.forEach { $0.backFromPiP() } }
         if p != .active { vault.lock() }
         if p == .background && lockPrivate && tabs.privateCount > 0 { privateLocked = true }
