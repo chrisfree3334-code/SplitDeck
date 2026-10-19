@@ -145,11 +145,13 @@ struct SDSurface: ViewModifier {
                 .overlay(shape.stroke(rim ? rimColor : Color.primary.opacity(0.08), lineWidth: rim ? 1.2 : 0.5))
                 .shadow(color: .black.opacity(0.14), radius: 8, y: 2)
         } else {
+            // Frosted glass: the page behind is blurred more, so the bar is less see-through without
+            // being any darker. The tint is the same light wash as before.
             let tint: Color = dark.map {
-                $0 ? Color.black.opacity(clear ? 0.47 : 0.59) : Color.white.opacity(clear ? 0.54 : 0.73)
-            } ?? Color(.systemBackground).opacity(clear ? 0.48 : 0.65)
+                $0 ? Color.black.opacity(clear ? 0.24 : 0.42) : Color.white.opacity(clear ? 0.34 : 0.62)
+            } ?? Color(.systemBackground).opacity(clear ? 0.26 : 0.5)
             if #available(iOS 26.0, *) {
-                content.glassEffect((clear ? Glass.clear : Glass.regular).tint(tint).interactive(), in: shape)
+                content.glassEffect(Glass.regular.tint(tint).interactive(), in: shape)
                     .overlay(rim ? shape.stroke(rimColor, lineWidth: 1.2) : nil)
             } else {
                 content.background(shape.fill(tint)).background(.regularMaterial, in: shape)
@@ -1024,9 +1026,9 @@ final class Pane: NSObject, ObservableObject, Identifiable, WKNavigationDelegate
         }
     }
     // No bounce, a soft finish (Safari-like).
-    static let barMotion = Animation.spring(response: 0.36, dampingFraction: 0.92)
+    static let barMotion = Animation.spring(response: 0.5, dampingFraction: 0.94)
     // Scrolling this far moves the bar all the way between bar and pill.
-    static let pullDistance: CGFloat = 46
+    static let pullDistance: CGFloat = 110
     private var lastDir: CGFloat = 1
     private var settleTick = 0
     @Published var tucked = false      // split view bar swiped into a thin pill
@@ -3263,7 +3265,7 @@ struct PaneView: View {
     // The bar folding into its pill: no bounce, a soft finish, like Safari.
     private var shrink: Animation? { saver ? nil : .spring(response: 0.42, dampingFraction: 0.9) }
     @Namespace private var ns
-    private var barH: CGFloat { compact ? 36 : 69 }
+    private var barH: CGFloat { compact ? 36 : 60 }
 
     // Tinted ends of the two-tone bar: the buttons sit on tinted glass, the address on clear glass.
     private var endTint: Color {
